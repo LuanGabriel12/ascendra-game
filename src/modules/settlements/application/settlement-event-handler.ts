@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { computeCanonicalFingerprintV1 } from "../../../shared/contracts/canonical-fingerprint.js";
 import {
   parseSupportedNeonSettlementEvent,
   type SupportedNeonSettlementEventV1,
@@ -34,10 +35,34 @@ export type HandleSettlementEventResult =
 export interface SettlementEventHandlerDependencies {
   readonly unitOfWork: SettlementUnitOfWork;
   readonly logger: Logger;
-  /**
-   * Optional hook strictly for deterministic fault-injection / lock-contention tests.
-   */
-  readonly beforeCommitHook?: ((context: { eventId: string; settlementId: string }) => Promise<void>) | undefined;
+  readonly beforeCommitHook?:
+    | ((context: { eventId: string; settlementId: string }) => Promise<void>)
+    | undefined;
+}
+
+function buildSemanticSettlementFingerprint(event: SupportedNeonSettlementEventV1): {
+  readonly fingerprint: string;
+  readonly canonicalJson: Record<string, unknown>;
+} {
+  if (event.event_type === "SettlementCaptured") {
+    return computeCanonicalFingerprintV1({
+      event_type: event.event_type,
+      version: event.version,
+      settlement_id: event.payload.settlement_id.toLowerCase(),
+      capturing_faction_id: event.payload.capturing_faction_id.toLowerCase(),
+      invasion_id: event.payload.invasion_id?.toLowerCase(),
+      expected_settlement_version: event.payload.expected_settlement_version,
+    });
+  }
+
+  return computeCanonicalFingerprintV1({
+    event_type: event.event_type,
+    version: event.version,
+    settlement_id: event.payload.settlement_id.toLowerCase(),
+    liberating_faction_id: event.payload.liberating_faction_id.toLowerCase(),
+    resulting_state: event.payload.resulting_state,
+    expected_settlement_version: event.payload.expected_settlement_version,
+  });
 }
 
 export class SettlementEventHandler {
@@ -54,16 +79,19 @@ export class SettlementEventHandler {
   }
 
   public async handle(rawEvent: unknown): Promise<HandleSettlementEventResult> {
+    const receivedAt = new Date();
     const event = parseSupportedNeonSettlementEvent(rawEvent);
     const settlementId = event.payload.settlement_id;
     const idempotencyKey = event.idempotency_key ?? event.event_id;
     const occurredAt = new Date(event.occurred_at);
+    const { fingerprint, canonicalJson } = buildSemanticSettlementFingerprint(event);
 
     try {
       const outcome = await this.unitOfWork.executeInTransaction(
         async (scope): Promise<HandleSettlementEventResult> => {
           const claimed = await scope.tryRegisterProcessedEvent({
             eventId: event.event_id,
+            externalEventId: event.event_id.toLowerCase(),
             idempotencyKey,
             eventType: event.event_type,
             eventVersion: event.version,
@@ -71,6 +99,9 @@ export class SettlementEventHandler {
             correlationId: event.correlation_id,
             aggregateId: settlementId,
             occurredAt,
+            receivedAt,
+            payloadFingerprint: fingerprint,
+            canonicalPayload: canonicalJson,
           });
 
           if (!claimed) {
@@ -165,7 +196,7 @@ export class SettlementEventHandler {
       );
 
       if (outcome.status === "duplicate_noop") {
-        this.logger.info("Ignored duplicate NEON settlement event", {
+        this.logger.info("Ignored verified duplicate NEON settlement event", {
           event_id: event.event_id,
           correlation_id: event.correlation_id,
           aggregate_id: settlementId,

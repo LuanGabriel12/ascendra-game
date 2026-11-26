@@ -14,6 +14,12 @@ export class SettlementNotFoundError extends SettlementDomainError {
   }
 }
 
+export class InvalidSettlementSnapshotError extends SettlementDomainError {
+  constructor(message: string) {
+    super("INVALID_SETTLEMENT_SNAPSHOT", message);
+  }
+}
+
 export class FactionNotFoundError extends SettlementDomainError {
   constructor(factionId: string) {
     super("FACTION_NOT_FOUND", `Faction '${factionId}' is not registered.`);

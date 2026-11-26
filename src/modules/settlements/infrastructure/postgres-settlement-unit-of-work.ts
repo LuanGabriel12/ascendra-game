@@ -1,11 +1,19 @@
+import { deriveDeterministicEventUuid } from "../../../shared/contracts/canonical-fingerprint.js";
+import type { SettlementStateChangedOutboxPayloadV1 } from "../../../shared/contracts/world-events.js";
 import {
   withPgTransaction,
   type PgPool,
   type PgPoolClient,
 } from "../../../shared/db/pool.js";
-import type { SettlementStateChangedOutboxPayloadV1 } from "../../../shared/contracts/world-events.js";
+import { claimOrVerifyProcessedEvent } from "../../../shared/db/processed-events-inbox.js";
 import { SettlementConcurrencyConflictError } from "../domain/errors.js";
-import { Settlement, type SettlementState } from "../domain/settlement.js";
+import {
+  PROVISIONAL_DEFAULT_MAX_DEFENSE_HP,
+  Settlement,
+  defaultDefenseStateForLifecycle,
+  type SettlementDefenseState,
+  type SettlementState,
+} from "../domain/settlement.js";
 import type { SettlementHistoryRecord } from "../domain/settlement-history.js";
 import type {
   AppendSettlementHistoryInput,
@@ -17,9 +25,12 @@ import type {
 
 interface SettlementRow {
   id: string;
+  external_id: string | null;
   name: string;
   region_id: string;
   state: SettlementState;
+  defense_state: SettlementDefenseState;
+  max_defense_hp: string;
   controlling_faction_id: string | null;
   version: number;
   created_at: Date;
@@ -49,7 +60,7 @@ export interface PersistedOutboxEvent {
   readonly eventVersion: number;
   readonly correlationId: string;
   readonly causationEventId: string;
-  readonly payload: SettlementStateChangedOutboxPayloadV1;
+  readonly payload: SettlementStateChangedOutboxPayloadV1 | Record<string, unknown>;
   readonly occurredAt: Date;
   readonly createdAt: Date;
   readonly publishedAt: Date | null;
@@ -63,7 +74,7 @@ interface OutboxRow {
   event_version: number;
   correlation_id: string;
   causation_event_id: string;
-  payload: SettlementStateChangedOutboxPayloadV1;
+  payload: SettlementStateChangedOutboxPayloadV1 | Record<string, unknown>;
   occurred_at: Date;
   created_at: Date;
   published_at: Date | null;
@@ -72,9 +83,12 @@ interface OutboxRow {
 function mapSettlementRow(row: SettlementRow): Settlement {
   return new Settlement({
     id: row.id,
+    externalId: row.external_id ?? row.id,
     name: row.name,
     regionId: row.region_id,
     state: row.state,
+    defenseState: row.defense_state,
+    maxDefenseHp: BigInt(row.max_defense_hp),
     controllingFactionId: row.controlling_faction_id,
     version: row.version,
     createdAt: row.created_at,
@@ -107,41 +121,37 @@ class PgSettlementTransactionScope implements SettlementTransactionScope {
   }
 
   public async tryRegisterProcessedEvent(input: RegisterProcessedEventInput): Promise<boolean> {
-    const res = await this.client.query<{ event_id: string }>(
-      `INSERT INTO processed_events (
-         event_id,
-         idempotency_key,
-         event_type,
-         event_version,
-         source,
-         correlation_id,
-         aggregate_id,
-         occurred_at
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       ON CONFLICT DO NOTHING
-       RETURNING event_id`,
-      [
-        input.eventId,
-        input.idempotencyKey,
-        input.eventType,
-        input.eventVersion,
-        input.source,
-        input.correlationId,
-        input.aggregateId,
-        input.occurredAt,
-      ],
-    );
-    return (res.rowCount ?? 0) > 0;
+    const externalEventId = (input.externalEventId ?? input.eventId).trim();
+    const eventUuid = deriveDeterministicEventUuid(input.eventId);
+
+    const claim = await claimOrVerifyProcessedEvent(this.client, {
+      eventUuid,
+      externalEventId,
+      idempotencyKey: input.idempotencyKey,
+      eventType: input.eventType,
+      eventVersion: input.eventVersion,
+      source: input.source,
+      correlationUuid: input.correlationId,
+      aggregateUuid: input.aggregateId,
+      occurredAt: input.occurredAt,
+      receivedAt: input.receivedAt ?? new Date(),
+      payloadFingerprint: input.payloadFingerprint,
+      canonicalPayload: input.canonicalPayload,
+    });
+
+    return claim.status === "claimed";
   }
 
   public async lockSettlementById(settlementId: string): Promise<Settlement | null> {
     const res = await this.client.query<SettlementRow>(
       `SELECT
          id,
+         external_id,
          name,
          region_id,
          state,
+         defense_state,
+         max_defense_hp::text AS max_defense_hp,
          controlling_faction_id,
          version,
          created_at,
@@ -170,13 +180,17 @@ class PgSettlementTransactionScope implements SettlementTransactionScope {
     const res = await this.client.query(
       `UPDATE settlements
        SET state = $1,
-           controlling_faction_id = $2,
-           version = $3,
-           updated_at = $4
-       WHERE id = $5
-         AND version = $6`,
+           defense_state = $2,
+           max_defense_hp = $3,
+           controlling_faction_id = $4,
+           version = $5,
+           updated_at = $6
+       WHERE id = $7
+         AND version = $8`,
       [
         settlement.state,
+        settlement.defenseState,
+        settlement.maxDefenseHp.toString(),
         settlement.controllingFactionId,
         settlement.version,
         settlement.updatedAt,
@@ -273,9 +287,12 @@ export class PostgresSettlementUnitOfWork implements SettlementUnitOfWork {
 
 export interface CreateSettlementInput {
   readonly id: string;
+  readonly externalId?: string | undefined;
   readonly name: string;
   readonly regionId: string;
   readonly state: SettlementState;
+  readonly defenseState?: SettlementDefenseState | undefined;
+  readonly maxDefenseHp?: bigint | undefined;
   readonly controllingFactionId: string | null;
 }
 
@@ -287,15 +304,43 @@ export class PostgresSettlementRepository {
   }
 
   public async create(input: CreateSettlementInput): Promise<Settlement> {
+    const externalId = (input.externalId ?? input.id).trim();
+    const defenseState = input.defenseState ?? defaultDefenseStateForLifecycle(input.state);
+    const maxDefenseHp = input.maxDefenseHp ?? PROVISIONAL_DEFAULT_MAX_DEFENSE_HP;
+
     const res = await this.pool.query<SettlementRow>(
-      `INSERT INTO settlements (id, name, region_id, state, controlling_faction_id, version)
-       VALUES ($1, $2, $3, $4, $5, 1)
-       RETURNING id, name, region_id, state, controlling_faction_id, version, created_at, updated_at`,
+      `INSERT INTO settlements (
+         id,
+         external_id,
+         name,
+         region_id,
+         state,
+         defense_state,
+         max_defense_hp,
+         controlling_faction_id,
+         version
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
+       RETURNING
+         id,
+         external_id,
+         name,
+         region_id,
+         state,
+         defense_state,
+         max_defense_hp::text AS max_defense_hp,
+         controlling_faction_id,
+         version,
+         created_at,
+         updated_at`,
       [
         input.id,
+        externalId,
         input.name.trim(),
         input.regionId.trim(),
         input.state,
+        defenseState,
+        maxDefenseHp.toString(),
         input.controllingFactionId,
       ],
     );
@@ -308,10 +353,43 @@ export class PostgresSettlementRepository {
 
   public async findById(settlementId: string): Promise<Settlement | null> {
     const res = await this.pool.query<SettlementRow>(
-      `SELECT id, name, region_id, state, controlling_faction_id, version, created_at, updated_at
+      `SELECT
+         id,
+         external_id,
+         name,
+         region_id,
+         state,
+         defense_state,
+         max_defense_hp::text AS max_defense_hp,
+         controlling_faction_id,
+         version,
+         created_at,
+         updated_at
        FROM settlements
        WHERE id = $1`,
       [settlementId],
+    );
+    const row = res.rows[0];
+    return row ? mapSettlementRow(row) : null;
+  }
+
+  public async findByExternalId(externalId: string): Promise<Settlement | null> {
+    const res = await this.pool.query<SettlementRow>(
+      `SELECT
+         id,
+         external_id,
+         name,
+         region_id,
+         state,
+         defense_state,
+         max_defense_hp::text AS max_defense_hp,
+         controlling_faction_id,
+         version,
+         created_at,
+         updated_at
+       FROM settlements
+       WHERE external_id = $1`,
+      [externalId.trim()],
     );
     const row = res.rows[0];
     return row ? mapSettlementRow(row) : null;

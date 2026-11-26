@@ -1,4 +1,6 @@
+import { MAX_INT64 } from "../../../shared/contracts/int64-wire.js";
 import {
+  InvalidSettlementSnapshotError,
   InvalidSettlementStateTransitionError,
   SettlementConcurrencyConflictError,
 } from "./errors.js";
@@ -13,11 +15,46 @@ export const SETTLEMENT_STATES = [
 
 export type SettlementState = (typeof SETTLEMENT_STATES)[number];
 
+/**
+ * NEON defensive condition enum (`ports.SettlementDefenseState` in Go).
+ * Kept orthogonal to CARBON's lifecycle `SettlementState`:
+ * - Non-occupied settlements (`peaceful`, `threatened`, `under_attack`, `rebuilding`)
+ *   may independently be `Secure`, `Fortified`, or `Damaged`.
+ * - Occupied settlements (`occupied`) carry `Captured` defensive state.
+ */
+export const SETTLEMENT_DEFENSE_STATES = [
+  "Secure",
+  "Fortified",
+  "Damaged",
+  "Captured",
+] as const;
+
+export type SettlementDefenseState = (typeof SETTLEMENT_DEFENSE_STATES)[number];
+
+/**
+ * Provisional development baseline matching NEON's DefaultSettlementFixtures (1000 HP).
+ * Explicitly NOT final gameplay balance.
+ */
+export const PROVISIONAL_DEFAULT_MAX_DEFENSE_HP = 1000n;
+
+export function defaultDefenseStateForLifecycle(state: SettlementState): SettlementDefenseState {
+  if (state === "occupied") {
+    return "Captured";
+  }
+  if (state === "rebuilding") {
+    return "Damaged";
+  }
+  return "Secure";
+}
+
 export interface SettlementProps {
   readonly id: string;
+  readonly externalId?: string | null | undefined;
   readonly name: string;
   readonly regionId: string;
   readonly state: SettlementState;
+  readonly defenseState?: SettlementDefenseState | undefined;
+  readonly maxDefenseHp?: bigint | undefined;
   readonly controllingFactionId: string | null;
   readonly version: number;
   readonly createdAt: Date;
@@ -45,9 +82,12 @@ const LIBERATABLE_STATES: ReadonlySet<SettlementState> = new Set<SettlementState
 
 export class Settlement {
   public readonly id: string;
+  public readonly externalId: string;
   public readonly name: string;
   public readonly regionId: string;
   public readonly state: SettlementState;
+  public readonly defenseState: SettlementDefenseState;
+  public readonly maxDefenseHp: bigint;
   public readonly controllingFactionId: string | null;
   public readonly version: number;
   public readonly createdAt: Date;
@@ -69,10 +109,38 @@ export class Settlement {
       );
     }
 
+    const resolvedExternalId = (props.externalId ?? props.id).trim();
+    if (!resolvedExternalId) {
+      throw new InvalidSettlementSnapshotError("Settlement externalId cannot be blank.");
+    }
+
+    const resolvedDefenseState =
+      props.defenseState ?? defaultDefenseStateForLifecycle(props.state);
+    if (props.state === "occupied" && resolvedDefenseState !== "Captured") {
+      throw new InvalidSettlementStateTransitionError(
+        `Occupied settlement '${props.id}' must carry defenseState 'Captured', got '${resolvedDefenseState}'.`,
+      );
+    }
+    if (props.state !== "occupied" && resolvedDefenseState === "Captured") {
+      throw new InvalidSettlementStateTransitionError(
+        `Non-occupied settlement '${props.id}' (state='${props.state}') cannot carry defenseState 'Captured'.`,
+      );
+    }
+
+    const resolvedMaxHp = props.maxDefenseHp ?? PROVISIONAL_DEFAULT_MAX_DEFENSE_HP;
+    if (resolvedMaxHp <= 0n || resolvedMaxHp > MAX_INT64) {
+      throw new InvalidSettlementSnapshotError(
+        `Settlement maxDefenseHp must be in (0, ${MAX_INT64.toString()}], got ${resolvedMaxHp.toString()}.`,
+      );
+    }
+
     this.id = props.id;
+    this.externalId = resolvedExternalId;
     this.name = props.name;
     this.regionId = props.regionId;
     this.state = props.state;
+    this.defenseState = resolvedDefenseState;
+    this.maxDefenseHp = resolvedMaxHp;
     this.controllingFactionId = props.controllingFactionId;
     this.version = props.version;
     this.createdAt = props.createdAt;
@@ -100,9 +168,12 @@ export class Settlement {
 
     const updated = new Settlement({
       id: this.id,
+      externalId: this.externalId,
       name: this.name,
       regionId: this.regionId,
       state: "occupied",
+      defenseState: "Captured",
+      maxDefenseHp: this.maxDefenseHp,
       controllingFactionId: params.capturingFactionId,
       version: this.version + 1,
       createdAt: this.createdAt,
@@ -142,11 +213,17 @@ export class Settlement {
       );
     }
 
+    const nextDefenseState: SettlementDefenseState =
+      this.state === "occupied" ? "Damaged" : this.defenseState;
+
     const updated = new Settlement({
       id: this.id,
+      externalId: this.externalId,
       name: this.name,
       regionId: this.regionId,
       state: targetState,
+      defenseState: nextDefenseState,
+      maxDefenseHp: this.maxDefenseHp,
       controllingFactionId: params.liberatingFactionId,
       version: this.version + 1,
       createdAt: this.createdAt,

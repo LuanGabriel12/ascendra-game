@@ -3,6 +3,7 @@ import type { Settlement, SettlementState } from "../domain/settlement.js";
 
 export interface RegisterProcessedEventInput {
   readonly eventId: string;
+  readonly externalEventId?: string | undefined;
   readonly idempotencyKey: string;
   readonly eventType: string;
   readonly eventVersion: number;
@@ -10,6 +11,9 @@ export interface RegisterProcessedEventInput {
   readonly correlationId: string;
   readonly aggregateId: string;
   readonly occurredAt: Date;
+  readonly receivedAt?: Date | undefined;
+  readonly payloadFingerprint: string;
+  readonly canonicalPayload: Record<string, unknown>;
 }
 
 export interface AppendSettlementHistoryInput {
@@ -39,8 +43,9 @@ export interface EnqueueSettlementOutboxInput {
 
 export interface SettlementTransactionScope {
   /**
-   * Atomically inserts into processed_events with ON CONFLICT DO NOTHING.
-   * Returns true if this transaction claimed the event; false if already processed.
+   * Atomically inserts into processed_events or verifies canonical payload equivalence.
+   * Returns true if claimed by this transaction; false if verified idempotent duplicate;
+   * throws InboxIdempotencyConflictError if a conflicting payload reuses event_id or idempotency_key.
    */
   tryRegisterProcessedEvent(input: RegisterProcessedEventInput): Promise<boolean>;
 
