@@ -14,3 +14,7 @@ A partir do **Ciclo 02 / Session 02**, novos ADRs utilizam prefixos explícitos 
 ## Série Inicial CARBON (Persistência & Consistência em TypeScript + PostgreSQL)
 - [0001-modular-monolith-and-stack.md](0001-modular-monolith-and-stack.md) — Stack TypeScript/Node 24 e PostgreSQL real (Accepted — CARBON Session 01)
 - [0002-settlement-concurrency-and-idempotency.md](0002-settlement-concurrency-and-idempotency.md) — Concorrência `SELECT FOR UPDATE`, Inbox e Outbox (Accepted — CARBON Session 01)
+
+## Série CARBON Session 02+
+- [CARBON-0003-polyglot-go-typescript-boundary.md](CARBON-0003-polyglot-go-typescript-boundary.md) — Fronteira poliglota Go (NEON) + TypeScript/PostgreSQL (CARBON) (Proposed)
+- [CARBON-0004-canonical-idempotency-and-64bit-identifiers.md](CARBON-0004-canonical-idempotency-and-64bit-identifiers.md) — Identificadores opacos, inteiros de 64 bits e idempotência por fingerprint canônico (Accepted / Proposed Wire)
