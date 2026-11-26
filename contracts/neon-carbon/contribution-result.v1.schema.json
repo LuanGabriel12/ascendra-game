@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ascendra.game/contracts/neon-carbon/contribution-result.v1.schema.json",
+  "title": "ContributionResultWireV1",
+  "description": "Cross-language JSON Schema (v1) matching NEON ports.ContributionResult. Supports opaque deterministic string IDs and canonical decimal strings for int64/uint64.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "simulation_id",
+    "invasion_id",
+    "settlement_id",
+    "tick",
+    "player_id",
+    "damage",
+    "support",
+    "objectives",
+    "eligible",
+    "outcome"
+  ],
+  "properties": {
+    "contract_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "\\S"
+    },
+    "simulation_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "\\S"
+    },
+    "invasion_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "\\S"
+    },
+    "settlement_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "\\S"
+    },
+    "tick": {
+      "description": "Logical simulation tick (uint64 [0, 18446744073709551615]) as canonical decimal string or safe JSON integer.",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$"
+        },
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      ]
+    },
+    "player_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "\\S"
+    },
+    "damage": {
+      "$ref": "#/$defs/nonNegativeInt64"
+    },
+    "support": {
+      "$ref": "#/$defs/nonNegativeInt64"
+    },
+    "objectives": {
+      "$ref": "#/$defs/nonNegativeInt64"
+    },
+    "eligible": {
+      "type": "boolean"
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["Defended", "Captured"]
+    }
+  },
+  "$defs": {
+    "nonNegativeInt64": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,18})$"
+        },
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      ]
+    }
+  }
+}

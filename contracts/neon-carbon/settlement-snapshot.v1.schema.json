@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ascendra.game/contracts/neon-carbon/settlement-snapshot.v1.schema.json",
+  "title": "SettlementSnapshotWireV1",
+  "description": "Cross-language JSON Schema (v1) for NEON SettlementReader.GetSettlementSnapshot backed by CARBON PostgreSQL projection. 64-bit max_defense_hp uses canonical decimal strings.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "settlement_id",
+    "region_id",
+    "defense_state",
+    "max_defense_hp"
+  ],
+  "properties": {
+    "contract_version": {
+      "type": "integer",
+      "const": 1,
+      "default": 1
+    },
+    "settlement_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "\\S"
+    },
+    "region_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "\\S"
+    },
+    "defense_state": {
+      "type": "string",
+      "enum": ["Secure", "Fortified", "Damaged", "Captured"]
+    },
+    "max_defense_hp": {
+      "description": "Positive int64 [1, 9223372036854775807] as canonical decimal string (or safe JSON integer <= 9007199254740991).",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[1-9][0-9]{0,18}$"
+        },
+        {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      ]
+    },
+    "settlement_version": {
+      "type": "integer",
+      "minimum": 1
+    }
+  }
+}

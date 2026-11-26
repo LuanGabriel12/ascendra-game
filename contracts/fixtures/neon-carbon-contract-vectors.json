@@ -1,0 +1,189 @@
+{
+  "description": "Shared cross-language contract test vectors between NEON (Go internal/ports/carbon.go & internal/world/harness.go) and CARBON (TypeScript/PostgreSQL).",
+  "settlement_snapshots": {
+    "valid_valewatch": {
+      "contract_version": 1,
+      "settlement_id": "settlement-valewatch",
+      "region_id": "region-ashvale",
+      "defense_state": "Secure",
+      "max_defense_hp": "1000",
+      "settlement_version": 1
+    },
+    "valid_ironford_fortified": {
+      "contract_version": 1,
+      "settlement_id": "settlement-ironford",
+      "region_id": "region-thornreach",
+      "defense_state": "Fortified",
+      "max_defense_hp": "1500",
+      "settlement_version": 2
+    },
+    "valid_max_int64_hp": {
+      "contract_version": 1,
+      "settlement_id": "settlement-citadel-max",
+      "region_id": "region-highpeak",
+      "defense_state": "Fortified",
+      "max_defense_hp": "9223372036854775807",
+      "settlement_version": 1
+    }
+  },
+  "contributions": {
+    "valid_contribution_result": {
+      "contract_version": 1,
+      "event_id": "sim:s1:inv:inv1:contrib:player-kael",
+      "simulation_id": "s1",
+      "invasion_id": "inv1",
+      "settlement_id": "settlement-valewatch",
+      "tick": "70",
+      "player_id": "player-kael",
+      "damage": "425",
+      "support": "0",
+      "objectives": "0",
+      "eligible": true,
+      "outcome": "Defended"
+    },
+    "duplicate_identical_reordered": {
+      "outcome": "Defended",
+      "eligible": true,
+      "objectives": "0",
+      "support": "0",
+      "damage": "425",
+      "player_id": "player-kael",
+      "tick": "70",
+      "settlement_id": "settlement-valewatch",
+      "invasion_id": "inv1",
+      "simulation_id": "s1",
+      "event_id": "sim:s1:inv:inv1:contrib:player-kael",
+      "contract_version": 1
+    },
+    "duplicate_conflicting_payload": {
+      "contract_version": 1,
+      "event_id": "sim:s1:inv:inv1:contrib:player-kael",
+      "simulation_id": "s1",
+      "invasion_id": "inv1",
+      "settlement_id": "settlement-valewatch",
+      "tick": "70",
+      "player_id": "player-kael",
+      "damage": "999999",
+      "support": "0",
+      "objectives": "0",
+      "eligible": true,
+      "outcome": "Defended"
+    },
+    "valid_non_uuid_external_id": {
+      "contract_version": 1,
+      "event_id": "sim:ashvale-01:inv:siege-09:contrib:player-lyra",
+      "simulation_id": "ashvale-01",
+      "invasion_id": "siege-09",
+      "settlement_id": "settlement-ironford",
+      "tick": "144",
+      "player_id": "player-lyra",
+      "damage": "170",
+      "support": "90",
+      "objectives": "1",
+      "eligible": true,
+      "outcome": "Defended"
+    },
+    "valid_max_int64": {
+      "contract_version": 1,
+      "event_id": "sim:bounds:inv:int64max:contrib:p-max-i64",
+      "simulation_id": "bounds",
+      "invasion_id": "int64max",
+      "settlement_id": "settlement-valewatch",
+      "tick": "1024",
+      "player_id": "p-max-i64",
+      "damage": "9223372036854775807",
+      "support": "9223372036854775807",
+      "objectives": "9223372036854775807",
+      "eligible": true,
+      "outcome": "Captured"
+    },
+    "valid_max_uint64": {
+      "contract_version": 1,
+      "event_id": "sim:bounds:inv:uint64max:contrib:p-max-u64",
+      "simulation_id": "bounds",
+      "invasion_id": "uint64max",
+      "settlement_id": "settlement-valewatch",
+      "tick": "18446744073709551615",
+      "player_id": "p-max-u64",
+      "damage": "0",
+      "support": "45",
+      "objectives": "0",
+      "eligible": false,
+      "outcome": "Captured"
+    },
+    "invalid_negative_metric": {
+      "contract_version": 1,
+      "event_id": "sim:s1:inv:inv1:contrib:neg",
+      "simulation_id": "s1",
+      "invasion_id": "inv1",
+      "settlement_id": "settlement-valewatch",
+      "tick": "50",
+      "player_id": "p-neg",
+      "damage": "-1",
+      "support": "10",
+      "objectives": "0",
+      "eligible": false,
+      "outcome": "Defended"
+    },
+    "invalid_non_terminal_outcome": {
+      "contract_version": 1,
+      "event_id": "sim:s1:inv:inv1:contrib:nonterm",
+      "simulation_id": "s1",
+      "invasion_id": "inv1",
+      "settlement_id": "settlement-valewatch",
+      "tick": "50",
+      "player_id": "p-nonterm",
+      "damage": "100",
+      "support": "0",
+      "objectives": "0",
+      "eligible": true,
+      "outcome": "None"
+    },
+    "invalid_unknown_fields": {
+      "contract_version": 1,
+      "event_id": "sim:s1:inv:inv1:contrib:extra",
+      "simulation_id": "s1",
+      "invasion_id": "inv1",
+      "settlement_id": "settlement-valewatch",
+      "tick": "50",
+      "player_id": "p-extra",
+      "damage": "100",
+      "support": "0",
+      "objectives": "0",
+      "eligible": true,
+      "outcome": "Defended",
+      "untrusted_gold_grant": 999999
+    },
+    "invalid_unsupported_version": {
+      "contract_version": 2,
+      "event_id": "sim:s1:inv:inv1:contrib:v2",
+      "simulation_id": "s1",
+      "invasion_id": "inv1",
+      "settlement_id": "settlement-valewatch",
+      "tick": "50",
+      "player_id": "p-v2",
+      "damage": "100",
+      "support": "0",
+      "objectives": "0",
+      "eligible": true,
+      "outcome": "Defended"
+    },
+    "invalid_19digit_int64_overflow_string": {
+      "contract_version": 1,
+      "event_id": "sim:s1:inv:inv1:contrib:i64overflow",
+      "simulation_id": "s1",
+      "invasion_id": "inv1",
+      "settlement_id": "settlement-valewatch",
+      "tick": "50",
+      "player_id": "p-overflow",
+      "damage": "9223372036854775808",
+      "support": "0",
+      "objectives": "0",
+      "eligible": true,
+      "outcome": "Defended"
+    }
+  },
+  "raw_go_json_samples": {
+    "go_encoding_json_max_bounds": "{\"event_id\":\"sim:go-raw:inv:1:contrib:p1\",\"simulation_id\":\"go-raw\",\"invasion_id\":\"1\",\"settlement_id\":\"settlement-valewatch\",\"tick\":18446744073709551615,\"player_id\":\"p1\",\"damage\":9223372036854775807,\"support\":45,\"objectives\":1,\"eligible\":true,\"outcome\":\"Defended\"}"
+  }
+}

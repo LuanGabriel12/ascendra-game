@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ascendra.game/contracts/events/invasion-lifecycle-proposals.v1.schema.json",
+  "title": "InvasionLifecycleContractsProposalV1",
+  "description": "PROPOSED JOINT CONTRACT (v1) — Full settlement invasion lifecycle events bridging NEON World Director (InvasionPrepared, InvasionStarted, SettlementDefended, SettlementCaptured) and CARBON persistence (SettlementLiberated, SettlementReconstructed). Requires NEON confirmation before enabling terminal capture without explicit faction metadata.",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/SettlementThreatenedV1" },
+    { "$ref": "#/$defs/InvasionStartedV1" },
+    { "$ref": "#/$defs/SettlementDefendedV1" },
+    { "$ref": "#/$defs/SettlementCapturedProposedV2" },
+    { "$ref": "#/$defs/SettlementLiberatedProposedV2" },
+    { "$ref": "#/$defs/SettlementReconstructedV1" }
+  ],
+  "$defs": {
+    "BaseLifecycleEnvelope": {
+      "type": "object",
+      "required": ["event_id", "event_type", "version", "simulation_id", "tick", "settlement_id"],
+      "properties": {
+        "event_id": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S" },
+        "event_type": { "type": "string" },
+        "version": { "type": "integer", "minimum": 1 },
+        "simulation_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "invasion_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "tick": { "type": "string", "pattern": "^(0|[1-9][0-9]{0,19})$" },
+        "settlement_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "expected_settlement_version": { "type": "integer", "minimum": 1 },
+        "occurred_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "SettlementThreatenedV1": {
+      "description": "Maps to NEON EventInvasionPrepared (Peace -> Threatened): transitions settlement peaceful -> threatened.",
+      "allOf": [
+        { "$ref": "#/$defs/BaseLifecycleEnvelope" },
+        {
+          "properties": {
+            "event_type": { "enum": ["SettlementThreatened", "InvasionPrepared"] },
+            "version": { "const": 1 },
+            "regional_threat": { "type": "string", "pattern": "^(0|[1-9][0-9]{0,18})$" }
+          },
+          "required": ["regional_threat"]
+        }
+      ]
+    },
+    "InvasionStartedV1": {
+      "description": "Maps to NEON EventInvasionStarted (Threatened -> UnderAttack): transitions settlement threatened -> under_attack.",
+      "allOf": [
+        { "$ref": "#/$defs/BaseLifecycleEnvelope" },
+        {
+          "properties": {
+            "event_type": { "const": "InvasionStarted" },
+            "version": { "const": 1 },
+            "invasion_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          "required": ["invasion_id"]
+        }
+      ]
+    },
+    "SettlementDefendedV1": {
+      "description": "Maps to NEON EventSettlementDefended (UnderAttack -> Resolved[Defended]). Distinct from SettlementLiberated: city was NEVER occupied; transitions under_attack -> peaceful (if remaining_defense_hp == max) or rebuilding/Damaged (if remaining_defense_hp < max). Independent of player eligibility.",
+      "allOf": [
+        { "$ref": "#/$defs/BaseLifecycleEnvelope" },
+        {
+          "properties": {
+            "event_type": { "const": "SettlementDefended" },
+            "version": { "const": 1 },
+            "invasion_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "remaining_defense_hp": { "type": "string", "pattern": "^[1-9][0-9]{0,18}$" }
+          },
+          "required": ["invasion_id", "remaining_defense_hp"]
+        }
+      ]
+    },
+    "SettlementCapturedProposedV2": {
+      "description": "BLOCKED ON NEON FIELD: NEON currently emits EventSettlementCaptured without capturing_faction_id. Proposed v2 adds capturing_faction_code / capturing_faction_id so CARBON never invents an occupying faction.",
+      "allOf": [
+        { "$ref": "#/$defs/BaseLifecycleEnvelope" },
+        {
+          "properties": {
+            "event_type": { "const": "SettlementCaptured" },
+            "version": { "const": 2 },
+            "invasion_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "capturing_faction_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          "required": ["invasion_id", "capturing_faction_id"]
+        }
+      ]
+    },
+    "SettlementLiberatedProposedV2": {
+      "description": "Emitted when an already-occupied settlement is reconquered, transitioning occupied -> rebuilding (defense_state = Damaged).",
+      "allOf": [
+        { "$ref": "#/$defs/BaseLifecycleEnvelope" },
+        {
+          "properties": {
+            "event_type": { "const": "SettlementLiberated" },
+            "version": { "const": 2 },
+            "liberating_faction_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          "required": ["liberating_faction_id"]
+        }
+      ]
+    },
+    "SettlementReconstructedV1": {
+      "description": "Emitted within CARBON once ReconstructionContracts complete, transitioning rebuilding -> peaceful and restoring defense_state to Secure or Fortified.",
+      "allOf": [
+        { "$ref": "#/$defs/BaseLifecycleEnvelope" },
+        {
+          "properties": {
+            "event_type": { "const": "SettlementReconstructed" },
+            "version": { "const": 1 },
+            "restored_defense_state": { "enum": ["Secure", "Fortified"] }
+          },
+          "required": ["restored_defense_state"]
+        }
+      ]
+    }
+  }
+}
