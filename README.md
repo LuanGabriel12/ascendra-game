@@ -1,8 +1,8 @@
-# ASCENDRA — Real-Time Gameplay Backend Foundation (NEON Cycles 01 & 02)
+# ASCENDRA — Real-Time Gameplay Backend Foundation (NEON Cycles 01–03)
 
 Multiplayer RPG - Ascendra Game
 
-Este repositório contém a fundação técnica e o motor de IA de criaturas do backend de simulação em tempo real do projeto **ASCENDRA**, sob responsabilidade de **NEON**.
+Este repositório contém a fundação técnica, o motor de IA de criaturas e o motor de ecossistema regional dinâmico do backend de simulação em tempo real do projeto **ASCENDRA**, sob responsabilidade de **NEON**.
 
 > **Nota importante de identidade:** `NEON` é exclusivamente o nome do papel/desenvolvedor responsável pelo núcleo de simulação de gameplay. Este projeto **não** usa Neon Database nem qualquer serviço externo chamado Neon.
 
@@ -12,7 +12,7 @@ Este repositório contém a fundação técnica e o motor de IA de criaturas do 
 - **Núcleo de simulação determinístico (`internal/simulation`)**:
   - PRNG determinístico com estado serializável (`SplitMix64` — sem `math/rand` global).
   - Serialização canônica e checksum SHA-256 independente de ordem de `map`, ponteiros, timestamps ou logs.
-  - Snapshot/restore versionado (`SchemaVersion = 2`) com validação explícita de schema e invariantes.
+  - Snapshot/restore versionado (`SchemaVersion = 3`) com limite pré-decodificação de bytes (`MaxBytes`) e validação explícita de schema e invariantes.
 - **World / Event Director & Motor de Invasões (`internal/world`)**:
   - Máquina de estados explícita de invasão (`Peace -> Threatened -> UnderAttack -> Resolved`), rejeitando transições inválidas.
   - Simulação por ticks lógicos (`uint64`) sem dependência de relógio de parede (`time.Now()`) nem aritmética de ponto flutuante (`float32`/`float64`).
@@ -21,11 +21,19 @@ Este repositório contém a fundação técnica e o motor de IA de criaturas do 
   - Interfaces mínimas `SettlementReader` e `ContributionSink`, testadas com fakes in-memory determinísticos.
   - **Nenhuma** regra de economia, Bounty, reputação, títulos ou persistência de cidades foi implementada pelo NEON.
 
-### Ciclo 02 — Creature AI Engine (`neon/creature-ai-engine`)
-- **Perfis de goblins e orcs (`internal/ai/profiles.go`)**: `goblin-skirmisher`, `goblin-raider-pack`, `goblin-taskmaster`, `orc-vanguard`, `orc-warchief` em inteiros/fixed-point.
-- **Percepção e seleção de alvos (`internal/ai/targeting.go`)**: alcance de visão (`VisionRange`), alerta coletivo (`AlertRange`), pesos táticos diferenciados (goblins oportunistas em alvos feridos; orcs confrontacionais em ameaça/objetivo) e desempate canônico.
-- **Coordenação coletiva (`internal/ai/coordination.go`)**: aura de moral de comandantes, foco coordenado (`FocusTarget`), reagrupamento (`Rally`) e flanqueamento de matilha (`FlankWeak`).
-- **Moral, territorialidade e reforços (`internal/ai/policy.go`, `internal/world/director.go`)**: quebra de moral + histerese de reagrupamento, retorno por leash territorial (`StateReturnHome`), reforços com cooldown e limites explícitos de capacidade (`MaxActiveGroups`, `MaxReinforcementWaves`, `MaxDefenders`, `MaxObjectives`, `MaxContributions`), além de ordenação canônica de comandos no mesmo tick (`CanonicalizeCommands`).
+### Ciclo 02 — Creature AI Engine (Auditado — `349fe69`)
+- **Perfis de goblins e orcs (`internal/ai/profiles.go`)**: `goblin-skirmisher`, `goblin-raider-pack`, `goblin-taskmaster`, `orc-berserker`, `orc-vanguard`, `orc-warchief` em inteiros/fixed-point.
+- **Percepção e seleção tipada de alvos (`internal/ai/targeting.go`)**: `TargetRef{Kind, ID}`, alcance de visão (`VisionRange`), alerta coletivo (`AlertRange`), retenção de alvo (`TargetMemoryTicks`), pesos táticos diferenciados e desempate canônico.
+- **Coordenação coletiva otimizada (`internal/ai/coordination.go`)**: índice espacial 1D + somas de prefixo + busca binária (`O(G log G)`), aura de moral de comandantes, `FocusTarget`, `Rally` e `FlankWeak`.
+- **Moral, territorialidade e reforços (`internal/ai/policy.go`, `internal/world/director.go`)**: quebra de moral + histerese de reagrupamento, choque explícito de morte de comandante (`CommanderFallen`), retorno por leash territorial (`StateReturnHome`), reforços com cooldown e limites explícitos de capacidade.
+
+### Ciclo 03 — Dynamic Ecosystem & Population Simulation Engine (`neon/dynamic-ecosystem-engine`)
+- **Simulação em duas escalas (`internal/ecosystem` + `internal/world/ecosystem_bridge.go`)**: ticks táticos (Escala A) integrados a epochs ecológicos (Escala B, padrão `20 ticks/epoch`) com fonte única de verdade (`FreePopulation` + `MaterializedPopulation`).
+- **3 regiões conectadas (fixtures)**: Vale de Valewatch, Floresta de Thornveil e Fronteira de Ironfang.
+- **Modelo populacional discreto inteiro**: logística com `K`, acumuladores seriais de resíduos, `K == 0` seguro e zero geração espontânea de populações extintas.
+- **Recursos naturais conservados**: `Food`, `Wood`, `Stone`, `Ore`, `Water` com consumo proporcional conservado ao inteiro exato e regeneração limitada.
+- **Acampamentos dinâmicos, migração em duas fases, competição territorial e ameaça regional com histerese**.
+- **Materialização controlada e limpeza de entidades**: reconciliação única de baixas/sobreviventes sem duplicação nem ressurreição, limpeza pós-retenção liberando `MaxActiveGroups = 32` e anel FIFO `RetiredGroupIDs`.
 
 ## Pré-requisitos
 
@@ -75,10 +83,20 @@ docs/handoff/                   Notas de handoff do Ciclo 1
 - [NEON → CARBON Contract Request](docs/contracts/NEON_TO_CARBON_CONTRACT_REQUEST.md)
 - [Handoff do Ciclo 1](docs/handoff/NEON_CYCLE1_HANDOFF.md)
 - [Handoff do Ciclo 2](docs/handoff/NEON_CYCLE2_HANDOFF.md)
+- [Handoff do Ciclo 3](docs/handoff/NEON_CYCLE3_HANDOFF.md)
 - [Auditoria CODEX — Ciclo 1](docs/audits/NEON_CYCLE_01_AUDIT.md)
+- [Auditoria CODEX — Ciclo 2](docs/audits/NEON_CYCLE_02_AUDIT.md)
+- [Proposta de Contratos de Ecossistema (NEON → CARBON)](docs/contracts/NEON_ECOSYSTEM_CONTRACT_PROPOSAL.md)
+- Documentação do Ecossistema (Ciclo 3):
+  - [Ecosystem Engine](docs/ecosystem/ECOSYSTEM_ENGINE.md)
+  - [Population Model](docs/ecosystem/POPULATION_MODEL.md)
+  - [Resource Dynamics](docs/ecosystem/RESOURCE_DYNAMICS.md)
+  - [Territory & Migration](docs/ecosystem/TERRITORY_AND_MIGRATION.md)
+  - [Performance Baseline](docs/ecosystem/PERFORMANCE_BASELINE.md)
 - ADRs:
   - [ADR-0001: Gameplay Backend Runtime (Go 1.27.x — Proposed)](docs/adr/0001-gameplay-backend-runtime.md)
   - [ADR-0002: Deterministic Simulation Boundary & Fixed-Point Units](docs/adr/0002-deterministic-simulation-boundary.md)
   - [ADR-0003: Ownership NEON/CARBON & Contract Strategy](docs/adr/0003-neon-carbon-ownership-and-ports.md)
   - [ADR-0004: Headless World Simulation Vertical Slice](docs/adr/0004-headless-world-vertical-slice.md)
-  - [ADR-0005: Creature AI Engine (Goblins, Orcs, Coordenação, Moral, Territorialidade e Reforços — Proposed)](docs/adr/0005-creature-ai-engine.md)
+  - [ADR-0005: Creature AI Engine (Proposed)](docs/adr/0005-creature-ai-engine.md)
+  - [NEON-ADR-0006: Dynamic Ecosystem Engine, Safe Snapshots v3 & 1D Spatial Coordination (Proposed)](docs/adr/NEON-ADR-0006-dynamic-ecosystem-engine.md)
