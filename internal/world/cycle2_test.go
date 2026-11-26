@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"ascendra-game/internal/adapters/memory"
@@ -116,6 +117,15 @@ func TestCycle02WarbandCoordinationReinforcementsAndSnapshot(t *testing.T) {
 	}
 	if resA.FinalChecksum != resB.FinalChecksum {
 		t.Fatalf("Cycle 02 snapshot/restore mismatch: %s != %s", resA.FinalChecksum, resB.FinalChecksum)
+	}
+	var subsequent []world.DomainEvent
+	for _, event := range resA.Events {
+		if event.Tick > tickK {
+			subsequent = append(subsequent, event)
+		}
+	}
+	if !reflect.DeepEqual(subsequent, resB.Events) {
+		t.Fatal("snapshot continuation produced different events")
 	}
 }
 
@@ -258,5 +268,82 @@ func BenchmarkWorldStepMultiGroup16(b *testing.B) {
 		if cur.Invasion.State == world.InvasionResolved {
 			cur = st
 		}
+	}
+}
+
+func TestDefeatedDefenderCannotCompleteObjective(t *testing.T) {
+	cfg := world.DefaultConfig()
+	st := mustInitialState(t, "dead-objective", 1)
+	st.Invasion.State = world.InvasionUnderAttack
+	st.Defenders = []world.DefenderEntity{{PlayerID: "p", MaxHP: 100, HP: 0}}
+	before, _ := st.Checksum()
+	_, _, err := world.Step(st, []world.Command{{Kind: world.CmdCompleteObjective, Tick: 1, PlayerID: "p", ObjectiveID: "gate"}}, cfg)
+	if !errors.Is(err, world.ErrDeadEntity) {
+		t.Fatalf("expected dead defender rejection, got %v", err)
+	}
+	after, _ := st.Checksum()
+	if before != after {
+		t.Fatal("failed tick mutated state")
+	}
+}
+
+func TestStepRejectsRestoredStateOverCapacity(t *testing.T) {
+	cfg := world.DefaultConfig()
+	cfg.MaxDefenders = 1
+	st := mustInitialState(t, "capacity-restore", 1)
+	st.Defenders = []world.DefenderEntity{{PlayerID: "a", HP: 1, MaxHP: 1}, {PlayerID: "b", HP: 1, MaxHP: 1}}
+	raw, err := st.MarshalSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := world.UnmarshalSnapshot(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = world.Step(restored, nil, cfg)
+	if !errors.Is(err, world.ErrCapacityExceeded) {
+		t.Fatalf("expected capacity error, got %v", err)
+	}
+}
+
+func TestLostTargetIsCleared(t *testing.T) {
+	cfg := world.DefaultConfig()
+	st := mustInitialState(t, "lost-target", 1)
+	st, _, err := world.Step(st, []world.Command{{Kind: world.CmdSpawnHostileGroup, Tick: 1, GroupID: "g", Archetype: "goblin-skirmisher", Count: 1}}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Groups[0].CurrentTargetID = "gone"
+	st, _, err = world.Step(st, nil, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Groups[0].CurrentTargetID != "" {
+		t.Fatalf("stale target %q", st.Groups[0].CurrentTargetID)
+	}
+}
+
+func TestRoutedGroupDoesNotSpawnReinforcements(t *testing.T) {
+	cfg := world.DefaultConfig()
+	st := mustInitialState(t, "routed-reinforcement", 1)
+	st, _, err := world.Step(st, []world.Command{{Kind: world.CmdSpawnHostileGroup, Tick: 1, GroupID: "g", Archetype: "goblin-raider-pack", Count: 1}}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Invasion.State = world.InvasionUnderAttack
+	st.Invasion.StartedTick = st.Tick
+	st.Groups[0].State = ai.StateRetreat
+	st.Groups[0].HP = st.Groups[0].MaxHP / 2
+	st.Groups[0].DistanceToSettlement = cfg.HostileRetreatExitDistance - 1
+	st.Groups[0].MoraleBP = 6000
+	next, _, err := world.Step(st, nil, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !next.Groups[0].Routed {
+		t.Fatal("group did not route")
+	}
+	if next.Invasion.ReinforcementWaves != 0 {
+		t.Fatal("routed group spawned reinforcements")
 	}
 }

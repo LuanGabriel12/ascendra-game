@@ -403,3 +403,28 @@ func TestProfileValidationRejectsInvalidConfigs(t *testing.T) {
 		t.Fatalf("expected ErrInvalidProfile when reinforcement archetype empty, got %v", err)
 	}
 }
+
+func TestExtremeRecentDamageDoesNotPanic(t *testing.T) {
+	p := ai.Perception{GroupID: "g", CurrentState: ai.StateIdle, HP: 1, MaxHP: 1, Profile: mustProfile(t, "goblin-skirmisher"), MoraleBP: 5000, RecentDamageTaken: int64(^uint64(0) >> 1)}
+	rng := simulation.NewDeterministicRNG(1)
+	if _, err := ai.Evaluate(p, &rng); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func FuzzTargetSelectionOrder(f *testing.F) {
+	f.Add(uint16(10), uint16(20), uint16(40), uint16(60))
+	f.Fuzz(func(t *testing.T, x, y, hp1, hp2 uint16) {
+		p, err := ai.LookupProfile("orc-vanguard")
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := ai.PerceivedTarget{TargetID: "a", Kind: ai.TargetDefender, Position: int64(x), HP: int64(hp1 % 101), MaxHP: 100}
+		b := ai.PerceivedTarget{TargetID: "b", Kind: ai.TargetDefender, Position: int64(y), HP: int64(hp2 % 101), MaxHP: 100}
+		left, ok1 := ai.SelectTarget(5000, 5000, p, []ai.PerceivedTarget{a, b}, ai.CoordinationOrder{}, false)
+		right, ok2 := ai.SelectTarget(5000, 5000, p, []ai.PerceivedTarget{b, a}, ai.CoordinationOrder{}, false)
+		if ok1 != ok2 || left != right {
+			t.Fatalf("order changed selection: %+v %+v", left, right)
+		}
+	})
+}

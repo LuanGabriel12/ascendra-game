@@ -76,6 +76,11 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 	if err := state.Validate(); err != nil {
 		return WorldState{}, nil, err
 	}
+	if len(state.Groups) > cfg.MaxActiveGroups || len(state.Defenders) > cfg.MaxDefenders ||
+		len(state.Invasion.ObjectivesCompleted) > cfg.MaxObjectives || len(state.Contributions) > cfg.MaxContributions ||
+		state.Invasion.ReinforcementWaves > cfg.MaxReinforcementWaves {
+		return WorldState{}, nil, ErrCapacityExceeded
+	}
 	if state.Tick == math.MaxUint64 {
 		return WorldState{}, nil, ErrNumericOverflow
 	}
@@ -274,6 +279,9 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 					nil,
 				))
 			}
+			if decision.TargetID == "" {
+				g.CurrentTargetID = ""
+			}
 
 			if decision.MoveDelta != 0 {
 				moved, err := safeAddInt64(g.DistanceToSettlement, decision.MoveDelta)
@@ -339,7 +347,7 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 				break
 			}
 			callerIdx := findGroupIndex(next.Groups, req.callerID)
-			if callerIdx < 0 {
+			if callerIdx < 0 || next.Groups[callerIdx].Routed || next.Groups[callerIdx].HP == 0 {
 				continue
 			}
 			next.Invasion.ReinforcementWaves++
@@ -801,6 +809,9 @@ func applyCompleteObjective(next *WorldState, cmd Command, cfg Config) error {
 	}
 	if strings.TrimSpace(cmd.PlayerID) == "" || strings.TrimSpace(cmd.ObjectiveID) == "" {
 		return fmt.Errorf("%w: player_id and objective_id are required", ErrInvalidCommand)
+	}
+	if idx := findDefenderIndex(next.Defenders, cmd.PlayerID); idx >= 0 && next.Defenders[idx].HP == 0 {
+		return fmt.Errorf("%w: defender %q is defeated", ErrDeadEntity, cmd.PlayerID)
 	}
 	idx, found := slices.BinarySearch(next.Invasion.ObjectivesCompleted, cmd.ObjectiveID)
 	if found {

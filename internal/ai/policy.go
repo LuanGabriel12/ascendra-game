@@ -577,6 +577,9 @@ func ratioBasisPoints(num, den int64) int64 {
 	if num <= 0 || den <= 0 {
 		return 0
 	}
+	if num >= den {
+		return int64(BasisPointsScale)
+	}
 	hi, lo := bits.Mul64(uint64(num), BasisPointsScale)
 	q, _ := bits.Div64(hi, lo, uint64(den))
 	if q > BasisPointsScale {
