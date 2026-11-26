@@ -13,6 +13,7 @@ import (
 	"ascendra-game/internal/adapters/memory"
 	"ascendra-game/internal/ecosystem"
 	"ascendra-game/internal/world"
+	"ascendra-game/internal/worldevents"
 )
 
 func main() {
@@ -57,6 +58,12 @@ func runAllScenarios(out io.Writer) error {
 	ecoCfg := ecosystem.DefaultConfig()
 	if err := runEcosystemScenarios(logger, reader, cfg, ecoCfg); err != nil {
 		logger.Error("ecosystem_scenario_failed", slog.String("error", err.Error()))
+		return err
+	}
+
+	// 3. Run Cycle 04 World Event Director Scenarios A-I.
+	if err := runWorldEventScenarios(logger, reader); err != nil {
+		logger.Error("world_event_scenario_failed", slog.String("error", err.Error()))
 		return err
 	}
 	return nil
@@ -312,4 +319,71 @@ func logEcoSummary(logger *slog.Logger, simID string, res ecosystem.EpochResult,
 		slog.Int("threat_changes", eventCounts[ecosystem.EventRegionalThreatChanged]),
 		slog.String("checksum", res.FinalChecksum),
 	)
+}
+
+func runWorldEventScenarios(logger *slog.Logger, reader *memory.SettlementReader) error {
+	ctx := context.Background()
+	runners := []func(context.Context, *memory.SettlementReader) (worldevents.ScenarioSummary, worldevents.RunResult, error){
+		func(c context.Context, r *memory.SettlementReader) (worldevents.ScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunScenarioA(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.ScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunScenarioB(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.ScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunScenarioC(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.ScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunScenarioD(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.ScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunScenarioE(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.ScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunScenarioF(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.ScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunScenarioG(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.ScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunScenarioH(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.ScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunScenarioI(c, r)
+		},
+	}
+	for _, fn := range runners {
+		start := time.Now()
+		sum, _, err := fn(ctx, reader)
+		if err != nil {
+			return err
+		}
+		outcomeStr := "None"
+		eligible := 0
+		if len(sum.TerminalOutcomes) > 0 {
+			last := sum.TerminalOutcomes[len(sum.TerminalOutcomes)-1]
+			outcomeStr = string(last.Outcome)
+			eligible = last.EligibleContributors
+		}
+		logger.Info("world_event_scenario_completed",
+			slog.String("event", "world_event_scenario_completed"),
+			slog.String("scenario", sum.Name),
+			slog.String("simulation_id", sum.SimulationID),
+			slog.Uint64("tick", sum.FinalTick),
+			slog.Uint64("epoch", sum.FinalEpoch),
+			slog.Int("campaigns_completed", sum.CampaignsCompleted),
+			slog.Int("terminal_outcomes", len(sum.TerminalOutcomes)),
+			slog.String("last_outcome", outcomeStr),
+			slog.Int("eligible_contributors", eligible),
+			slog.Int("reinforcements_deployed", sum.ReinforcementsDeployed),
+			slog.Int64("free_population", sum.FreePopulationTotal),
+			slog.Int64("reserved_population", sum.ReservedPopulationTotal),
+			slog.Int64("materialized_population", sum.MaterializedPopTotal),
+			slog.Int("snapshot_bytes", sum.SnapshotBytes),
+			slog.Bool("snapshot_verified", sum.SnapshotVerified),
+			slog.String("checksum", sum.FinalChecksum),
+			slog.Duration("duration", time.Since(start)),
+		)
+	}
+	return nil
 }
