@@ -20,6 +20,11 @@ type reinforcementRequest struct {
 	cooldown    int64
 }
 
+type fallenCommander struct {
+	family ai.Family
+	pos    int64
+}
+
 // NewWorldState initializes a deterministic WorldState by querying the minimal
 // SettlementSnapshot from CARBON via ports.SettlementReader.
 func NewWorldState(simulationID, settlementID string, seed uint64, reader ports.SettlementReader) (WorldState, error) {
@@ -55,6 +60,7 @@ func NewWorldState(simulationID, settlementID string, seed uint64, reader ports.
 			ObjectivesCompleted: []string{},
 		},
 		Groups:          []CreatureGroup{},
+		RetiredGroupIDs: []string{},
 		Defenders:       []DefenderEntity{},
 		PlayerCooldowns: []PlayerCooldown{},
 		Contributions:   []PlayerContribution{},
@@ -70,16 +76,11 @@ func NewWorldState(simulationID, settlementID string, seed uint64, reader ports.
 // It is pure, deterministic, I/O-free, wall-clock-free, and atomic: if any command or
 // invariant fails, the caller's input state remains untouched.
 func Step(state WorldState, commands []Command, cfg Config) (WorldState, []DomainEvent, error) {
-	if err := cfg.Validate(); err != nil {
+	if err := state.ValidateWithConfig(cfg); err != nil {
 		return WorldState{}, nil, err
 	}
-	if err := state.Validate(); err != nil {
-		return WorldState{}, nil, err
-	}
-	if len(state.Groups) > cfg.MaxActiveGroups || len(state.Defenders) > cfg.MaxDefenders ||
-		len(state.Invasion.ObjectivesCompleted) > cfg.MaxObjectives || len(state.Contributions) > cfg.MaxContributions ||
-		state.Invasion.ReinforcementWaves > cfg.MaxReinforcementWaves {
-		return WorldState{}, nil, ErrCapacityExceeded
+	if len(commands) > cfg.MaxCommandsPerTick {
+		return WorldState{}, nil, fmt.Errorf("%w: %d commands exceed limit %d", ErrCapacityExceeded, len(commands), cfg.MaxCommandsPerTick)
 	}
 	if state.Tick == math.MaxUint64 {
 		return WorldState{}, nil, ErrNumericOverflow
@@ -89,6 +90,7 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 	next.Tick++
 	events := make([]DomainEvent, 0, len(commands)+8)
 	threatIncreasedThisTick := false
+	fallenCommanders := make([]fallenCommander, 0, 2)
 
 	// 1. Validate command ticks and apply commands in canonical deterministic order.
 	orderedCommands := CanonicalizeCommands(commands)
@@ -135,7 +137,7 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 			}
 
 		case CmdPlayerDefendStrike:
-			if err := applyPlayerDefendStrike(&next, cmd, cfg, &events); err != nil {
+			if err := applyPlayerDefendStrike(&next, cmd, cfg, &events, &fallenCommanders); err != nil {
 				return WorldState{}, nil, err
 			}
 
@@ -166,8 +168,8 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 		}
 	}
 
-	// 3. Cycle 02 Creature AI Engine: perception, collective coordination, morale,
-	// territoriality, target selection, and bounded reinforcement requests.
+	// 3. Creature AI Engine: perception, O(G log G) collective coordination, morale,
+	// territoriality, typed target selection, target memory, and bounded reinforcement requests.
 	invasionActive := next.Invasion.State == InvasionUnderAttack
 	if len(next.Groups) > 0 {
 		perceivedTargets := buildPerceivedTargets(&next)
@@ -204,6 +206,15 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 			g := &next.Groups[i]
 			if g.HP == 0 || g.State == ai.StateDead || g.Routed {
 				g.RecentDamageTaken = 0
+				g.CurrentTargetID = ""
+				g.CurrentTarget = ai.TargetRef{}
+				g.TargetMemoryTicks = 0
+				if g.TerminalTick == 0 {
+					g.TerminalTick = next.Tick
+				}
+				if g.PopulationWeight == 0 {
+					g.Accounted = true
+				}
 				continue
 			}
 			if g.AttackCooldownTicks > 0 {
@@ -220,6 +231,14 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 				remainingCalls = 0
 			}
 
+			cmdrShock := false
+			for _, fc := range fallenCommanders {
+				if fc.family == g.Family && absDiffInt64(g.DistanceToSettlement, fc.pos) <= prof.AlertRange {
+					cmdrShock = true
+					break
+				}
+			}
+
 			perception := ai.Perception{
 				Tick:                        next.Tick,
 				GroupID:                     g.GroupID,
@@ -234,6 +253,9 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 				HomePosition:                g.HomePosition,
 				MoraleBP:                    g.MoraleBP,
 				RecentDamageTaken:           g.RecentDamageTaken,
+				CommanderFallenShock:        cmdrShock,
+				RetainedTarget:              g.CurrentTarget,
+				TargetMemoryTicks:           g.TargetMemoryTicks,
 				ReinforceCooldownTicks:      g.ReinforceCooldownTicks,
 				RemainingReinforcementCalls: remainingCalls,
 				Targets:                     perceivedTargets,
@@ -269,18 +291,23 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 				))
 			}
 
-			if decision.TargetID != "" && decision.TargetID != g.CurrentTargetID {
-				g.CurrentTargetID = decision.TargetID
-				events = append(events, next.newEvent(
-					EventTargetAcquired,
-					g.GroupID,
-					decision.TargetID,
-					0,
-					nil,
-				))
-			}
-			if decision.TargetID == "" {
+			if !decision.Target.IsZero() {
+				if decision.Target != g.CurrentTarget {
+					g.CurrentTarget = decision.Target
+					g.CurrentTargetID = decision.Target.ID
+					events = append(events, next.newEvent(
+						EventTargetAcquired,
+						g.GroupID,
+						fmt.Sprintf("%s:%s", decision.Target.Kind, decision.Target.ID),
+						0,
+						nil,
+					))
+				}
+				g.TargetMemoryTicks = decision.NextTargetMemoryTicks
+			} else {
+				g.CurrentTarget = ai.TargetRef{}
 				g.CurrentTargetID = ""
+				g.TargetMemoryTicks = 0
 			}
 
 			if decision.MoveDelta != 0 {
@@ -310,6 +337,13 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 
 			if g.State == ai.StateRetreat && g.DistanceToSettlement >= cfg.HostileRetreatExitDistance {
 				g.Routed = true
+				g.TerminalTick = next.Tick
+				g.CurrentTarget = ai.TargetRef{}
+				g.CurrentTargetID = ""
+				g.TargetMemoryTicks = 0
+				if g.PopulationWeight == 0 {
+					g.Accounted = true
+				}
 				events = append(events, next.newEvent(EventCreaturePopulationChanged, g.GroupID, "Retreat->Routed", -1, nil))
 				continue
 			}
@@ -325,8 +359,8 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 					next.SettlementDefenseHP -= dmg
 				}
 				g.AttackCooldownTicks = prof.AttackCooldownTicks
-			} else if decision.Action == ai.ActionStrikeTarget && decision.TargetKind == ai.TargetDefender {
-				if defIdx := findDefenderIndex(next.Defenders, decision.TargetID); defIdx >= 0 && next.Defenders[defIdx].HP > 0 {
+			} else if decision.Action == ai.ActionStrikeTarget && decision.Target.Kind == ai.TargetDefender {
+				if defIdx := findDefenderIndex(next.Defenders, decision.Target.ID); defIdx >= 0 && next.Defenders[defIdx].HP > 0 {
 					dmg, err := rollHostileDamage(prof.BaseDamage, cfg.HostileDamageVariance, &next.RNG)
 					if err != nil {
 						return WorldState{}, nil, err
@@ -393,7 +427,7 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 		} else {
 			timedOut := next.Tick >= next.Invasion.StartedTick &&
 				(next.Tick-next.Invasion.StartedTick) >= cfg.InvasionMaxDurationTicks
-			allNeutralized := len(next.Groups) > 0 && countActiveHostiles(next.Groups) == 0
+			allNeutralized := (next.Invasion.TotalGroupsSpawned > 0 || len(next.Groups) > 0) && countActiveHostiles(next.Groups) == 0
 			if allNeutralized || timedOut {
 				if err := resolveInvasion(&next, ports.InvasionOutcomeDefended, cfg, &events); err != nil {
 					return WorldState{}, nil, err
@@ -402,7 +436,11 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 		}
 	}
 
-	// 6. Passive regional threat decay outside active battle when threat was not actively escalated.
+	// 6. Controlled entity lifecycle cleanup: retire accounted terminal groups after retention window,
+	// freeing MaxActiveGroups capacity while preventing immediate ID reuse via bounded RetiredGroupIDs.
+	cleanupTerminalGroups(&next, cfg, &events)
+
+	// 7. Passive regional threat decay outside active battle when threat was not actively escalated.
 	if !threatIncreasedThisTick && cfg.ThreatDecayPerTick > 0 &&
 		(next.Invasion.State == InvasionPeace || next.Invasion.State == InvasionThreatened) &&
 		next.RegionalThreat > 0 {
@@ -422,10 +460,41 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 	if next.EventSeq < state.EventSeq {
 		return WorldState{}, nil, ErrNumericOverflow
 	}
-	if err := next.Validate(); err != nil {
+	if err := next.ValidateWithConfig(cfg); err != nil {
 		return WorldState{}, nil, err
 	}
 	return next, events, nil
+}
+
+// cleanupTerminalGroups removes accounted dead/routed groups once their retention window has elapsed
+// and records their IDs in the bounded FIFO RetiredGroupIDs list.
+func cleanupTerminalGroups(next *WorldState, cfg Config, events *[]DomainEvent) {
+	if len(next.Groups) == 0 {
+		return
+	}
+	kept := make([]CreatureGroup, 0, len(next.Groups))
+	for _, g := range next.Groups {
+		terminal := g.HP == 0 || g.State == ai.StateDead || g.Routed
+		if terminal && g.Accounted && g.TerminalTick > 0 && next.Tick >= g.TerminalTick && (next.Tick-g.TerminalTick) >= cfg.GroupCleanupRetentionTicks {
+			recordRetiredGroupID(next, g.GroupID, cfg.MaxRetiredGroupIDs)
+			*events = append(*events, next.newEvent(EventGroupRetired, g.GroupID, string(g.State), 0, nil))
+			continue
+		}
+		kept = append(kept, g)
+	}
+	next.Groups = kept
+}
+
+func recordRetiredGroupID(next *WorldState, groupID string, maxRetired int) {
+	if maxRetired <= 0 {
+		return
+	}
+	if !slices.Contains(next.RetiredGroupIDs, groupID) {
+		next.RetiredGroupIDs = append(next.RetiredGroupIDs, groupID)
+		if len(next.RetiredGroupIDs) > maxRetired {
+			next.RetiredGroupIDs = append([]string(nil), next.RetiredGroupIDs[len(next.RetiredGroupIDs)-maxRetired:]...)
+		}
+	}
 }
 
 // DispatchContributions forwards ContributionRecorded domain events to CARBON's
@@ -528,7 +597,6 @@ func transitionInvasion(next *WorldState, target InvasionState, cfg Config, even
 		*events = append(*events, next.newEvent(EventInvasionPrepared, next.SettlementID, transitionLabel, next.RegionalThreat, nil))
 	case InvasionUnderAttack:
 		next.Invasion.StartedTick = next.Tick
-		// Ensure at least one hostile vanguard group exists when an invasion starts.
 		if countActiveHostiles(next.Groups) == 0 {
 			spawnCmd := Command{
 				Kind:      CmdSpawnHostileGroup,
@@ -567,7 +635,6 @@ func resolveInvasion(next *WorldState, outcome ports.InvasionOutcome, cfg Config
 		*events = append(*events, next.newEvent(EventSettlementCaptured, next.SettlementID, transitionLabel, 0, nil))
 	}
 
-	// Emit validated ContributionResult records strictly once per invasion instance.
 	if !next.Invasion.ContributionsEmitted {
 		for _, c := range next.Contributions {
 			var scoreObj int64
@@ -612,8 +679,8 @@ func resolveInvasion(next *WorldState, outcome ports.InvasionOutcome, cfg Config
 }
 
 func applyDeployDefender(next *WorldState, cmd Command, cfg Config) error {
-	if strings.TrimSpace(cmd.PlayerID) == "" {
-		return fmt.Errorf("%w: player_id is required to deploy defender", ErrInvalidCommand)
+	if strings.TrimSpace(cmd.PlayerID) == "" || len(cmd.PlayerID) > cfg.MaxIdentifierLength {
+		return fmt.Errorf("%w: invalid player_id to deploy defender", ErrInvalidCommand)
 	}
 	if cmd.Position < 0 || cmd.Position > cfg.MaxBattlefieldDistance {
 		return fmt.Errorf("%w: defender position %d out of [0, %d]", ErrInvalidCommand, cmd.Position, cfg.MaxBattlefieldDistance)
@@ -646,11 +713,17 @@ func applySpawnHostileGroup(next *WorldState, cmd Command, cfg Config, events *[
 	if strings.TrimSpace(cmd.GroupID) == "" || strings.TrimSpace(cmd.Archetype) == "" {
 		return fmt.Errorf("%w: group_id and archetype are required", ErrInvalidCommand)
 	}
+	if len(cmd.GroupID) > cfg.MaxIdentifierLength || len(cmd.Archetype) > cfg.MaxIdentifierLength {
+		return fmt.Errorf("%w: group_id or archetype exceeds max length %d", ErrInvalidCommand, cfg.MaxIdentifierLength)
+	}
 	if cmd.Count <= 0 {
 		return fmt.Errorf("%w: hostile count must be > 0, got %d", ErrInvalidCommand, cmd.Count)
 	}
 	if len(next.Groups) >= cfg.MaxActiveGroups {
 		return fmt.Errorf("%w: max active groups %d reached", ErrCapacityExceeded, cfg.MaxActiveGroups)
+	}
+	if slices.Contains(next.RetiredGroupIDs, cmd.GroupID) {
+		return fmt.Errorf("%w: %q", ErrRetiredGroupID, cmd.GroupID)
 	}
 	if findGroupIndex(next.Groups, cmd.GroupID) >= 0 {
 		return fmt.Errorf("%w: duplicate group_id %q", ErrInvalidCommand, cmd.GroupID)
@@ -698,11 +771,12 @@ func applySpawnHostileGroup(next *WorldState, cmd Command, cfg Config, events *[
 		Routed:                 false,
 	}
 	next.Groups = insertGroupSorted(next.Groups, group)
+	next.Invasion.TotalGroupsSpawned++
 	*events = append(*events, next.newEvent(EventCreaturePopulationChanged, group.GroupID, "Spawned", cmd.Count, nil))
 	return nil
 }
 
-func applyPlayerDefendStrike(next *WorldState, cmd Command, cfg Config, events *[]DomainEvent) error {
+func applyPlayerDefendStrike(next *WorldState, cmd Command, cfg Config, events *[]DomainEvent, fallen *[]fallenCommander) error {
 	if next.Invasion.State != InvasionUnderAttack {
 		return fmt.Errorf("%w: cannot defend strike during state %s", ErrInvasionNotActive, next.Invasion.State)
 	}
@@ -712,7 +786,7 @@ func applyPlayerDefendStrike(next *WorldState, cmd Command, cfg Config, events *
 	if defIdx := findDefenderIndex(next.Defenders, cmd.PlayerID); defIdx >= 0 && next.Defenders[defIdx].HP == 0 {
 		return fmt.Errorf("%w: defender %q is defeated", ErrDeadEntity, cmd.PlayerID)
 	}
-	if err := checkAndSetPlayerCooldown(next, cmd.PlayerID, cfg.PlayerAttackCooldown); err != nil {
+	if err := checkAndSetPlayerCooldown(next, cmd.PlayerID, cfg.PlayerAttackCooldown, cfg.MaxPlayerCooldowns); err != nil {
 		return err
 	}
 
@@ -725,7 +799,6 @@ func applyPlayerDefendStrike(next *WorldState, cmd Command, cfg Config, events *
 		return fmt.Errorf("%w: group %q cannot be targeted", ErrDeadEntity, target.GroupID)
 	}
 
-	// Authoritative damage calculation (never trusted from client input).
 	dmg := cfg.PlayerStrikeBaseDamage
 	if cfg.PlayerDamageVariance > 0 {
 		bonus := next.RNG.Int64N(cfg.PlayerDamageVariance + 1)
@@ -747,10 +820,20 @@ func applyPlayerDefendStrike(next *WorldState, cmd Command, cfg Config, events *
 	if target.HP == 0 {
 		target.State = ai.StateDead
 		target.MoraleBP = 0
+		target.TerminalTick = next.Tick
+		target.CurrentTarget = ai.TargetRef{}
+		target.CurrentTargetID = ""
+		target.TargetMemoryTicks = 0
+		if target.PopulationWeight == 0 {
+			target.Accounted = true
+		}
 		*events = append(*events, next.newEvent(EventCreaturePopulationChanged, target.GroupID, "Defeated", -1, nil))
+		if target.Role == ai.RoleCommander {
+			*fallen = append(*fallen, fallenCommander{family: target.Family, pos: target.DistanceToSettlement})
+			*events = append(*events, next.newEvent(EventCommanderFallen, target.GroupID, string(target.Family), 0, nil))
+		}
 	}
 
-	// Raise authoritative threat on deployed defender so orc/goblin AI perceives aggro.
 	if defIdx := findDefenderIndex(next.Defenders, cmd.PlayerID); defIdx >= 0 && next.Defenders[defIdx].HP > 0 {
 		nextThreat, err := safeAddInt64(next.Defenders[defIdx].ThreatScore, cfg.DefenderStrikeThreatGain)
 		if err != nil {
@@ -778,7 +861,7 @@ func applyPlayerSupportDefense(next *WorldState, cmd Command, cfg Config) error 
 	if defIdx := findDefenderIndex(next.Defenders, cmd.PlayerID); defIdx >= 0 && next.Defenders[defIdx].HP == 0 {
 		return fmt.Errorf("%w: defender %q is defeated", ErrDeadEntity, cmd.PlayerID)
 	}
-	if err := checkAndSetPlayerCooldown(next, cmd.PlayerID, cfg.PlayerAttackCooldown); err != nil {
+	if err := checkAndSetPlayerCooldown(next, cmd.PlayerID, cfg.PlayerAttackCooldown, cfg.MaxPlayerCooldowns); err != nil {
 		return err
 	}
 
@@ -824,7 +907,7 @@ func applyCompleteObjective(next *WorldState, cmd Command, cfg Config) error {
 	return addContribution(next, cmd.PlayerID, 0, 0, 1, cfg)
 }
 
-func checkAndSetPlayerCooldown(next *WorldState, playerID string, cooldownTicks int64) error {
+func checkAndSetPlayerCooldown(next *WorldState, playerID string, cooldownTicks int64, maxCooldowns int) error {
 	if uint64(cooldownTicks) > math.MaxUint64-next.Tick {
 		return ErrNumericOverflow
 	}
@@ -837,6 +920,9 @@ func checkAndSetPlayerCooldown(next *WorldState, playerID string, cooldownTicks 
 		}
 		next.PlayerCooldowns[idx].NextActionTick = next.Tick + uint64(cooldownTicks)
 		return nil
+	}
+	if len(next.PlayerCooldowns) >= maxCooldowns {
+		return fmt.Errorf("%w: max player cooldown entries %d reached", ErrCapacityExceeded, maxCooldowns)
 	}
 	next.PlayerCooldowns = slices.Insert(next.PlayerCooldowns, idx, PlayerCooldown{
 		PlayerID:       playerID,
@@ -913,4 +999,11 @@ func countActiveHostiles(groups []CreatureGroup) int {
 		}
 	}
 	return active
+}
+
+func absDiffInt64(a, b int64) int64 {
+	if a >= b {
+		return a - b
+	}
+	return b - a
 }

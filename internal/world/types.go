@@ -14,7 +14,7 @@ import (
 
 const (
 	// ConfigVersion versions deterministic simulation tuning parameters.
-	ConfigVersion uint32 = 2
+	ConfigVersion uint32 = 3
 	// UnitsPerTile defines fixed-point spatial resolution: 1000 WorldUnits = 1.000 tile.
 	UnitsPerTile int64 = 1000
 	// BasisPointsScale defines integer percentage resolution: 10000 = 100.00%.
@@ -34,6 +34,7 @@ var (
 	ErrInvasionNotActive         = errors.New("invasion is not active")
 	ErrNumericOverflow           = errors.New("integer overflow detected")
 	ErrCapacityExceeded          = errors.New("simulation capacity limit exceeded")
+	ErrRetiredGroupID            = errors.New("group_id was recently retired and cannot be reused")
 )
 
 // Config holds versioned, purely integer deterministic simulation rules and capacity bounds.
@@ -60,7 +61,7 @@ type Config struct {
 	PlayerSupportHeal          int64  `json:"player_support_heal"`
 	EligibilityMinScore        int64  `json:"eligibility_min_score"`
 
-	// Cycle 02 defender and bounded capacity limits (addresses Cycle 01 audit P2 capacity).
+	// Cycle 02 defender and bounded capacity limits.
 	DefenderBaseHP             int64 `json:"defender_base_hp"`
 	DefenderStrikeThreatGain   int64 `json:"defender_strike_threat_gain"`
 	DefenderSupportThreatGain  int64 `json:"defender_support_threat_gain"`
@@ -70,9 +71,18 @@ type Config struct {
 	MaxDefenders               int   `json:"max_defenders"`
 	MaxObjectives              int   `json:"max_objectives"`
 	MaxContributions           int   `json:"max_contributions"`
+
+	// Cycle 03 operational safety & entity lifecycle cleanup limits.
+	MaxSnapshotBytes           int    `json:"max_snapshot_bytes"`
+	MaxIdentifierLength        int    `json:"max_identifier_length"`
+	MaxCommandsPerTick         int    `json:"max_commands_per_tick"`
+	MaxPlayerCooldowns         int    `json:"max_player_cooldowns"`
+	GroupCleanupRetentionTicks uint64 `json:"group_cleanup_retention_ticks"`
+	MaxRetiredGroupIDs         int    `json:"max_retired_group_ids"`
 }
 
-// DefaultConfig returns a balanced deterministic configuration for Cycle 02.
+// DefaultConfig returns a balanced deterministic configuration preserving the standard
+// 32-group tactical ceiling while adding Cycle 03 lifecycle and snapshot safety limits.
 func DefaultConfig() Config {
 	return Config{
 		Version:                    ConfigVersion,
@@ -88,7 +98,7 @@ func DefaultConfig() Config {
 		HostileBaseDamage:          65,
 		HostileDamageVariance:      15,
 		HostileBaseHP:              400,
-		HostileRetreatThresholdBP:  1500, // 15.00%
+		HostileRetreatThresholdBP:  1500,
 		HostileRetreatExitDistance: 16 * UnitsPerTile,
 		MaxBattlefieldDistance:     24 * UnitsPerTile,
 		PlayerAttackCooldown:       8,
@@ -105,6 +115,12 @@ func DefaultConfig() Config {
 		MaxDefenders:               64,
 		MaxObjectives:              32,
 		MaxContributions:           128,
+		MaxSnapshotBytes:           simulation.DefaultMaxSnapshotBytes,
+		MaxIdentifierLength:        128,
+		MaxCommandsPerTick:         64,
+		MaxPlayerCooldowns:         128,
+		GroupCleanupRetentionTicks: 4,
+		MaxRetiredGroupIDs:         256,
 	}
 }
 
@@ -149,6 +165,9 @@ func (c Config) Validate() error {
 	if c.MaxActiveGroups <= 0 || c.MaxReinforcementWaves < 0 || c.MaxDefenders <= 0 || c.MaxObjectives <= 0 || c.MaxContributions <= 0 {
 		return fmt.Errorf("%w: invalid capacity bounds", ErrInvalidConfig)
 	}
+	if c.MaxSnapshotBytes <= 0 || c.MaxIdentifierLength <= 0 || c.MaxCommandsPerTick <= 0 || c.MaxPlayerCooldowns <= 0 || c.MaxRetiredGroupIDs <= 0 {
+		return fmt.Errorf("%w: invalid operational safety bounds", ErrInvalidConfig)
+	}
 	return nil
 }
 
@@ -162,7 +181,6 @@ const (
 	InvasionResolved    InvasionState = "Resolved"
 )
 
-// Valid reports whether the invasion state is recognized.
 func (s InvasionState) Valid() bool {
 	switch s {
 	case InvasionPeace, InvasionThreatened, InvasionUnderAttack, InvasionResolved:
@@ -172,7 +190,6 @@ func (s InvasionState) Valid() bool {
 	}
 }
 
-// Code returns a stable numeric code for canonical hashing.
 func (s InvasionState) Code() uint8 {
 	switch s {
 	case InvasionPeace:
@@ -199,9 +216,12 @@ type InvasionRecord struct {
 	ObjectivesCompleted  []string              `json:"objectives_completed"`
 	ContributionsEmitted bool                  `json:"contributions_emitted"`
 	ReinforcementWaves   int                   `json:"reinforcement_waves"`
+	TotalGroupsSpawned   int                   `json:"total_groups_spawned"`
 }
 
-// CreatureGroup models a hostile warband simulated by the World Director and Cycle 02 AI Engine.
+// CreatureGroup models a hostile tactical warband simulated by the World Director and AI Engine.
+// When materialized from the regional ecosystem, SourcePopulationID/SourceCampID/PopulationWeight
+// link it cleanly back to its abstract population for conserved loss/survivor reconciliation.
 type CreatureGroup struct {
 	GroupID                string          `json:"group_id"`
 	Archetype              string          `json:"archetype"`
@@ -219,7 +239,16 @@ type CreatureGroup struct {
 	MaxReinforcementCalls  int             `json:"max_reinforcement_calls"`
 	RecentDamageTaken      int64           `json:"recent_damage_taken"`
 	CurrentTargetID        string          `json:"current_target_id,omitempty"`
+	CurrentTarget          ai.TargetRef    `json:"current_target,omitempty"`
+	TargetMemoryTicks      int64           `json:"target_memory_ticks,omitempty"`
 	Routed                 bool            `json:"routed"`
+	TerminalTick           uint64          `json:"terminal_tick,omitempty"`
+	Accounted              bool            `json:"accounted,omitempty"`
+	SourcePopulationID     string          `json:"source_population_id,omitempty"`
+	SourceCampID           string          `json:"source_camp_id,omitempty"`
+	SourceRegionID         string          `json:"source_region_id,omitempty"`
+	FactionID              string          `json:"faction_id,omitempty"`
+	PopulationWeight       int64           `json:"population_weight,omitempty"`
 }
 
 // DefenderEntity models a deployed defender on the battlefield perceivable by Creature AI.
@@ -245,8 +274,9 @@ type PlayerContribution struct {
 	Objectives int64  `json:"objectives"`
 }
 
-// WorldState is the complete, deterministic, serializable logical state of a world slice.
-// All slices are maintained in strict canonical sorted order by stable ID.
+// WorldState is the complete, deterministic, serializable logical state of a tactical world slice.
+// All slices are maintained in strict canonical sorted order by stable ID (except RetiredGroupIDs,
+// which is a bounded FIFO retention ring).
 type WorldState struct {
 	SimulationID           string                       `json:"simulation_id"`
 	Tick                   uint64                       `json:"tick"`
@@ -259,6 +289,7 @@ type WorldState struct {
 	RegionalThreat         int64                        `json:"regional_threat"`
 	Invasion               InvasionRecord               `json:"invasion"`
 	Groups                 []CreatureGroup              `json:"groups"`
+	RetiredGroupIDs        []string                     `json:"retired_group_ids,omitempty"`
 	Defenders              []DefenderEntity             `json:"defenders"`
 	PlayerCooldowns        []PlayerCooldown             `json:"player_cooldowns"`
 	Contributions          []PlayerContribution         `json:"contributions"`
@@ -276,6 +307,10 @@ func (s WorldState) Clone() WorldState {
 	if out.Groups == nil {
 		out.Groups = []CreatureGroup{}
 	}
+	out.RetiredGroupIDs = slices.Clone(s.RetiredGroupIDs)
+	if out.RetiredGroupIDs == nil {
+		out.RetiredGroupIDs = []string{}
+	}
 	out.Defenders = slices.Clone(s.Defenders)
 	if out.Defenders == nil {
 		out.Defenders = []DefenderEntity{}
@@ -291,7 +326,7 @@ func (s WorldState) Clone() WorldState {
 	return out
 }
 
-// Validate verifies all authoritative state invariants.
+// Validate verifies core authoritative state invariants.
 func (s WorldState) Validate() error {
 	if strings.TrimSpace(s.SimulationID) == "" {
 		return fmt.Errorf("%w: empty simulation_id", ErrInvalidState)
@@ -317,8 +352,8 @@ func (s WorldState) Validate() error {
 	if !s.Invasion.Outcome.Valid() {
 		return fmt.Errorf("%w: invalid invasion outcome %q", ErrInvalidState, s.Invasion.Outcome)
 	}
-	if s.Invasion.ReinforcementWaves < 0 {
-		return fmt.Errorf("%w: negative reinforcement_waves %d", ErrInvalidState, s.Invasion.ReinforcementWaves)
+	if s.Invasion.ReinforcementWaves < 0 || s.Invasion.TotalGroupsSpawned < 0 {
+		return fmt.Errorf("%w: negative reinforcement_waves or total_groups_spawned", ErrInvalidState)
 	}
 	if s.Invasion.State == InvasionResolved && !s.Invasion.Outcome.ValidTerminal() {
 		return fmt.Errorf("%w: resolved invasion must have terminal outcome", ErrInvalidState)
@@ -336,6 +371,14 @@ func (s WorldState) Validate() error {
 		}
 	}
 
+	retiredSet := make(map[string]struct{}, len(s.RetiredGroupIDs))
+	for _, rid := range s.RetiredGroupIDs {
+		if strings.TrimSpace(rid) == "" {
+			return fmt.Errorf("%w: empty retired_group_id", ErrInvalidState)
+		}
+		retiredSet[rid] = struct{}{}
+	}
+
 	for i, g := range s.Groups {
 		if strings.TrimSpace(g.GroupID) == "" || strings.TrimSpace(g.Archetype) == "" {
 			return fmt.Errorf("%w: empty group_id or archetype", ErrInvalidState)
@@ -343,8 +386,15 @@ func (s WorldState) Validate() error {
 		if i > 0 && s.Groups[i-1].GroupID >= g.GroupID {
 			return fmt.Errorf("%w: groups not strictly sorted by group_id", ErrInvalidState)
 		}
-		if !g.Family.Valid() || !g.Role.Valid() {
-			return fmt.Errorf("%w: group %q has invalid family %q or role %q", ErrInvalidState, g.GroupID, g.Family, g.Role)
+		if _, collision := retiredSet[g.GroupID]; collision {
+			return fmt.Errorf("%w: active group %q collides with retired_group_ids", ErrInvalidState, g.GroupID)
+		}
+		prof, err := ai.LookupProfile(g.Archetype)
+		if err != nil {
+			return fmt.Errorf("%w: group %q unknown archetype %q", ErrInvalidState, g.GroupID, g.Archetype)
+		}
+		if g.Family != prof.Family || g.Role != prof.Role {
+			return fmt.Errorf("%w: group %q family/role (%s/%s) does not match catalog (%s/%s)", ErrInvalidState, g.GroupID, g.Family, g.Role, prof.Family, prof.Role)
 		}
 		if !g.State.Valid() {
 			return fmt.Errorf("%w: invalid group state %q", ErrInvalidState, g.State)
@@ -364,8 +414,11 @@ func (s WorldState) Validate() error {
 		if g.ReinforcementsCalled < 0 || g.MaxReinforcementCalls < 0 || g.ReinforcementsCalled > g.MaxReinforcementCalls {
 			return fmt.Errorf("%w: group %q invalid reinforcement call counts (%d/%d)", ErrInvalidState, g.GroupID, g.ReinforcementsCalled, g.MaxReinforcementCalls)
 		}
-		if g.RecentDamageTaken < 0 {
-			return fmt.Errorf("%w: group %q negative recent_damage_taken", ErrInvalidState, g.GroupID)
+		if g.RecentDamageTaken < 0 || g.TargetMemoryTicks < 0 || g.PopulationWeight < 0 {
+			return fmt.Errorf("%w: group %q negative damage/memory/weight", ErrInvalidState, g.GroupID)
+		}
+		if !g.CurrentTarget.Valid() {
+			return fmt.Errorf("%w: group %q invalid typed target %+v", ErrInvalidState, g.GroupID, g.CurrentTarget)
 		}
 	}
 
@@ -405,6 +458,40 @@ func (s WorldState) Validate() error {
 	return nil
 }
 
+// ValidateWithConfig enforces both state invariants and explicit operational/capacity caps.
+func (s WorldState) ValidateWithConfig(cfg Config) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if err := s.Validate(); err != nil {
+		return err
+	}
+	if len(s.Groups) > cfg.MaxActiveGroups ||
+		len(s.Defenders) > cfg.MaxDefenders ||
+		len(s.Invasion.ObjectivesCompleted) > cfg.MaxObjectives ||
+		len(s.Contributions) > cfg.MaxContributions ||
+		len(s.PlayerCooldowns) > cfg.MaxPlayerCooldowns ||
+		len(s.RetiredGroupIDs) > cfg.MaxRetiredGroupIDs ||
+		s.Invasion.ReinforcementWaves > cfg.MaxReinforcementWaves {
+		return ErrCapacityExceeded
+	}
+	maxID := cfg.MaxIdentifierLength
+	if len(s.SimulationID) > maxID || len(s.SettlementID) > maxID || len(s.RegionID) > maxID || len(s.Invasion.InvasionID) > maxID {
+		return fmt.Errorf("%w: top-level identifier exceeds max length %d", ErrInvalidState, maxID)
+	}
+	for _, g := range s.Groups {
+		if len(g.GroupID) > maxID || len(g.Archetype) > maxID || len(g.SourcePopulationID) > maxID || len(g.SourceCampID) > maxID {
+			return fmt.Errorf("%w: group identifier exceeds max length %d", ErrInvalidState, maxID)
+		}
+	}
+	for _, d := range s.Defenders {
+		if len(d.PlayerID) > maxID {
+			return fmt.Errorf("%w: defender identifier exceeds max length %d", ErrInvalidState, maxID)
+		}
+	}
+	return nil
+}
+
 // Checksum computes a canonical, architecture-independent SHA-256 digest of WorldState.
 func (s WorldState) Checksum() (string, error) {
 	if err := s.Validate(); err != nil {
@@ -429,6 +516,7 @@ func (s WorldState) Checksum() (string, error) {
 	h.WriteUint64(s.Invasion.ResolvedTick)
 	h.WriteBool(s.Invasion.ContributionsEmitted)
 	h.WriteInt64(int64(s.Invasion.ReinforcementWaves))
+	h.WriteInt64(int64(s.Invasion.TotalGroupsSpawned))
 	h.WriteUint64(uint64(len(s.Invasion.ObjectivesCompleted)))
 	for _, obj := range s.Invasion.ObjectivesCompleted {
 		h.WriteString(obj)
@@ -452,7 +540,22 @@ func (s WorldState) Checksum() (string, error) {
 		h.WriteInt64(int64(g.MaxReinforcementCalls))
 		h.WriteInt64(g.RecentDamageTaken)
 		h.WriteString(g.CurrentTargetID)
+		h.WriteUint8(g.CurrentTarget.Kind.Code())
+		h.WriteString(g.CurrentTarget.ID)
+		h.WriteInt64(g.TargetMemoryTicks)
 		h.WriteBool(g.Routed)
+		h.WriteUint64(g.TerminalTick)
+		h.WriteBool(g.Accounted)
+		h.WriteString(g.SourcePopulationID)
+		h.WriteString(g.SourceCampID)
+		h.WriteString(g.SourceRegionID)
+		h.WriteString(g.FactionID)
+		h.WriteInt64(g.PopulationWeight)
+	}
+
+	h.WriteUint64(uint64(len(s.RetiredGroupIDs)))
+	for _, rid := range s.RetiredGroupIDs {
+		h.WriteString(rid)
 	}
 
 	h.WriteUint64(uint64(len(s.Defenders)))
@@ -491,11 +594,31 @@ func (s WorldState) MarshalSnapshot() ([]byte, error) {
 	return simulation.EncodeSnapshot(s, sum)
 }
 
-// UnmarshalSnapshot decodes a versioned snapshot, validates all invariants, and verifies its checksum.
+// UnmarshalSnapshot decodes a versioned snapshot enforcing DefaultMaxSnapshotBytes before
+// JSON allocation, validating invariants and verifying its canonical checksum.
 func UnmarshalSnapshot(data []byte) (WorldState, error) {
 	return simulation.DecodeSnapshot(data, func(st WorldState) (string, error) {
 		return st.Checksum()
 	})
+}
+
+// UnmarshalSnapshotWithLimits enforces cfg.MaxSnapshotBytes BEFORE JSON decoding and
+// validates all operational capacity limits in cfg immediately upon restoration.
+func UnmarshalSnapshotWithLimits(data []byte, cfg Config) (WorldState, error) {
+	if err := cfg.Validate(); err != nil {
+		return WorldState{}, err
+	}
+	opts := simulation.DecodeOptions{MaxBytes: cfg.MaxSnapshotBytes}
+	st, err := simulation.DecodeSnapshotWithOptions(data, opts, func(st WorldState) (string, error) {
+		return st.Checksum()
+	})
+	if err != nil {
+		return WorldState{}, err
+	}
+	if err := st.ValidateWithConfig(cfg); err != nil {
+		return WorldState{}, err
+	}
+	return st, nil
 }
 
 // CommandKind enumerates untrusted external or scripted intentions processed authoritatively.
@@ -529,8 +652,9 @@ type Command struct {
 	TargetState   InvasionState `json:"target_state,omitempty"`
 }
 
-// CanonicalizeCommands returns a deterministically ordered copy of tick commands so
-// simulation outcomes never depend on network/caller arrival order within the same tick.
+// CanonicalizeCommands returns a deterministically ordered copy of tick commands covering
+// all payload fields so execution order is independent of caller slice ordering.
+// Note: deterministic ordering ensures replay equivalence, NOT competitive fairness policy.
 func CanonicalizeCommands(cmds []Command) []Command {
 	if len(cmds) <= 1 {
 		return slices.Clone(cmds)
@@ -577,6 +701,9 @@ func compareCommands(a, b Command) int {
 	if c := strings.Compare(a.GroupID, b.GroupID); c != 0 {
 		return c
 	}
+	if c := strings.Compare(a.Archetype, b.Archetype); c != 0 {
+		return c
+	}
 	if c := strings.Compare(a.TargetGroupID, b.TargetGroupID); c != 0 {
 		return c
 	}
@@ -586,8 +713,20 @@ func compareCommands(a, b Command) int {
 	if c := strings.Compare(a.Source, b.Source); c != 0 {
 		return c
 	}
+	if a.Count != b.Count {
+		if a.Count < b.Count {
+			return -1
+		}
+		return 1
+	}
 	if a.Position != b.Position {
 		if a.Position < b.Position {
+			return -1
+		}
+		return 1
+	}
+	if a.HomePosition != b.HomePosition {
+		if a.HomePosition < b.HomePosition {
 			return -1
 		}
 		return 1
@@ -617,6 +756,8 @@ const (
 	EventMoraleChanged             EventType = "MoraleChanged"
 	EventReinforcementsCalled      EventType = "ReinforcementsCalled"
 	EventTerritoryAlert            EventType = "TerritoryAlert"
+	EventCommanderFallen           EventType = "CommanderFallen"
+	EventGroupRetired              EventType = "GroupRetired"
 )
 
 // DomainEvent represents a deterministic, immutable fact emitted during a tick.

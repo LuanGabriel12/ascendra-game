@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"ascendra-game/internal/adapters/memory"
+	"ascendra-game/internal/ecosystem"
 	"ascendra-game/internal/world"
 )
 
@@ -29,8 +30,9 @@ func runAllScenarios(out io.Writer) error {
 		return err
 	}
 
+	// 1. Preserve all four Cycle 01 & 02 tactical scenarios.
 	cfg := world.DefaultConfig()
-	scenarios := []struct {
+	tacticalScenarios := []struct {
 		simID        string
 		seed         uint64
 		snapshotTick uint64
@@ -42,17 +44,23 @@ func runAllScenarios(out io.Writer) error {
 		{"sim-warband-02", 20260202, 32, 180, world.BuildWarbandCoordinationScenarioScript()},
 		{"sim-territory-02", 31337, 20, 65, world.BuildTerritorialLeashScenarioScript()},
 	}
-
-	for _, sc := range scenarios {
-		if err := runAndVerify(logger, reader, cfg, sc.simID, sc.seed, sc.snapshotTick, sc.totalTicks, sc.script); err != nil {
+	for _, sc := range tacticalScenarios {
+		if err := runTacticalAndVerify(logger, reader, cfg, sc.simID, sc.seed, sc.snapshotTick, sc.totalTicks, sc.script); err != nil {
 			logger.Error("scenario_failed", slog.String("simulation_id", sc.simID), slog.String("error", err.Error()))
 			return err
 		}
 	}
+
+	// 2. Run Cycle 03 Ecosystem Scenarios A-F.
+	ecoCfg := ecosystem.DefaultConfig()
+	if err := runEcosystemScenarios(logger, reader, cfg, ecoCfg); err != nil {
+		logger.Error("ecosystem_scenario_failed", slog.String("error", err.Error()))
+		return err
+	}
 	return nil
 }
 
-func runAndVerify(
+func runTacticalAndVerify(
 	logger *slog.Logger,
 	reader *memory.SettlementReader,
 	cfg world.Config,
@@ -68,20 +76,12 @@ func runAndVerify(
 		return err
 	}
 
-	logger.Info("simulation_started",
-		slog.String("event", "simulation_started"),
-		slog.Uint64("tick", initial.Tick),
-		slog.String("simulation_id", simID),
-		slog.String("entity_id", initial.SettlementID),
-	)
-
 	sinkA := memory.NewContributionSink()
 	resA, err := world.RunScenario(context.Background(), initial, script, totalTicks, cfg, sinkA)
 	if err != nil {
 		return err
 	}
 
-	// Verify snapshot/restore determinism at snapshotTick -> totalTicks.
 	atK, err := world.RunScenario(context.Background(), initial, script, snapshotTick, cfg, nil)
 	if err != nil {
 		return err
@@ -90,7 +90,7 @@ func runAndVerify(
 	if err != nil {
 		return err
 	}
-	restored, err := world.UnmarshalSnapshot(snapRaw)
+	restored, err := world.UnmarshalSnapshotWithLimits(snapRaw, cfg)
 	if err != nil {
 		return err
 	}
@@ -135,4 +135,165 @@ func runAndVerify(
 		slog.Duration("duration", time.Since(start)),
 	)
 	return nil
+}
+
+func runEcosystemScenarios(
+	logger *slog.Logger,
+	reader *memory.SettlementReader,
+	worldCfg world.Config,
+	ecoCfg ecosystem.Config,
+) error {
+	// Scenario A — Goblin Growth & Camp Expansion.
+	resA, err := ecosystem.RunEpochs(context.Background(), ecosystem.NewDefaultEcosystemState("eco-scenario-a-growth", 3001), nil, 15, ecoCfg, 256)
+	if err != nil {
+		return err
+	}
+	logEcoSummary(logger, "eco-scenario-a-growth", resA, true)
+
+	// Scenario B — Scarcity & Conserved Migration.
+	resB, err := ecosystem.RunEpochs(context.Background(), ecosystem.NewScarcityMigrationState("eco-scenario-b-migration", 3002), nil, 12, ecoCfg, 256)
+	if err != nil {
+		return err
+	}
+	logEcoSummary(logger, "eco-scenario-b-migration", resB, true)
+
+	// Scenario C — Territorial Dispute (Goblins vs Orcs).
+	resC, err := ecosystem.RunEpochs(context.Background(), ecosystem.NewTerritorialDisputeState("eco-scenario-c-dispute", 3003), nil, 15, ecoCfg, 256)
+	if err != nil {
+		return err
+	}
+	logEcoSummary(logger, "eco-scenario-c-dispute", resC, true)
+
+	// Scenario D — Rising Regional Threat to Critical.
+	resD, err := ecosystem.RunEpochs(context.Background(), ecosystem.NewRisingThreatState("eco-scenario-d-threat", 3004), nil, 10, ecoCfg, 256)
+	if err != nil {
+		return err
+	}
+	logEcoSummary(logger, "eco-scenario-d-threat", resD, true)
+
+	// Scenario E — Tactical Materialization, Combat Losses & Conserved Dematerialization.
+	wInit, err := world.NewWorldState("eco-scenario-e-materialize", "settlement-valewatch", 3005, reader)
+	if err != nil {
+		return err
+	}
+	intState := world.IntegratedState{
+		World:     wInit,
+		Ecosystem: ecosystem.NewDefaultEcosystemState("eco-scenario-e-materialize", 3005),
+	}
+	intState, _, _, err = world.MaterializeGroup(intState, "camp-thornveil-warren", "mat-goblin-1", "goblin-raider-pack", 2, 10000, worldCfg, ecoCfg)
+	if err != nil {
+		return err
+	}
+	intState, _, _, err = world.MaterializeGroup(intState, "camp-ironfang-bastion", "mat-orc-1", "orc-vanguard", 2, 11000, worldCfg, ecoCfg)
+	if err != nil {
+		return err
+	}
+	// Run 25 ticks (crosses 1 ecosystem epoch), then recall surviving orc group cleanly.
+	for tick := uint64(1); tick <= 25; tick++ {
+		var wCmds []world.Command
+		if tick == 1 {
+			wCmds = []world.Command{{Kind: world.CmdIncreaseThreat, Tick: 1, Delta: 1000}}
+		}
+		if tick == 5 || tick == 15 {
+			wCmds = []world.Command{{Kind: world.CmdPlayerDefendStrike, Tick: tick, PlayerID: "player-kael", TargetGroupID: "mat-goblin-1"}}
+		}
+		intState, _, _, err = world.StepIntegrated(intState, wCmds, nil, worldCfg, ecoCfg)
+		if err != nil {
+			return err
+		}
+	}
+	intState, recallSummary, _, err := world.DematerializeGroup(intState, "mat-orc-1", worldCfg, ecoCfg)
+	if err != nil {
+		return err
+	}
+	intChecksum, err := intState.Checksum(worldCfg, ecoCfg)
+	if err != nil {
+		return err
+	}
+	freeTotal, matTotal := ecosystem.TotalEcosystemPopulation(intState.Ecosystem)
+	logger.Info("ecosystem_scenario_completed",
+		slog.String("event", "ecosystem_scenario_completed"),
+		slog.String("simulation_id", "eco-scenario-e-materialize"),
+		slog.Uint64("tick", intState.World.Tick),
+		slog.Uint64("epoch", intState.Ecosystem.Epoch),
+		slog.Int64("free_population", freeTotal),
+		slog.Int64("materialized_population", matTotal),
+		slog.Int64("recalled_survivors", recallSummary.Survivors),
+		slog.Int64("recalled_losses", recallSummary.Losses),
+		slog.String("checksum", intChecksum),
+	)
+
+	// Scenario F — Ecosystem Snapshot Interrupt, Restore & Equivalence Verification.
+	initF := ecosystem.NewDefaultEcosystemState("eco-scenario-f-snapshot", 3006)
+	fullF, err := ecosystem.RunEpochs(context.Background(), initF, nil, 20, ecoCfg, 256)
+	if err != nil {
+		return err
+	}
+	midF, err := ecosystem.RunEpochs(context.Background(), initF, nil, 8, ecoCfg, 256)
+	if err != nil {
+		return err
+	}
+	rawF, err := midF.FinalState.MarshalSnapshot(ecoCfg)
+	if err != nil {
+		return err
+	}
+	restoredF, err := ecosystem.UnmarshalSnapshot(rawF, ecoCfg)
+	if err != nil {
+		return err
+	}
+	contF, err := ecosystem.RunEpochs(context.Background(), restoredF, nil, 20, ecoCfg, 256)
+	if err != nil {
+		return err
+	}
+	if fullF.FinalChecksum != contF.FinalChecksum {
+		return fmt.Errorf("scenario F snapshot divergence: %s != %s", fullF.FinalChecksum, contF.FinalChecksum)
+	}
+	logger.Info("ecosystem_scenario_completed",
+		slog.String("event", "ecosystem_scenario_completed"),
+		slog.String("simulation_id", "eco-scenario-f-snapshot"),
+		slog.Uint64("epoch", contF.FinalState.Epoch),
+		slog.Int("snapshot_bytes", len(rawF)),
+		slog.Bool("snapshot_verified", true),
+		slog.String("checksum", contF.FinalChecksum),
+	)
+	return nil
+}
+
+func logEcoSummary(logger *slog.Logger, simID string, res ecosystem.EpochResult, includeEvents bool) {
+	freeTotal, matTotal := ecosystem.TotalEcosystemPopulation(res.FinalState)
+	eventCounts := make(map[ecosystem.EventType]int)
+	for _, ev := range res.Events {
+		eventCounts[ev.Type]++
+	}
+	if includeEvents {
+		for _, ev := range res.Events {
+			switch ev.Type {
+			case ecosystem.EventCampExpanded,
+				ecosystem.EventPopulationMigrated,
+				ecosystem.EventTerritorialInfluenceChanged,
+				ecosystem.EventRegionalThreatChanged:
+				logger.Info(string(ev.Type),
+					slog.String("event", string(ev.Type)),
+					slog.String("simulation_id", simID),
+					slog.Uint64("epoch", ev.Epoch),
+					slog.String("region_id", ev.RegionID),
+					slog.String("entity_id", ev.EntityID),
+					slog.String("detail", ev.Detail),
+					slog.Int64("amount", ev.Amount),
+				)
+			}
+		}
+	}
+	logger.Info("ecosystem_scenario_completed",
+		slog.String("event", "ecosystem_scenario_completed"),
+		slog.String("simulation_id", simID),
+		slog.Uint64("epoch", res.FinalState.Epoch),
+		slog.Int64("free_population", freeTotal),
+		slog.Int64("materialized_population", matTotal),
+		slog.Int("active_camps", len(res.FinalState.Camps)),
+		slog.Int("migrations", eventCounts[ecosystem.EventPopulationMigrated]),
+		slog.Int("camp_expansions", eventCounts[ecosystem.EventCampExpanded]),
+		slog.Int("threat_changes", eventCounts[ecosystem.EventRegionalThreatChanged]),
+		slog.String("checksum", res.FinalChecksum),
+	)
 }
