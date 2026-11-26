@@ -2,6 +2,7 @@ package ecosystem
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 )
@@ -39,19 +40,30 @@ func processTerritory(state *EcosystemState, cfg Config, events *[]EcologicalEve
 					continue
 				}
 				// Bounded strength calculation.
-				contrib := tot * pop.StrengthPerIndividual
-				if contrib > 0 {
-					pwr += contrib
+				if pop.StrengthPerIndividual > (math.MaxInt64-pwr)/tot {
+					return ErrNumericOverflow
 				}
+				pwr += tot * pop.StrengthPerIndividual
 			}
 			for _, c := range state.Camps {
 				if c.RegionID == reg.RegionID && c.FactionID == f.FactionID && c.State.CanSupplyMaterialization() {
+					if c.Reserves > math.MaxInt64-pwr || c.Capacity > (math.MaxInt64-pwr-c.Reserves)/2 {
+						return ErrNumericOverflow
+					}
 					pwr += c.Capacity*2 + c.Reserves
 				}
 			}
 			if pwr > 0 {
 				powers = append(powers, factionPower{factionID: f.FactionID, power: pwr})
 			}
+		}
+
+		var totalPower int64
+		for _, fp := range powers {
+			if fp.power > math.MaxInt64-totalPower {
+				return ErrNumericOverflow
+			}
+			totalPower += fp.power
 		}
 
 		// 1. Resolve hostile rivalry attrition between explicitly StanceHostile factions present in region.
@@ -103,9 +115,11 @@ func processTerritory(state *EcosystemState, cfg Config, events *[]EcologicalEve
 						} else {
 							pop.MigrationPressureBP += boost
 						}
-						reg.RecentConflictScore += losses * 5
-						if reg.RecentConflictScore > cfg.MaxRegionalThreat {
+						room := max(0, cfg.MaxRegionalThreat-reg.RecentConflictScore)
+						if losses > room/5 {
 							reg.RecentConflictScore = cfg.MaxRegionalThreat
+						} else {
+							reg.RecentConflictScore += losses * 5
 						}
 						ev, err := state.newEvent(
 							EventPopulationDeclined,
@@ -129,11 +143,6 @@ func processTerritory(state *EcosystemState, cfg Config, events *[]EcologicalEve
 		prevMap := make(map[string]int64, len(reg.FactionInfluences))
 		for _, inf := range reg.FactionInfluences {
 			prevMap[inf.FactionID] = inf.InfluenceBP
-		}
-
-		var totalPower int64
-		for _, fp := range powers {
-			totalPower += fp.power
 		}
 
 		nextInf := make([]FactionInfluence, 0, len(powers))

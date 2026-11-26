@@ -46,10 +46,22 @@ func processResources(state *EcosystemState, events *[]EcologicalEvent) error {
 		}
 
 		// Allocate each resource strictly conserving total units.
-		foodAlloc, foodDepleted := allocateResource(&reg.Resources.Food, foodDemand)
-		woodAlloc, woodDepleted := allocateResource(&reg.Resources.Wood, woodDemand)
-		oreAlloc, oreDepleted := allocateResource(&reg.Resources.Ore, oreDemand)
-		waterAlloc, waterDepleted := allocateResource(&reg.Resources.Water, waterDemand)
+		foodAlloc, foodDepleted, err := allocateResource(&reg.Resources.Food, foodDemand)
+		if err != nil {
+			return err
+		}
+		woodAlloc, woodDepleted, err := allocateResource(&reg.Resources.Wood, woodDemand)
+		if err != nil {
+			return err
+		}
+		oreAlloc, oreDepleted, err := allocateResource(&reg.Resources.Ore, oreDemand)
+		if err != nil {
+			return err
+		}
+		waterAlloc, waterDepleted, err := allocateResource(&reg.Resources.Water, waterDemand)
+		if err != nil {
+			return err
+		}
 
 		if foodDepleted {
 			ev, err := state.newEvent(EventResourceDepleted, reg.RegionID, reg.RegionID, "food", "Food depleted", 0)
@@ -162,20 +174,20 @@ func ceilMilliDemand(count, perCapitaMilli int64) (int64, error) {
 
 // allocateResource distributes at most min(slot.Amount, slot.ExtractionLimit) across demands.
 // Guarantees exact integer conservation: sum(allocated) == consumed == initialAmount - finalAmount.
-func allocateResource(slot *ResourceSlot, demands []int64) ([]int64, bool) {
+func allocateResource(slot *ResourceSlot, demands []int64) ([]int64, bool, error) {
 	alloc := make([]int64, len(demands))
 	var totalDemand int64
 	for _, d := range demands {
 		if d > 0 {
 			if totalDemand > (1<<63-1)-d {
-				totalDemand = 1<<63 - 1
+				return nil, false, ErrNumericOverflow
 			} else {
 				totalDemand += d
 			}
 		}
 	}
 	if totalDemand == 0 || slot.Amount == 0 || slot.ExtractionLimit == 0 {
-		return alloc, false
+		return alloc, false, nil
 	}
 
 	available := slot.Amount
@@ -187,7 +199,7 @@ func allocateResource(slot *ResourceSlot, demands []int64) ([]int64, bool) {
 	if totalDemand <= available {
 		copy(alloc, demands)
 		slot.Amount -= totalDemand
-		return alloc, wasPositive && slot.Amount == 0
+		return alloc, wasPositive && slot.Amount == 0, nil
 	}
 
 	// Proportional allocation with deterministic canonical remainder distribution.
@@ -212,7 +224,7 @@ func allocateResource(slot *ResourceSlot, demands []int64) ([]int64, bool) {
 	}
 
 	slot.Amount -= distributed
-	return alloc, wasPositive && slot.Amount == 0
+	return alloc, wasPositive && slot.Amount == 0, nil
 }
 
 func regenerateResource(slot *ResourceSlot) (int64, bool) {
@@ -222,13 +234,7 @@ func regenerateResource(slot *ResourceSlot) (int64, bool) {
 	wasDepleted := slot.Amount == 0
 	headroom := slot.MaxCapacity - slot.Amount
 	rateGain := mulDivBP(headroom, slot.RegenRateBP)
-	gain := slot.RegenPerEpoch + rateGain
-	if gain < 0 {
-		gain = 0
-	}
-	if gain > headroom {
-		gain = headroom
-	}
+	gain := rateGain + min(slot.RegenPerEpoch, headroom-rateGain)
 	slot.Amount += gain
 	return gain, wasDepleted && slot.Amount > 0
 }

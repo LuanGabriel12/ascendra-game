@@ -223,14 +223,23 @@ func TestCapacityBoundsRejectedExplicitly(t *testing.T) {
 
 // Scaling benchmark under multi-group Creature AI load (16 active goblin/orc groups + 4 defenders).
 func BenchmarkWorldStepMultiGroup16(b *testing.B) {
+	benchmarkWorldStepBattlefield(b, 16, 4)
+}
+
+func BenchmarkWorldStepDefaultCapacity(b *testing.B) {
+	benchmarkWorldStepBattlefield(b, 32, 64)
+}
+
+func benchmarkWorldStepBattlefield(b *testing.B, groups, defenders int) {
+	b.Helper()
 	cfg := world.DefaultConfig()
 	cfg.MaxReinforcementWaves = 0 // Keep steady 16-group population for clean per-tick scaling baseline.
 	reader, _ := memory.NewSettlementReader(memory.DefaultSettlementFixtures()...)
 	st, _ := world.NewWorldState("sim-scale16", "settlement-valewatch", 77, reader)
 
-	cmds := make([]world.Command, 0, 21)
+	cmds := make([]world.Command, 0, groups+defenders+1)
 	archetypes := []string{"goblin-skirmisher", "goblin-raider-pack", "goblin-taskmaster", "orc-vanguard", "orc-warchief"}
-	for i := 0; i < 16; i++ {
+	for i := 0; i < groups; i++ {
 		cmds = append(cmds, world.Command{
 			Kind:         world.CmdSpawnHostileGroup,
 			Tick:         1,
@@ -241,20 +250,31 @@ func BenchmarkWorldStepMultiGroup16(b *testing.B) {
 			Position:     int64(5000 + (i%6)*800),
 		})
 	}
-	for i := 0; i < 4; i++ {
+	for i := 0; i < defenders; i++ {
 		cmds = append(cmds, world.Command{
 			Kind:     world.CmdDeployDefender,
 			Tick:     1,
 			PlayerID: fmt.Sprintf("def-%d", i),
-			Position: int64(1500 + i*600),
+			Position: min(int64(1500+i*600), cfg.MaxBattlefieldDistance),
 		})
 	}
 	cmds = append(cmds, world.Command{Kind: world.CmdIncreaseThreat, Tick: 1, Delta: 1000})
 
 	var err error
+	if len(cmds) > cfg.MaxCommandsPerTick {
+		first, remaining := cmds[:cfg.MaxCommandsPerTick], cmds[cfg.MaxCommandsPerTick:]
+		st, _, err = world.Step(st, first, cfg)
+		if err != nil {
+			b.Fatalf("setup first battlefield batch: %v", err)
+		}
+		for i := range remaining {
+			remaining[i].Tick = 2
+		}
+		cmds = remaining
+	}
 	st, _, err = world.Step(st, cmds, cfg)
 	if err != nil {
-		b.Fatalf("setup 16-group state failed: %v", err)
+		b.Fatalf("setup battlefield failed: %v", err)
 	}
 
 	b.ReportAllocs()

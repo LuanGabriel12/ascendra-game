@@ -266,3 +266,26 @@ func TestCycle03RetiredGroupIDRingBounded(t *testing.T) {
 		t.Fatalf("expected bounded RetiredGroupIDs length 3, got %d (%v)", len(st.RetiredGroupIDs), st.RetiredGroupIDs)
 	}
 }
+
+func TestAuditLinkedReinforcementDoesNotCreatePopulation(t *testing.T) {
+	wCfg, eCfg := world.DefaultConfig(), ecosystem.DefaultConfig()
+	st := world.IntegratedState{World: mustInitialState(t, "audit-reinforcement", 11), Ecosystem: ecosystem.NewDefaultEcosystemState("audit-reinforcement", 11)}
+	st, _, _, err := world.MaterializeGroup(st, "camp-thornveil-warren", "linked", "goblin-raider-pack", 1, 8000, wCfg, eCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.World.Groups[0].HP = st.World.Groups[0].MaxHP / 2
+	beforeFree, beforeMat := ecosystem.TotalEcosystemPopulation(st.Ecosystem)
+	next, _, _, err := world.StepIntegrated(st, []world.Command{{Kind: world.CmdIncreaseThreat, Tick: 1, Delta: 1000}}, nil, wCfg, eCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	free, mat := ecosystem.TotalEcosystemPopulation(next.Ecosystem)
+	if len(next.World.Groups) != 1 || next.World.Invasion.ReinforcementWaves != 0 || free != beforeFree || mat != beforeMat {
+		t.Fatal("unreserved reinforcements changed integrated state")
+	}
+	st.World.Groups[0].SourcePopulationID = "missing"
+	if st.Validate(wCfg, eCfg) == nil {
+		t.Fatal("orphan group accepted")
+	}
+}

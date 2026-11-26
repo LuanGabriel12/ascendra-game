@@ -1,6 +1,9 @@
 package ecosystem
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 // processRegionalThreat computes bounded integer regional threat and applies hysteresis
 // transitions between Stable, Growing, Hostile, and Critical threat bands.
@@ -31,7 +34,11 @@ func processRegionalThreat(state *EcosystemState, cfg Config, events *[]Ecologic
 				continue
 			}
 			tot := pop.FreePopulation + pop.MaterializedPopulation
-			hostileStrength += tot * pop.StrengthPerIndividual
+			if tot > (math.MaxInt64-hostileStrength)/pop.StrengthPerIndividual {
+				hostileStrength = math.MaxInt64
+			} else {
+				hostileStrength += tot * pop.StrengthPerIndividual
+			}
 		}
 
 		for _, c := range state.Camps {
@@ -42,7 +49,7 @@ func processRegionalThreat(state *EcosystemState, cfg Config, events *[]Ecologic
 			if fIdx < 0 || !state.Factions[fIdx].HostileToSettlement {
 				continue
 			}
-			hostileCampThreat += c.ThreatContribution
+			hostileCampThreat += min(c.ThreatContribution, math.MaxInt64-hostileCampThreat)
 		}
 
 		for _, inf := range reg.FactionInfluences {
@@ -66,8 +73,9 @@ func processRegionalThreat(state *EcosystemState, cfg Config, events *[]Ecologic
 		}
 
 		// Combine factors into bounded integer score [0, MaxRegionalThreat].
-		rawThreat := (hostileStrength / 6) + (hostileCampThreat / 2) + (hostileInfluenceBP / 40) + (reg.RecentConflictScore / 2)
-		scaledThreat := (rawThreat * proximityMult) / 100
+		rawThreat := hostileStrength/6 + hostileCampThreat/2 + hostileInfluenceBP/40
+		rawThreat += min(reg.RecentConflictScore/2, math.MaxInt64-rawThreat)
+		scaledThreat := mulDivBP(rawThreat, proximityMult*100)
 		if scaledThreat < 0 {
 			scaledThreat = 0
 		}
@@ -83,7 +91,7 @@ func processRegionalThreat(state *EcosystemState, cfg Config, events *[]Ecologic
 		if nextLevel != prevLevel {
 			detail := fmt.Sprintf("%s->%s", prevLevel, nextLevel)
 			if nextLevel == ThreatCritical {
-				if reg.LastEventIntentEpoch == 0 || state.Epoch >= reg.LastEventIntentEpoch+cfg.EventIntentCooldownEpochs {
+				if reg.LastEventIntentEpoch == 0 || state.Epoch >= reg.LastEventIntentEpoch && state.Epoch-reg.LastEventIntentEpoch >= cfg.EventIntentCooldownEpochs {
 					reg.LastEventIntentEpoch = state.Epoch
 					detail = fmt.Sprintf("%s->%s;intent=InvasionPressure", prevLevel, nextLevel)
 				}
@@ -101,7 +109,7 @@ func processRegionalThreat(state *EcosystemState, cfg Config, events *[]Ecologic
 			}
 			*events = append(*events, ev)
 		} else if nextLevel == ThreatCritical &&
-			(reg.LastEventIntentEpoch == 0 || state.Epoch >= reg.LastEventIntentEpoch+cfg.EventIntentCooldownEpochs) {
+			(reg.LastEventIntentEpoch == 0 || state.Epoch >= reg.LastEventIntentEpoch && state.Epoch-reg.LastEventIntentEpoch >= cfg.EventIntentCooldownEpochs) {
 			// Emit throttled intent reminder only after explicit cooldown expires.
 			reg.LastEventIntentEpoch = state.Epoch
 			ev, err := state.newEvent(

@@ -108,11 +108,6 @@ func ReserveForMaterialization(
 	if err != nil {
 		return MaterializationTicket{}, EcologicalEvent{}, err
 	}
-	pop.FreePopulation -= weight
-	pop.MaterializedPopulation = nextMat
-	if camp.AssignedPopulation > pop.FreePopulation {
-		camp.AssignedPopulation = pop.FreePopulation
-	}
 
 	ticket := MaterializationTicket{
 		PopulationID:   pop.PopulationID,
@@ -134,6 +129,9 @@ func ReserveForMaterialization(
 	if err != nil {
 		return MaterializationTicket{}, EcologicalEvent{}, err
 	}
+	pop.FreePopulation -= weight
+	pop.MaterializedPopulation = nextMat
+	camp.AssignedPopulation = min(camp.AssignedPopulation, pop.FreePopulation)
 	return ticket, ev, nil
 }
 
@@ -187,8 +185,6 @@ func ReconcileDematerialization(
 	if err != nil {
 		return DematerializationSummary{}, EcologicalEvent{}, err
 	}
-	pop.MaterializedPopulation -= ticket.ContingentSize
-	pop.FreePopulation = nextFree
 
 	summary := DematerializationSummary{
 		PopulationID: pop.PopulationID,
@@ -206,5 +202,7 @@ func ReconcileDematerialization(
 	if err != nil {
 		return DematerializationSummary{}, EcologicalEvent{}, err
 	}
+	pop.MaterializedPopulation -= ticket.ContingentSize
+	pop.FreePopulation = nextFree
 	return summary, ev, nil
 }

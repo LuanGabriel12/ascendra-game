@@ -2,6 +2,7 @@ package ecosystem
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 
@@ -20,11 +21,12 @@ type MigrationPlan struct {
 }
 
 // processMigration executes strict two-phase deterministic migration:
-//   Phase 1 (Plan): reads an immutable snapshot of regions and populations so that
-//                   region processing order cannot alter decisions and no contingent
-//                   migrates twice in the same epoch.
-//   Phase 2 (Apply): executes transfers atomically with exact population conservation
-//                    (sum(outflow) == sum(inflow), zero duplication, zero rounding loss).
+//
+//	Phase 1 (Plan): reads an immutable snapshot of regions and populations so that
+//	                region processing order cannot alter decisions and no contingent
+//	                migrates twice in the same epoch.
+//	Phase 2 (Apply): executes transfers atomically with exact population conservation
+//	                 (sum(outflow) == sum(inflow), zero duplication, zero rounding loss).
 func processMigration(state *EcosystemState, cfg Config, events *[]EcologicalEvent) error {
 	if cfg.MaxMigrantsPerEpoch == 0 || cfg.MigrationShareBP == 0 {
 		return nil
@@ -36,7 +38,10 @@ func processMigration(state *EcosystemState, cfg Config, events *[]EcologicalEve
 
 	// Phase 2: apply all plans deterministically in canonical SourcePopID order.
 	for _, plan := range plans {
-		if plan.Count <= 0 {
+		destIdx := findRegionIndex(state.Regions, plan.DestRegionID)
+		headroom := state.Regions[destIdx].CarryingCapacity - totalRegionPopulation(state.Populations, plan.DestRegionID)
+		plan.Count = min(plan.Count, headroom)
+		if plan.Count < cfg.MinMigrationGroupSize {
 			continue
 		}
 		srcIdx := findPopulationIndex(state.Populations, plan.SourcePopID)
@@ -59,24 +64,27 @@ func processMigration(state *EcosystemState, cfg Config, events *[]EcologicalEve
 			if destRegIdx < 0 {
 				continue
 			}
+			if state.PopSeq == math.MaxUint64 {
+				return ErrNumericOverflow
+			}
 			state.PopSeq++
 			newPopID := fmt.Sprintf("pop-%s-%s-%04d", plan.DestRegionID, plan.FactionID, state.PopSeq)
 			newPop := Population{
-				PopulationID:          newPopID,
-				RegionID:              plan.DestRegionID,
-				SpeciesID:             src.SpeciesID,
-				FamilyID:              src.FamilyID,
-				FactionID:             src.FactionID,
-				FreePopulation:        0,
+				PopulationID:           newPopID,
+				RegionID:               plan.DestRegionID,
+				SpeciesID:              src.SpeciesID,
+				FamilyID:               src.FamilyID,
+				FactionID:              src.FactionID,
+				FreePopulation:         0,
 				MaterializedPopulation: 0,
-				CarryingCapacity:      state.Regions[destRegIdx].CarryingCapacity,
-				GrowthRateBP:          src.GrowthRateBP,
-				MortalityRateBP:       src.MortalityRateBP,
-				FoodPerCapitaMilli:    src.FoodPerCapitaMilli,
-				WoodPerCapitaMilli:    src.WoodPerCapitaMilli,
-				OrePerCapitaMilli:     src.OrePerCapitaMilli,
-				WaterPerCapitaMilli:   src.WaterPerCapitaMilli,
-				StrengthPerIndividual: src.StrengthPerIndividual,
+				CarryingCapacity:       state.Regions[destRegIdx].CarryingCapacity,
+				GrowthRateBP:           src.GrowthRateBP,
+				MortalityRateBP:        src.MortalityRateBP,
+				FoodPerCapitaMilli:     src.FoodPerCapitaMilli,
+				WoodPerCapitaMilli:     src.WoodPerCapitaMilli,
+				OrePerCapitaMilli:      src.OrePerCapitaMilli,
+				WaterPerCapitaMilli:    src.WaterPerCapitaMilli,
+				StrengthPerIndividual:  src.StrengthPerIndividual,
 			}
 			insertIdx, _ := slices.BinarySearchFunc(state.Populations, newPop.PopulationID, func(p Population, id string) int {
 				return strings.Compare(p.PopulationID, id)
@@ -244,7 +252,11 @@ func totalRegionPopulation(pops []Population, regionID string) int64 {
 	var total int64
 	for _, p := range pops {
 		if p.RegionID == regionID {
-			total += p.FreePopulation + p.MaterializedPopulation
+			size := p.FreePopulation + p.MaterializedPopulation
+			if size > math.MaxInt64-total {
+				return math.MaxInt64
+			}
+			total += size
 		}
 	}
 	return total

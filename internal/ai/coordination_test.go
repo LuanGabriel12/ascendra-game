@@ -2,6 +2,8 @@ package ai_test
 
 import (
 	"fmt"
+	"math"
+	"math/rand"
 	"reflect"
 	"testing"
 
@@ -411,6 +413,33 @@ func BenchmarkCoordinateSpatialDistributions(b *testing.B) {
 					}
 				}
 			})
+		}
+	}
+}
+
+func TestAuditSpatialCoordinationRandomized(t *testing.T) {
+	for _, seed := range []int64{20260301, 20260302, 20260303} {
+		rng := rand.New(rand.NewSource(seed))
+		for iteration := 0; iteration < 50; iteration++ {
+			groups, targets := buildSpatialDataset(1+rng.Intn(80), "dense")
+			for i := range groups {
+				groups[i].Position = int64(rng.Intn(25)) * 1000
+				if rng.Intn(10) == 0 {
+					groups[i].Position = math.MaxInt64 - int64(rng.Intn(4))
+				}
+				groups[i].Routed = rng.Intn(8) == 0
+			}
+			if rng.Intn(4) == 0 {
+				targets = nil
+			}
+			invasion := rng.Intn(2) == 0
+			got, err := ai.Coordinate(groups, targets, invasion)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := coordinateReference(groups, targets, invasion); !reflect.DeepEqual(got, want) {
+				t.Fatalf("spatial reference mismatch seed=%d iteration=%d", seed, iteration)
+			}
 		}
 	}
 }

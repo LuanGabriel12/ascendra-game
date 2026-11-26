@@ -40,9 +40,28 @@ func (s IntegratedState) Validate(worldCfg Config, ecoCfg ecosystem.Config) erro
 
 	// Verify exact conservation: sum(un-accounted tactical PopulationWeight per pop) == MaterializedPopulation.
 	expectedMat := make(map[string]int64, len(s.Ecosystem.Populations))
+	populations := make(map[string]ecosystem.Population, len(s.Ecosystem.Populations))
+	for _, pop := range s.Ecosystem.Populations {
+		populations[pop.PopulationID] = pop
+	}
+	camps := make(map[string]string, len(s.Ecosystem.Camps))
+	for _, camp := range s.Ecosystem.Camps {
+		camps[camp.CampID] = camp.PopulationID
+	}
 	for _, g := range s.World.Groups {
+		if g.PopulationWeight > 0 && g.Accounted && g.HP > 0 && !g.Routed && g.State != ai.StateDead {
+			return fmt.Errorf("%w: active group %q is already accounted", ErrInvalidState, g.GroupID)
+		}
 		if g.PopulationWeight > 0 && !g.Accounted {
-			expectedMat[g.SourcePopulationID] += g.PopulationWeight
+			pop, ok := populations[g.SourcePopulationID]
+			if !ok || camps[g.SourceCampID] != g.SourcePopulationID || pop.RegionID != g.SourceRegionID || pop.FactionID != g.FactionID || pop.FamilyID != g.Family {
+				return fmt.Errorf("%w: invalid population provenance for group %q", ErrInvalidState, g.GroupID)
+			}
+			total, err := safeAddInt64(expectedMat[g.SourcePopulationID], g.PopulationWeight)
+			if err != nil {
+				return err
+			}
+			expectedMat[g.SourcePopulationID] = total
 		}
 	}
 	for _, pop := range s.Ecosystem.Populations {
@@ -150,6 +169,9 @@ func MaterializeGroup(
 	}
 
 	spawnPos := worldCfg.HostileSpawnDistance
+	if position < 0 {
+		return IntegratedState{}, nil, nil, fmt.Errorf("%w: negative position", ErrInvalidCommand)
+	}
 	if position > 0 {
 		if position > worldCfg.MaxBattlefieldDistance {
 			return IntegratedState{}, nil, nil, fmt.Errorf("%w: position %d exceeds battlefield limit", ErrInvalidCommand, position)
@@ -292,13 +314,8 @@ func StepIntegrated(
 
 		// Bridge critical regional threat pressure into tactical world threat (bounded, non-spam).
 		for _, reg := range nextEco.Regions {
-			if reg.ThreatLevel == ecosystem.ThreatCritical && reg.LastEventIntentEpoch == nextEco.Epoch {
-				boost := int64(250)
-				if nextWorld.RegionalThreat+boost > worldCfg.MaxThreat {
-					nextWorld.RegionalThreat = worldCfg.MaxThreat
-				} else {
-					nextWorld.RegionalThreat += boost
-				}
+			if (reg.RegionID == nextWorld.RegionID || (reg.HasSettlement && reg.SettlementID == nextWorld.SettlementID)) && reg.ThreatLevel == ecosystem.ThreatCritical && reg.LastEventIntentEpoch == nextEco.Epoch {
+				nextWorld.RegionalThreat += min(int64(250), max(0, worldCfg.MaxThreat-nextWorld.RegionalThreat))
 			}
 		}
 	}

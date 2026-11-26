@@ -137,14 +137,13 @@ func applyCommand(next *EcosystemState, cmd Command, cfg Config, events *[]Ecolo
 		}
 		pop.FreePopulation -= losses
 		if rIdx := findRegionIndex(next.Regions, pop.RegionID); rIdx >= 0 {
-			nextConflict, err := safeAddInt64(next.Regions[rIdx].RecentConflictScore, losses*4)
-			if err != nil {
-				return err
+			region := &next.Regions[rIdx]
+			room := max(0, cfg.MaxRegionalThreat-region.RecentConflictScore)
+			if losses > room/4 {
+				region.RecentConflictScore = cfg.MaxRegionalThreat
+			} else {
+				region.RecentConflictScore += losses * 4
 			}
-			if nextConflict > cfg.MaxRegionalThreat {
-				nextConflict = cfg.MaxRegionalThreat
-			}
-			next.Regions[rIdx].RecentConflictScore = nextConflict
 		}
 		if losses > 0 {
 			ev, err := next.newEvent(EventPopulationDeclined, pop.RegionID, pop.PopulationID, "", "External conflict losses", losses)

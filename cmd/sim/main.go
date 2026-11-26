@@ -6,6 +6,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"reflect"
+	"slices"
 	"time"
 
 	"ascendra-game/internal/adapters/memory"
@@ -98,6 +100,13 @@ func runTacticalAndVerify(
 	resB, err := world.RunScenario(context.Background(), restored, script, totalTicks, cfg, sinkB)
 	if err != nil {
 		return err
+	}
+	cutA := 0
+	for cutA < len(resA.Events) && resA.Events[cutA].Tick <= snapshotTick {
+		cutA++
+	}
+	if !reflect.DeepEqual(resA.Events[cutA:], resB.Events) {
+		return fmt.Errorf("snapshot continuation events diverged")
 	}
 	if resA.FinalChecksum != resB.FinalChecksum {
 		return fmt.Errorf("snapshot/restore checksum mismatch: %s != %s", resA.FinalChecksum, resB.FinalChecksum)
@@ -244,6 +253,13 @@ func runEcosystemScenarios(
 	contF, err := ecosystem.RunEpochs(context.Background(), restoredF, nil, 20, ecoCfg, 256)
 	if err != nil {
 		return err
+	}
+	cutF := 0
+	for cutF < len(fullF.Events) && fullF.Events[cutF].Epoch <= 8 {
+		cutF++
+	}
+	if !slices.Equal(fullF.Events[cutF:], contF.Events) {
+		return fmt.Errorf("snapshot continuation events diverged")
 	}
 	if fullF.FinalChecksum != contF.FinalChecksum {
 		return fmt.Errorf("scenario F snapshot divergence: %s != %s", fullF.FinalChecksum, contF.FinalChecksum)

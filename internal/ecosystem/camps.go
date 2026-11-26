@@ -2,6 +2,7 @@ package ecosystem
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 )
@@ -57,7 +58,9 @@ func processCamps(state *EcosystemState, cfg Config, events *[]EcologicalEvent) 
 				c.Reserves -= 10
 			} else {
 				c.Reserves = 0
-				c.StarvationEpochs++
+				if c.StarvationEpochs < cfg.CampAbandonStarveEpochs {
+					c.StarvationEpochs++
+				}
 				if c.State != CampResourceStarved {
 					c.State = CampResourceStarved
 				}
@@ -77,7 +80,7 @@ func processCamps(state *EcosystemState, cfg Config, events *[]EcologicalEvent) 
 			c.StarvationEpochs = 0
 			// Build modest reserves from local surplus food (conserved from region food pool).
 			reserveGain := int64(5)
-			if reg.Resources.Food.Amount >= reserveGain && c.Reserves+reserveGain <= c.Capacity*2 {
+			if reg.Resources.Food.Amount >= reserveGain && c.Reserves <= min(c.Capacity, math.MaxInt64/2)*2-reserveGain {
 				reg.Resources.Food.Amount -= reserveGain
 				c.Reserves += reserveGain
 			}
@@ -110,10 +113,7 @@ func processCamps(state *EcosystemState, cfg Config, events *[]EcologicalEvent) 
 			reg.Resources.Wood.Amount >= cfg.CampExpandWoodCost {
 
 			reg.Resources.Wood.Amount -= cfg.CampExpandWoodCost
-			newCap := c.Capacity + cfg.CampExpandCapacityGain
-			if newCap > cfg.CampMaxCapacity {
-				newCap = cfg.CampMaxCapacity
-			}
+			newCap := c.Capacity + min(cfg.CampExpandCapacityGain, cfg.CampMaxCapacity-c.Capacity)
 			gain := newCap - c.Capacity
 			c.Capacity = newCap
 			c.State = CampExpanding
@@ -127,9 +127,9 @@ func processCamps(state *EcosystemState, cfg Config, events *[]EcologicalEvent) 
 		}
 
 		// Update camp threat contribution cleanly from assigned population and reserves.
-		c.ThreatContribution = (c.AssignedPopulation * 3) + (c.Reserves / 2)
+		c.ThreatContribution = min(c.AssignedPopulation, (math.MaxInt64-c.Reserves/2)/3)*3 + c.Reserves/2
 		if c.State == CampExpanding {
-			c.ThreatContribution += 40
+			c.ThreatContribution += min(40, math.MaxInt64-c.ThreatContribution)
 		}
 	}
 
@@ -192,6 +192,9 @@ func tryEstablishCamp(state *EcosystemState, popID string, cfg Config, events *[
 	}
 
 	reg.Resources.Wood.Amount -= cfg.CampEstablishWoodCost
+	if state.CampSeq == math.MaxUint64 {
+		return ErrNumericOverflow
+	}
 	state.CampSeq++
 	campID := fmt.Sprintf("camp-%s-%04d", pop.FactionID, state.CampSeq)
 	initCap := int64(60)
@@ -211,7 +214,7 @@ func tryEstablishCamp(state *EcosystemState, popID string, cfg Config, events *[
 		PopulationID:            pop.PopulationID,
 		AssignedPopulation:      assigned,
 		Capacity:                initCap,
-		Reserves:                15,
+		Reserves:                0,
 		State:                   CampEstablishing,
 		ThreatContribution:      assigned * 2,
 		CreatedEpoch:            state.Epoch,

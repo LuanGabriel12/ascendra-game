@@ -324,7 +324,8 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 				g.DistanceToSettlement = moved
 			}
 
-			if decision.RequestReinforcements {
+			// Linked groups need a population reservation before reinforcements can spawn.
+			if decision.RequestReinforcements && g.PopulationWeight == 0 {
 				pendingReinforcements = append(pendingReinforcements, reinforcementRequest{
 					callerIndex: i,
 					callerID:    g.GroupID,

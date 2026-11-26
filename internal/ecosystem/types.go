@@ -676,7 +676,7 @@ func (s EcosystemState) Validate(cfg Config) error {
 			return fmt.Errorf("%w: camp %q references missing faction %q", ErrInvalidReference, c.CampID, c.FactionID)
 		}
 		pop, ok := popSet[c.PopulationID]
-		if !ok || pop.RegionID != c.RegionID || pop.FactionID != c.FactionID {
+		if !ok || pop.RegionID != c.RegionID || pop.FactionID != c.FactionID || pop.FamilyID != c.FamilyID {
 			return fmt.Errorf("%w: camp %q population reference %q mismatch", ErrInvalidReference, c.CampID, c.PopulationID)
 		}
 		if !c.FamilyID.Valid() || !c.State.Valid() {
