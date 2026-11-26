@@ -1,5 +1,7 @@
 # ASCENDRA — Real-Time Gameplay Backend Foundation (NEON Cycle 1)
 
+Multiplayer RPG - Ascendra Game
+
 Este repositório contém a fundação técnica inicial do backend de simulação em tempo real do projeto **ASCENDRA**, entregue no **Ciclo 1** sob responsabilidade de **NEON**.
 
 > **Nota importante de identidade:** `NEON` é exclusivamente o nome do papel/desenvolvedor responsável pelo núcleo de simulação de gameplay. Este projeto **não** usa Neon Database nem qualquer serviço externo chamado Neon.
