@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ascendra.game/contracts/events/settlement-state-changed.v1.schema.json",
+  "title": "SettlementStateChangedEventV1",
+  "description": "CARBON OUTBOX EVENT (v1) — Persisted atomically in outbox_events whenever CARBON commits an authoritative settlement state transition.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "settlement_id",
+    "region_id",
+    "previous_state",
+    "new_state",
+    "previous_faction_id",
+    "new_faction_id",
+    "settlement_version",
+    "cause_event_id",
+    "cause_event_type"
+  ],
+  "properties": {
+    "settlement_id": { "type": "string", "format": "uuid" },
+    "region_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "previous_state": {
+      "type": "string",
+      "enum": ["peaceful", "threatened", "under_attack", "occupied", "rebuilding"]
+    },
+    "new_state": {
+      "type": "string",
+      "enum": ["peaceful", "threatened", "under_attack", "occupied", "rebuilding"]
+    },
+    "previous_faction_id": { "type": ["string", "null"], "format": "uuid" },
+    "new_faction_id": { "type": ["string", "null"], "format": "uuid" },
+    "settlement_version": { "type": "integer", "minimum": 2 },
+    "cause_event_id": { "type": "string", "format": "uuid" },
+    "cause_event_type": { "type": "string" }
+  }
+}

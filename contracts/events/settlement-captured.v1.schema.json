@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ascendra.game/contracts/events/settlement-captured.v1.schema.json",
+  "title": "SettlementCapturedEventV1",
+  "description": "PROPOSED SHARED CONTRACT (v1) — Emitted by NEON when an invasion or siege results in a faction capturing a settlement. Requires NEON confirmation.",
+  "allOf": [
+    { "$ref": "./envelope.v1.schema.json" },
+    {
+      "properties": {
+        "event_type": { "const": "SettlementCaptured" },
+        "version": { "const": 1 },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["settlement_id", "capturing_faction_id"],
+          "properties": {
+            "settlement_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "capturing_faction_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "invasion_id": {
+              "type": "string",
+              "format": "uuid",
+              "description": "Optional reference to NEON's invasion instance for audit correlation."
+            },
+            "expected_settlement_version": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Optional optimistic concurrency guard when NEON targets a known settlement state version."
+            }
+          }
+        }
+      }
+    }
+  ]
+}

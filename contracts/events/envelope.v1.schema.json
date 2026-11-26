@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ascendra.game/contracts/events/envelope.v1.schema.json",
+  "title": "AscendraSharedEventEnvelopeV1",
+  "description": "PROPOSED SHARED CONTRACT (v1) — Versioned event envelope between NEON and CARBON. Requires coordination before breaking changes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "version",
+    "occurred_at",
+    "correlation_id",
+    "source",
+    "payload"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Globally unique immutable identifier for this event instance."
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Optional logical deduplication key. Defaults to event_id when omitted."
+    },
+    "event_type": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Authoritative ISO-8601 UTC timestamp when the domain event occurred."
+    },
+    "correlation_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Trace correlation identifier propagating across world simulation and persistence."
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "Originating subsystem identifier (e.g. neon.invasion-engine, carbon.settlements)."
+    },
+    "payload": {
+      "type": "object"
+    }
+  }
+}

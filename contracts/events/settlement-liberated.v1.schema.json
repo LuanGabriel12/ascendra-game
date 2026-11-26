@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ascendra.game/contracts/events/settlement-liberated.v1.schema.json",
+  "title": "SettlementLiberatedEventV1",
+  "description": "PROPOSED SHARED CONTRACT (v1) — Emitted by NEON when an occupied or besieged settlement is liberated. Requires NEON confirmation.",
+  "allOf": [
+    { "$ref": "./envelope.v1.schema.json" },
+    {
+      "properties": {
+        "event_type": { "const": "SettlementLiberated" },
+        "version": { "const": 1 },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["settlement_id", "liberating_faction_id"],
+          "properties": {
+            "settlement_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "liberating_faction_id": {
+              "type": "string",
+              "format": "uuid",
+              "description": "Nullable only if liberated into neutral autonomy; in v1 requires a valid registered faction UUID."
+            },
+            "resulting_state": {
+              "type": "string",
+              "enum": ["rebuilding", "peaceful"],
+              "default": "rebuilding",
+              "description": "Defaults to 'rebuilding' when liberating an occupied settlement, or 'peaceful' when repelling an active attack."
+            },
+            "expected_settlement_version": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      }
+    }
+  ]
+}
