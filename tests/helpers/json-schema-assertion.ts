@@ -76,6 +76,9 @@ export function validateAgainstJsonSchema(
       if (t === "object") {
         return typeof candidate === "object" && candidate !== null && !Array.isArray(candidate);
       }
+      if (t === "array") {
+        return Array.isArray(candidate);
+      }
       if (t === "string") {
         return typeof candidate === "string";
       }

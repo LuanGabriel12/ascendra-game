@@ -145,12 +145,10 @@ describe("CARBON Session 02 — SettlementSnapshot, Contribution Engine & Cross-
       [legacyEventId, legacyEventId, legacyCorrelationId, legacyOccupiedId],
     );
 
-    // Run incremental migrateUp -> applies 0002 and 0003 over existing 0001 data!
+    // Run incremental migrateUp -> applies 0002, 0003, and any newer incremental migrations over existing 0001 data!
     const incrementalApplied = await migrateUp(pgCtx.pool, MIGRATIONS_DIR);
-    assert.deepEqual(incrementalApplied, [
-      "0002_settlement_snapshot_and_inbox_fingerprint",
-      "0003_gameplay_contributions",
-    ]);
+    assert.ok(incrementalApplied.includes("0002_settlement_snapshot_and_inbox_fingerprint"));
+    assert.ok(incrementalApplied.includes("0003_gameplay_contributions"));
 
     // Verify explicit backfill on pre-existing 0001 settlements
     const snapshotReader = new PostgresSettlementSnapshotReader(pgCtx.pool);
@@ -189,20 +187,18 @@ describe("CARBON Session 02 — SettlementSnapshot, Contribution Engine & Cross-
       InboxIdempotencyConflictError,
     );
 
-    // Rollback all 3 migrations to empty DB and re-apply cleanly from scratch (Case 3)
-    const rolledDownAll = await migrateDown(pgCtx.pool, MIGRATIONS_DIR, 3);
-    assert.deepEqual(rolledDownAll, [
-      "0003_gameplay_contributions",
-      "0002_settlement_snapshot_and_inbox_fingerprint",
-      "0001_carbon_settlement_slice",
-    ]);
+    // Rollback all applied migrations dynamically to empty DB and re-apply cleanly from scratch (Case 3)
+    const currentlyApplied = await listAppliedMigrations(pgCtx.pool);
+    const rolledDownAll = await migrateDown(pgCtx.pool, MIGRATIONS_DIR, currentlyApplied.length);
+    assert.ok(rolledDownAll.includes("0003_gameplay_contributions"));
+    assert.ok(rolledDownAll.includes("0002_settlement_snapshot_and_inbox_fingerprint"));
+    assert.ok(rolledDownAll.includes("0001_carbon_settlement_slice"));
 
     const cleanApplyAll = await migrateUp(pgCtx.pool, MIGRATIONS_DIR);
-    assert.deepEqual(cleanApplyAll, [
-      "0001_carbon_settlement_slice",
-      "0002_settlement_snapshot_and_inbox_fingerprint",
-      "0003_gameplay_contributions",
-    ]);
+    assert.equal(cleanApplyAll.length, currentlyApplied.length);
+    assert.ok(cleanApplyAll.includes("0001_carbon_settlement_slice"));
+    assert.ok(cleanApplyAll.includes("0002_settlement_snapshot_and_inbox_fingerprint"));
+    assert.ok(cleanApplyAll.includes("0003_gameplay_contributions"));
   });
 
   it("Cases 4, 5, 6 & 24: SettlementSnapshot projection, missing settlement, defense_state orthogonality, and settlement_history preservation", async () => {

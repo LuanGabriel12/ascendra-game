@@ -76,19 +76,19 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Verify full migration lifecycle (up -> down x3 -> up)
+      - name: Verify full migration lifecycle dynamically (up -> down:all -> up)
         run: |
           npm run migrate:up
-          npm run migrate:down
-          npm run migrate:down
-          npm run migrate:down
+          npm run migrate:down:all
           npm run migrate:up
 
       - name: Run real PostgreSQL integration test suites
         run: npm test
 
-      - name: Run reproducible Session 02 integrated demonstration
-        run: npm run demo:session02
+      - name: Run reproducible Session 02 & Session 03 headless demonstrations
+        run: |
+          npm run demo:session02
+          npm run demo:session03
 
   neon-go:
     name: NEON Go Simulation & Race Detector

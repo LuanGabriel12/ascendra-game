@@ -43,6 +43,18 @@ async function main(): Promise<void> {
         rolled_back_count: rolledBack.length,
         migrations: rolledBack,
       });
+    } else if (command === "down:all") {
+      const current = await listAppliedMigrations(pool);
+      const rolledBack =
+        current.length > 0
+          ? await migrateDown(pool, DEFAULT_MIGRATIONS_DIR, current.length)
+          : [];
+      logger.info("All applied migrations rolled back", {
+        operation: "migrate:down:all",
+        result: "ok",
+        rolled_back_count: rolledBack.length,
+        migrations: rolledBack,
+      });
     } else if (command === "status") {
       const current = await listAppliedMigrations(pool);
       logger.info("Migration status", {
