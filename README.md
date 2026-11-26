@@ -1,8 +1,8 @@
-# ASCENDRA — Real-Time Gameplay Backend Foundation (NEON Cycles 01–03)
+# ASCENDRA — Real-Time Gameplay Backend Foundation (NEON Cycles 01–04)
 
 Multiplayer RPG - Ascendra Game
 
-Este repositório contém a fundação técnica, o motor de IA de criaturas e o motor de ecossistema regional dinâmico do backend de simulação em tempo real do projeto **ASCENDRA**, sob responsabilidade de **NEON**.
+Este repositório contém a fundação técnica, o motor de IA de criaturas, o motor de ecossistema regional dinâmico e o World Event Director & Campaign Engine do backend de simulação em tempo real do projeto **ASCENDRA**, sob responsabilidade de **NEON**.
 
 > **Nota importante de identidade:** `NEON` é exclusivamente o nome do papel/desenvolvedor responsável pelo núcleo de simulação de gameplay. Este projeto **não** usa Neon Database nem qualquer serviço externo chamado Neon.
 
@@ -12,7 +12,7 @@ Este repositório contém a fundação técnica, o motor de IA de criaturas e o 
 - **Núcleo de simulação determinístico (`internal/simulation`)**:
   - PRNG determinístico com estado serializável (`SplitMix64` — sem `math/rand` global).
   - Serialização canônica e checksum SHA-256 independente de ordem de `map`, ponteiros, timestamps ou logs.
-  - Snapshot/restore versionado (`SchemaVersion = 3`) com limite pré-decodificação de bytes (`MaxBytes`) e validação explícita de schema e invariantes.
+  - Snapshot/restore versionado (`SchemaVersion = 4`) com limite pré-decodificação de bytes (`MaxBytes`) e validação explícita de schema e invariantes (versões `v1`/`v2`/`v3` rejeitadas com `ErrUnsupportedSnapshotVersion`).
 - **World / Event Director & Motor de Invasões (`internal/world`)**:
   - Máquina de estados explícita de invasão (`Peace -> Threatened -> UnderAttack -> Resolved`), rejeitando transições inválidas.
   - Simulação por ticks lógicos (`uint64`) sem dependência de relógio de parede (`time.Now()`) nem aritmética de ponto flutuante (`float32`/`float64`).
@@ -27,13 +27,21 @@ Este repositório contém a fundação técnica, o motor de IA de criaturas e o 
 - **Coordenação coletiva otimizada (`internal/ai/coordination.go`)**: índice espacial 1D + somas de prefixo + busca binária (`O(G log G)`), aura de moral de comandantes, `FocusTarget`, `Rally` e `FlankWeak`.
 - **Moral, territorialidade e reforços (`internal/ai/policy.go`, `internal/world/director.go`)**: quebra de moral + histerese de reagrupamento, choque explícito de morte de comandante (`CommanderFallen`), retorno por leash territorial (`StateReturnHome`), reforços com cooldown e limites explícitos de capacidade.
 
-### Ciclo 03 — Dynamic Ecosystem & Population Simulation Engine (`neon/dynamic-ecosystem-engine`)
+### Ciclo 03 — Dynamic Ecosystem & Population Simulation Engine (Auditado — `b133a62`)
 - **Simulação em duas escalas (`internal/ecosystem` + `internal/world/ecosystem_bridge.go`)**: ticks táticos (Escala A) integrados a epochs ecológicos (Escala B, padrão `20 ticks/epoch`) com fonte única de verdade (`FreePopulation` + `MaterializedPopulation`).
 - **3 regiões conectadas (fixtures)**: Vale de Valewatch, Floresta de Thornveil e Fronteira de Ironfang.
 - **Modelo populacional discreto inteiro**: logística com `K`, acumuladores seriais de resíduos, `K == 0` seguro e zero geração espontânea de populações extintas.
 - **Recursos naturais conservados**: `Food`, `Wood`, `Stone`, `Ore`, `Water` com consumo proporcional conservado ao inteiro exato e regeneração limitada.
 - **Acampamentos dinâmicos, migração em duas fases, competição territorial e ameaça regional com histerese**.
 - **Materialização controlada e limpeza de entidades**: reconciliação única de baixas/sobreviventes sem duplicação nem ressurreição, limpeza pós-retenção liberando `MaxActiveGroups = 32` e anel FIFO `RetiredGroupIDs`.
+
+### Ciclo 04 — World Event Director & Dynamic Campaign Engine (`neon/world-event-director`)
+- **World Event Director & Campaign Engine (`internal/worldevents`)**: transforma alterações ecológicas em campanhas dinâmicas determinísticas com FSM explícita de 14 estados (`Candidate -> Scheduled -> Reconnaissance -> Preparing -> Warning -> Mobilizing -> Active -> Resolving -> Defended/Captured/Cancelled/Expired -> Recovering -> Completed`), políticas data-driven para Goblins e Orcs, regras de proteção de assentamento e eventos encadeados com teto `MaxChainDepth`.
+- **Escalonador determinístico baseado em ticks**: prioridade inteira separada da ameaça ecológica, envelhecimento anti-starvation (`PriorityAgingPerTick`), desempate canônico total, cooldowns e limites de concorrência (3 globais, 1 por região, 1 por assentamento, máx. 1 combate tático ativo).
+- **Reservas idempotentes de população em 3 compartimentos (`internal/ecosystem/reservations.go`)**: `Free + Reserved + Materialized` com `ReservationID` monotônico, `IdempotencyKey`, deduplicação por `AppliedOps`, poda segura com `RetiredReservationKeys` e zero ressurreição.
+- **Autoridade única de invasões e separação de comandos (`internal/world/commands.go`)**: `OrchestrationCampaignDirector` desabilita transições automáticas de ameaça em `world.Step`; `GameplayCommand` / `DirectorCommand` / `AdminCommand` isolados por escopo (`ErrUnauthorizedCommand`).
+- **Reforços ecológicos com débito real e Fato Global com Zero Jogadores**: `EventReinforcementRequested` debitado exclusivamente da reserva da campanha; `TerminalSettlementOutcome` emitido estritamente uma vez mesmo quando `EligibleContributors == 0`.
+- **Snapshot v4 (`OrchestratedState`) e 19 cenários headless em `cmd/sim`**: 4 táticos + 6 ecossistema + 9 World Event Director (A–I).
 
 ## Pré-requisitos
 
@@ -50,13 +58,14 @@ go test -v ./...
 go test -race ./...
 
 # Executar fuzzing com tempo limitado e reproduzível
-go test -fuzz=FuzzSnapshotDecode -fuzztime=3s ./internal/simulation
-go test -fuzz=FuzzCommandValidation -fuzztime=3s ./internal/world
+go test '-fuzz=^FuzzCampaignSchedulerAndCommands$' '-fuzztime=30s' '-run=^$' ./internal/worldevents
+go test '-fuzz=^FuzzOrchestratedSnapshotDecode$' '-fuzztime=30s' '-run=^$' ./internal/worldevents
+go test '-fuzz=^FuzzEcosystemCommandsAndInvariants$' '-fuzztime=30s' '-run=^$' ./internal/ecosystem
 
 # Executar benchmarks de baseline (custo por tick, allocations, checksum e tamanho de snapshot)
-go test '-run=^$' '-bench=.' -benchmem ./internal/world
+go test '-run=^$' '-bench=.' -benchmem -count=5 ./internal/worldevents
 
-# Executar o harness headless CLI (cenários determinísticos + verificação de snapshot/restore)
+# Executar o harness headless CLI (19 cenários determinísticos + verificação de snapshot/restore)
 go run ./cmd/sim
 ```
 
@@ -67,13 +76,16 @@ cmd/sim/                        Harness CLI headless com logs estruturados (log/
 internal/ports/                 Interfaces de fronteira NEON <-> CARBON
 internal/adapters/memory/       Fakes in-memory e fixtures determinísticas para testes
 internal/simulation/            PRNG determinístico, checksum canônico SHA-256 e snapshots
-internal/ai/                    Política determinística de IA de grupos hostis (FSM)
-internal/world/                 World Director, Invasion FSM, validação de contribuição e harness
+internal/ai/                    Política determinística de IA de grupos hostis (FSM + 1D O(G log G))
+internal/ecosystem/             Motor de ecossistema regional, populações, recursos, acampamentos e reservas idempotentes
+internal/world/                 World Director tático, Invasion FSM, separação de comandos e contribuições
+internal/worldevents/           World Event Director, Campaign FSM, escalonador de ticks e cenários A-I
 docs/OWNERSHIP.md               Matriz de ownership NEON / CARBON / A confirmar
 docs/OBSERVABILITY.md           Schema de logs estruturados e métricas futuras
 docs/adr/                       Architecture Decision Records (status Proposed até alinhamento)
-docs/contracts/                 NEON -> CARBON Contract Request
-docs/handoff/                   Notas de handoff do Ciclo 1
+docs/contracts/                 Propostas de contratos NEON -> CARBON
+docs/worldevents/               Documentação técnica do Ciclo 4 (Diretor, Campanhas, Escalonador, Reservas, Baseline)
+docs/handoff/                   Notas de handoff por ciclo
 ```
 
 ## Documentação de arquitetura e colaboração
@@ -84,15 +96,24 @@ docs/handoff/                   Notas de handoff do Ciclo 1
 - [Handoff do Ciclo 1](docs/handoff/NEON_CYCLE1_HANDOFF.md)
 - [Handoff do Ciclo 2](docs/handoff/NEON_CYCLE2_HANDOFF.md)
 - [Handoff do Ciclo 3](docs/handoff/NEON_CYCLE3_HANDOFF.md)
+- [Handoff do Ciclo 4](docs/handoff/NEON_CYCLE4_HANDOFF.md)
 - [Auditoria CODEX — Ciclo 1](docs/audits/NEON_CYCLE_01_AUDIT.md)
 - [Auditoria CODEX — Ciclo 2](docs/audits/NEON_CYCLE_02_AUDIT.md)
+- [Auditoria CODEX — Ciclo 3](docs/audits/NEON_CYCLE_03_AUDIT.md)
 - [Proposta de Contratos de Ecossistema (NEON → CARBON)](docs/contracts/NEON_ECOSYSTEM_CONTRACT_PROPOSAL.md)
+- [Proposta de Contratos de World Events (NEON → CARBON)](docs/contracts/NEON_WORLD_EVENT_CONTRACT_PROPOSAL.md)
 - Documentação do Ecossistema (Ciclo 3):
   - [Ecosystem Engine](docs/ecosystem/ECOSYSTEM_ENGINE.md)
   - [Population Model](docs/ecosystem/POPULATION_MODEL.md)
   - [Resource Dynamics](docs/ecosystem/RESOURCE_DYNAMICS.md)
   - [Territory & Migration](docs/ecosystem/TERRITORY_AND_MIGRATION.md)
   - [Performance Baseline](docs/ecosystem/PERFORMANCE_BASELINE.md)
+- Documentação do World Event Director (Ciclo 4):
+  - [World Event Director](docs/worldevents/WORLD_EVENT_DIRECTOR.md)
+  - [Campaign Engine](docs/worldevents/CAMPAIGN_ENGINE.md)
+  - [Event Scheduler](docs/worldevents/EVENT_SCHEDULER.md)
+  - [Population Reservations](docs/worldevents/POPULATION_RESERVATIONS.md)
+  - [Performance Baseline (Ciclo 4)](docs/worldevents/PERFORMANCE_BASELINE.md)
 - ADRs:
   - [ADR-0001: Gameplay Backend Runtime (Go 1.27.x — Proposed)](docs/adr/0001-gameplay-backend-runtime.md)
   - [ADR-0002: Deterministic Simulation Boundary & Fixed-Point Units](docs/adr/0002-deterministic-simulation-boundary.md)
@@ -100,3 +121,4 @@ docs/handoff/                   Notas de handoff do Ciclo 1
   - [ADR-0004: Headless World Simulation Vertical Slice](docs/adr/0004-headless-world-vertical-slice.md)
   - [ADR-0005: Creature AI Engine (Proposed)](docs/adr/0005-creature-ai-engine.md)
   - [NEON-ADR-0006: Dynamic Ecosystem Engine, Safe Snapshots v3 & 1D Spatial Coordination (Proposed)](docs/adr/NEON-ADR-0006-dynamic-ecosystem-engine.md)
+  - [NEON-ADR-0007: World Event Director, Campaign Engine, Idempotent Population Reservations & Snapshot v4 (Proposed)](docs/adr/NEON-ADR-0007-world-event-director.md)
