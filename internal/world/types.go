@@ -37,10 +37,26 @@ var (
 	ErrRetiredGroupID            = errors.New("group_id was recently retired and cannot be reused")
 )
 
+// OrchestrationMode defines the sole authority permitted to initiate invasions.
+//   - OrchestrationLegacyThreat: Cycle 01-03 threshold-driven progression inside Step().
+//   - OrchestrationCampaignDirector: Cycle 04 World Event Director is the SOLE authority
+//     permitted to prepare/start invasions; automatic threshold transitions are disabled.
+type OrchestrationMode string
+
+const (
+	OrchestrationLegacyThreat     OrchestrationMode = "LegacyThreat"
+	OrchestrationCampaignDirector OrchestrationMode = "CampaignDirector"
+)
+
+func (m OrchestrationMode) Valid() bool {
+	return m == "" || m == OrchestrationLegacyThreat || m == OrchestrationCampaignDirector
+}
+
 // Config holds versioned, purely integer deterministic simulation rules and capacity bounds.
 type Config struct {
-	Version                    uint32 `json:"version"`
-	ThreatThreshold            int64  `json:"threat_threshold"`
+	Version                    uint32            `json:"version"`
+	OrchestrationMode          OrchestrationMode `json:"orchestration_mode,omitempty"`
+	ThreatThreshold            int64             `json:"threat_threshold"`
 	InvasionThreshold          int64  `json:"invasion_threshold"`
 	MaxThreat                  int64  `json:"max_threat"`
 	ThreatDecayPerTick         int64  `json:"threat_decay_per_tick"`
@@ -86,6 +102,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Version:                    ConfigVersion,
+		OrchestrationMode:          OrchestrationLegacyThreat,
 		ThreatThreshold:            500,
 		InvasionThreshold:          1000,
 		MaxThreat:                  2000,
@@ -128,6 +145,9 @@ func DefaultConfig() Config {
 func (c Config) Validate() error {
 	if c.Version != ConfigVersion {
 		return fmt.Errorf("%w: unsupported config version %d", ErrInvalidConfig, c.Version)
+	}
+	if !c.OrchestrationMode.Valid() {
+		return fmt.Errorf("%w: unknown orchestration_mode %q", ErrInvalidConfig, c.OrchestrationMode)
 	}
 	if c.ThreatThreshold <= 0 || c.InvasionThreshold <= c.ThreatThreshold || c.MaxThreat < c.InvasionThreshold {
 		return fmt.Errorf("%w: threat thresholds must satisfy 0 < threat < invasion <= max", ErrInvalidConfig)
@@ -209,6 +229,8 @@ func (s InvasionState) Code() uint8 {
 type InvasionRecord struct {
 	InvasionID           string                `json:"invasion_id"`
 	Sequence             uint64                `json:"sequence"`
+	CampaignID           string                `json:"campaign_id,omitempty"`
+	InvadingFactionID    string                `json:"invading_faction_id,omitempty"`
 	State                InvasionState         `json:"state"`
 	Outcome              ports.InvasionOutcome `json:"outcome"`
 	StartedTick          uint64                `json:"started_tick"`
@@ -248,6 +270,8 @@ type CreatureGroup struct {
 	SourceCampID           string          `json:"source_camp_id,omitempty"`
 	SourceRegionID         string          `json:"source_region_id,omitempty"`
 	FactionID              string          `json:"faction_id,omitempty"`
+	ReservationID          string          `json:"reservation_id,omitempty"`
+	CampaignID             string          `json:"campaign_id,omitempty"`
 	PopulationWeight       int64           `json:"population_weight,omitempty"`
 }
 
@@ -294,6 +318,8 @@ type WorldState struct {
 	PlayerCooldowns        []PlayerCooldown             `json:"player_cooldowns"`
 	Contributions          []PlayerContribution         `json:"contributions"`
 	EventSeq               uint64                       `json:"event_seq"`
+	GroupSeq               uint64                       `json:"group_seq,omitempty"`
+	InvasionSeq            uint64                       `json:"invasion_seq,omitempty"`
 }
 
 // Clone returns a deep copy of WorldState so failed ticks never mutate caller state.
@@ -476,11 +502,14 @@ func (s WorldState) ValidateWithConfig(cfg Config) error {
 		return ErrCapacityExceeded
 	}
 	maxID := cfg.MaxIdentifierLength
-	if len(s.SimulationID) > maxID || len(s.SettlementID) > maxID || len(s.RegionID) > maxID || len(s.Invasion.InvasionID) > maxID {
+	if len(s.SimulationID) > maxID || len(s.SettlementID) > maxID || len(s.RegionID) > maxID ||
+		len(s.Invasion.InvasionID) > maxID || len(s.Invasion.CampaignID) > maxID || len(s.Invasion.InvadingFactionID) > maxID {
 		return fmt.Errorf("%w: top-level identifier exceeds max length %d", ErrInvalidState, maxID)
 	}
 	for _, g := range s.Groups {
-		if len(g.GroupID) > maxID || len(g.Archetype) > maxID || len(g.SourcePopulationID) > maxID || len(g.SourceCampID) > maxID {
+		if len(g.GroupID) > maxID || len(g.Archetype) > maxID || len(g.SourcePopulationID) > maxID ||
+			len(g.SourceCampID) > maxID || len(g.SourceRegionID) > maxID || len(g.FactionID) > maxID ||
+			len(g.ReservationID) > maxID || len(g.CampaignID) > maxID {
 			return fmt.Errorf("%w: group identifier exceeds max length %d", ErrInvalidState, maxID)
 		}
 	}
@@ -510,6 +539,8 @@ func (s WorldState) Checksum() (string, error) {
 
 	h.WriteString(s.Invasion.InvasionID)
 	h.WriteUint64(s.Invasion.Sequence)
+	h.WriteString(s.Invasion.CampaignID)
+	h.WriteString(s.Invasion.InvadingFactionID)
 	h.WriteUint8(s.Invasion.State.Code())
 	h.WriteString(string(s.Invasion.Outcome))
 	h.WriteUint64(s.Invasion.StartedTick)
@@ -550,6 +581,8 @@ func (s WorldState) Checksum() (string, error) {
 		h.WriteString(g.SourceCampID)
 		h.WriteString(g.SourceRegionID)
 		h.WriteString(g.FactionID)
+		h.WriteString(g.ReservationID)
+		h.WriteString(g.CampaignID)
 		h.WriteInt64(g.PopulationWeight)
 	}
 
@@ -582,6 +615,8 @@ func (s WorldState) Checksum() (string, error) {
 	}
 
 	h.WriteUint64(s.EventSeq)
+	h.WriteUint64(s.GroupSeq)
+	h.WriteUint64(s.InvasionSeq)
 	return h.SumHex(), nil
 }
 
@@ -625,31 +660,43 @@ func UnmarshalSnapshotWithLimits(data []byte, cfg Config) (WorldState, error) {
 type CommandKind string
 
 const (
-	CmdIncreaseThreat          CommandKind = "IncreaseThreat"
-	CmdSpawnHostileGroup       CommandKind = "SpawnHostileGroup"
-	CmdForceInvasionTransition CommandKind = "ForceInvasionTransition"
-	CmdDeployDefender          CommandKind = "DeployDefender"
-	CmdPlayerDefendStrike      CommandKind = "PlayerDefendStrike"
-	CmdPlayerSupportDefense    CommandKind = "PlayerSupportDefense"
-	CmdCompleteObjective       CommandKind = "CompleteObjective"
+	CmdIncreaseThreat                CommandKind = "IncreaseThreat"
+	CmdSpawnHostileGroup             CommandKind = "SpawnHostileGroup"
+	CmdForceInvasionTransition       CommandKind = "ForceInvasionTransition"
+	CmdDeployDefender                CommandKind = "DeployDefender"
+	CmdPlayerDefendStrike            CommandKind = "PlayerDefendStrike"
+	CmdPlayerSupportDefense          CommandKind = "PlayerSupportDefense"
+	CmdCompleteObjective             CommandKind = "CompleteObjective"
+	CmdDirectorPrepareInvasion       CommandKind = "DirectorPrepareInvasion"
+	CmdDirectorStartInvasion         CommandKind = "DirectorStartInvasion"
+	CmdDirectorSpawnCampaignGroup    CommandKind = "DirectorSpawnCampaignGroup"
+	CmdDirectorResetResolvedInvasion CommandKind = "DirectorResetResolvedInvasion"
+	CmdDirectorAbortPreparedInvasion CommandKind = "DirectorAbortPreparedInvasion"
 )
 
 // Command carries an explicit intention targeting a single logical tick.
 // Players never specify damage, HP, threat, rewards, or cooldown values in commands.
 type Command struct {
-	Kind          CommandKind   `json:"kind"`
-	Tick          uint64        `json:"tick"`
-	PlayerID      string        `json:"player_id,omitempty"`
-	TargetGroupID string        `json:"target_group_id,omitempty"`
-	GroupID       string        `json:"group_id,omitempty"`
-	Archetype     string        `json:"archetype,omitempty"`
-	Count         int64         `json:"count,omitempty"`
-	Position      int64         `json:"position,omitempty"`
-	HomePosition  int64         `json:"home_position,omitempty"`
-	Delta         int64         `json:"delta,omitempty"`
-	Source        string        `json:"source,omitempty"`
-	ObjectiveID   string        `json:"objective_id,omitempty"`
-	TargetState   InvasionState `json:"target_state,omitempty"`
+	Kind               CommandKind   `json:"kind"`
+	Tick               uint64        `json:"tick"`
+	PlayerID           string        `json:"player_id,omitempty"`
+	TargetGroupID      string        `json:"target_group_id,omitempty"`
+	GroupID            string        `json:"group_id,omitempty"`
+	Archetype          string        `json:"archetype,omitempty"`
+	Count              int64         `json:"count,omitempty"`
+	Position           int64         `json:"position,omitempty"`
+	HomePosition       int64         `json:"home_position,omitempty"`
+	Delta              int64         `json:"delta,omitempty"`
+	Source             string        `json:"source,omitempty"`
+	ObjectiveID        string        `json:"objective_id,omitempty"`
+	TargetState        InvasionState `json:"target_state,omitempty"`
+	CampaignID         string        `json:"campaign_id,omitempty"`
+	InvadingFactionID  string        `json:"invading_faction_id,omitempty"`
+	ReservationID      string        `json:"reservation_id,omitempty"`
+	SourcePopulationID string        `json:"source_population_id,omitempty"`
+	SourceCampID       string        `json:"source_camp_id,omitempty"`
+	SourceRegionID     string        `json:"source_region_id,omitempty"`
+	PopulationWeight   int64         `json:"population_weight,omitempty"`
 }
 
 // CanonicalizeCommands returns a deterministically ordered copy of tick commands covering
@@ -666,13 +713,15 @@ func CanonicalizeCommands(cmds []Command) []Command {
 
 func commandPriority(k CommandKind) int {
 	switch k {
+	case CmdDirectorResetResolvedInvasion, CmdDirectorAbortPreparedInvasion:
+		return 0
 	case CmdDeployDefender:
 		return 1
-	case CmdSpawnHostileGroup:
+	case CmdSpawnHostileGroup, CmdDirectorSpawnCampaignGroup:
 		return 2
 	case CmdIncreaseThreat:
 		return 3
-	case CmdForceInvasionTransition:
+	case CmdForceInvasionTransition, CmdDirectorPrepareInvasion, CmdDirectorStartInvasion:
 		return 4
 	case CmdPlayerSupportDefense:
 		return 5
@@ -737,7 +786,34 @@ func compareCommands(a, b Command) int {
 		}
 		return 1
 	}
-	return strings.Compare(string(a.TargetState), string(b.TargetState))
+	if c := strings.Compare(string(a.TargetState), string(b.TargetState)); c != 0 {
+		return c
+	}
+	if c := strings.Compare(a.CampaignID, b.CampaignID); c != 0 {
+		return c
+	}
+	if c := strings.Compare(a.InvadingFactionID, b.InvadingFactionID); c != 0 {
+		return c
+	}
+	if c := strings.Compare(a.ReservationID, b.ReservationID); c != 0 {
+		return c
+	}
+	if c := strings.Compare(a.SourcePopulationID, b.SourcePopulationID); c != 0 {
+		return c
+	}
+	if c := strings.Compare(a.SourceCampID, b.SourceCampID); c != 0 {
+		return c
+	}
+	if c := strings.Compare(a.SourceRegionID, b.SourceRegionID); c != 0 {
+		return c
+	}
+	if a.PopulationWeight != b.PopulationWeight {
+		if a.PopulationWeight < b.PopulationWeight {
+			return -1
+		}
+		return 1
+	}
+	return 0
 }
 
 // EventType enumerates domain events produced by the World Director and Creature AI Engine.
@@ -758,6 +834,7 @@ const (
 	EventTerritoryAlert            EventType = "TerritoryAlert"
 	EventCommanderFallen           EventType = "CommanderFallen"
 	EventGroupRetired              EventType = "GroupRetired"
+	EventReinforcementRequested    EventType = "ReinforcementRequested"
 )
 
 // DomainEvent represents a deterministic, immutable fact emitted during a tick.

@@ -65,6 +65,8 @@ func NewWorldState(simulationID, settlementID string, seed uint64, reader ports.
 		PlayerCooldowns: []PlayerCooldown{},
 		Contributions:   []PlayerContribution{},
 		EventSeq:        0,
+		GroupSeq:        0,
+		InvasionSeq:     1,
 	}
 	if err := state.Validate(); err != nil {
 		return WorldState{}, err
@@ -151,20 +153,48 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 				return WorldState{}, nil, err
 			}
 
+		case CmdDirectorPrepareInvasion:
+			if err := applyDirectorPrepareInvasion(&next, cmd, cfg, &events); err != nil {
+				return WorldState{}, nil, err
+			}
+
+		case CmdDirectorStartInvasion:
+			if err := applyDirectorStartInvasion(&next, cmd, cfg, &events); err != nil {
+				return WorldState{}, nil, err
+			}
+
+		case CmdDirectorSpawnCampaignGroup:
+			if err := applyDirectorSpawnCampaignGroup(&next, cmd, cfg, &events); err != nil {
+				return WorldState{}, nil, err
+			}
+
+		case CmdDirectorResetResolvedInvasion:
+			if err := applyDirectorResetResolvedInvasion(&next, cfg); err != nil {
+				return WorldState{}, nil, err
+			}
+
+		case CmdDirectorAbortPreparedInvasion:
+			if err := applyDirectorAbortPreparedInvasion(&next, cmd, cfg, &events); err != nil {
+				return WorldState{}, nil, err
+			}
+
 		default:
 			return WorldState{}, nil, fmt.Errorf("%w: unknown command kind %q", ErrInvalidCommand, cmd.Kind)
 		}
 	}
 
-	// 2. World Director threshold-driven invasion progression.
-	if next.Invasion.State == InvasionPeace && next.RegionalThreat >= cfg.ThreatThreshold {
-		if err := transitionInvasion(&next, InvasionThreatened, cfg, &events); err != nil {
-			return WorldState{}, nil, err
+	// 2. Threshold-driven invasion progression ONLY in LegacyThreat mode.
+	// In CampaignDirector mode, the World Event Director is the sole authority to prepare/start invasions.
+	if cfg.OrchestrationMode != OrchestrationCampaignDirector {
+		if next.Invasion.State == InvasionPeace && next.RegionalThreat >= cfg.ThreatThreshold {
+			if err := transitionInvasion(&next, InvasionThreatened, cfg, &events); err != nil {
+				return WorldState{}, nil, err
+			}
 		}
-	}
-	if next.Invasion.State == InvasionThreatened && next.RegionalThreat >= cfg.InvasionThreshold {
-		if err := transitionInvasion(&next, InvasionUnderAttack, cfg, &events); err != nil {
-			return WorldState{}, nil, err
+		if next.Invasion.State == InvasionThreatened && next.RegionalThreat >= cfg.InvasionThreshold {
+			if err := transitionInvasion(&next, InvasionUnderAttack, cfg, &events); err != nil {
+				return WorldState{}, nil, err
+			}
 		}
 	}
 
@@ -324,16 +354,31 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 				g.DistanceToSettlement = moved
 			}
 
-			// Linked groups need a population reservation before reinforcements can spawn.
-			if decision.RequestReinforcements && g.PopulationWeight == 0 {
-				pendingReinforcements = append(pendingReinforcements, reinforcementRequest{
-					callerIndex: i,
-					callerID:    g.GroupID,
-					archetype:   decision.ReinforcementArchetype,
-					count:       decision.ReinforcementCount,
-					homePos:     g.HomePosition,
-					cooldown:    prof.ReinforceCooldownTicks,
-				})
+			// Linked groups need a population reservation before reinforcements can spawn:
+			// - In Legacy mode: standalone (PopulationWeight == 0) groups spawn directly.
+			// - In CampaignDirector mode: linked groups emit an explicit EventReinforcementRequested
+			//   intention for the World Event Director to validate and reserve population cleanly.
+			if decision.RequestReinforcements {
+				if g.PopulationWeight == 0 {
+					pendingReinforcements = append(pendingReinforcements, reinforcementRequest{
+						callerIndex: i,
+						callerID:    g.GroupID,
+						archetype:   decision.ReinforcementArchetype,
+						count:       decision.ReinforcementCount,
+						homePos:     g.HomePosition,
+						cooldown:    prof.ReinforceCooldownTicks,
+					})
+				} else if cfg.OrchestrationMode == OrchestrationCampaignDirector && g.CampaignID != "" && g.State != ai.StateRetreat {
+					g.ReinforcementsCalled++
+					g.ReinforceCooldownTicks = prof.ReinforceCooldownTicks
+					events = append(events, next.newEvent(
+						EventReinforcementRequested,
+						g.GroupID,
+						decision.ReinforcementArchetype,
+						decision.ReinforcementCount,
+						nil,
+					))
+				}
 			}
 
 			if g.State == ai.StateRetreat && g.DistanceToSettlement >= cfg.HostileRetreatExitDistance {
@@ -451,7 +496,8 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 		}
 		next.RegionalThreat -= decay
 		events = append(events, next.newEvent(EventThreatChanged, next.RegionID, "", -decay, nil))
-		if next.Invasion.State == InvasionThreatened && next.RegionalThreat == 0 && countActiveHostiles(next.Groups) == 0 {
+		if cfg.OrchestrationMode != OrchestrationCampaignDirector &&
+			next.Invasion.State == InvasionThreatened && next.RegionalThreat == 0 && countActiveHostiles(next.Groups) == 0 {
 			if err := transitionInvasion(&next, InvasionPeace, cfg, &events); err != nil {
 				return WorldState{}, nil, err
 			}
@@ -1007,4 +1053,192 @@ func absDiffInt64(a, b int64) int64 {
 		return a - b
 	}
 	return b - a
+}
+
+// NextDurableGroupID generates a deterministic, monotonic group identifier scoped to SimulationID.
+func NextDurableGroupID(state *WorldState, campaignID, tag string, maxLen int) (string, error) {
+	if state == nil {
+		return "", fmt.Errorf("%w: nil world state", ErrInvalidState)
+	}
+	if state.GroupSeq == math.MaxUint64 {
+		return "", ErrNumericOverflow
+	}
+	nextSeq := state.GroupSeq + 1
+	id := fmt.Sprintf("grp:%s:%s:%s:%06d", state.SimulationID, campaignID, tag, nextSeq)
+	if len(id) > maxLen {
+		id = fmt.Sprintf("grp:%s:%06d", tag, nextSeq)
+		if len(id) > maxLen {
+			return "", fmt.Errorf("%w: durable group id exceeds max length %d", ErrInvalidState, maxLen)
+		}
+	}
+	state.GroupSeq = nextSeq
+	return id, nil
+}
+
+func applyDirectorPrepareInvasion(next *WorldState, cmd Command, cfg Config, events *[]DomainEvent) error {
+	if strings.TrimSpace(cmd.CampaignID) == "" || strings.TrimSpace(cmd.InvadingFactionID) == "" {
+		return fmt.Errorf("%w: campaign_id and invading_faction_id required", ErrInvalidCommand)
+	}
+	if next.Invasion.State != InvasionPeace {
+		return fmt.Errorf("%w: cannot prepare invasion from state %s", ErrInvalidInvasionTransition, next.Invasion.State)
+	}
+	next.Invasion.CampaignID = cmd.CampaignID
+	next.Invasion.InvadingFactionID = cmd.InvadingFactionID
+	return transitionInvasion(next, InvasionThreatened, cfg, events)
+}
+
+func applyDirectorStartInvasion(next *WorldState, cmd Command, cfg Config, events *[]DomainEvent) error {
+	if strings.TrimSpace(cmd.CampaignID) == "" || strings.TrimSpace(cmd.InvadingFactionID) == "" {
+		return fmt.Errorf("%w: campaign_id and invading_faction_id required", ErrInvalidCommand)
+	}
+	if next.Invasion.State != InvasionThreatened {
+		return fmt.Errorf("%w: cannot start invasion from state %s (must be Threatened)", ErrInvalidInvasionTransition, next.Invasion.State)
+	}
+	if next.Invasion.CampaignID != "" && next.Invasion.CampaignID != cmd.CampaignID {
+		return fmt.Errorf("%w: invasion already owned by campaign %q", ErrInvalidCommand, next.Invasion.CampaignID)
+	}
+	if countActiveHostiles(next.Groups) == 0 {
+		return fmt.Errorf("%w: cannot start campaign-driven invasion without mobilized hostiles", ErrInvalidCommand)
+	}
+	next.Invasion.CampaignID = cmd.CampaignID
+	next.Invasion.InvadingFactionID = cmd.InvadingFactionID
+	return transitionInvasion(next, InvasionUnderAttack, cfg, events)
+}
+
+func applyDirectorSpawnCampaignGroup(next *WorldState, cmd Command, cfg Config, events *[]DomainEvent) error {
+	if strings.TrimSpace(cmd.CampaignID) == "" || strings.TrimSpace(cmd.ReservationID) == "" ||
+		strings.TrimSpace(cmd.SourcePopulationID) == "" || strings.TrimSpace(cmd.SourceCampID) == "" ||
+		cmd.PopulationWeight <= 0 {
+		return fmt.Errorf("%w: campaign group spawn requires campaign, reservation, population provenance, and weight > 0", ErrInvalidCommand)
+	}
+	if err := applySpawnHostileGroup(next, cmd, cfg, events); err != nil {
+		return err
+	}
+	gIdx := findGroupIndex(next.Groups, cmd.GroupID)
+	if gIdx < 0 {
+		return fmt.Errorf("%w: spawned group %q missing", ErrInvalidState, cmd.GroupID)
+	}
+	next.Groups[gIdx].CampaignID = cmd.CampaignID
+	next.Groups[gIdx].ReservationID = cmd.ReservationID
+	next.Groups[gIdx].SourcePopulationID = cmd.SourcePopulationID
+	next.Groups[gIdx].SourceCampID = cmd.SourceCampID
+	next.Groups[gIdx].SourceRegionID = cmd.SourceRegionID
+	next.Groups[gIdx].FactionID = cmd.InvadingFactionID
+	next.Groups[gIdx].PopulationWeight = cmd.PopulationWeight
+	next.Groups[gIdx].Accounted = false
+	return nil
+}
+
+// applyDirectorResetResolvedInvasion allocates a brand-new monotonic InvasionID after a previous
+// invasion has reached Resolved and all active hostiles have been cleared/reconciled.
+// It NEVER reopens an old InvasionID.
+func applyDirectorResetResolvedInvasion(next *WorldState, cfg Config) error {
+	if next.Invasion.State != InvasionResolved {
+		return fmt.Errorf("%w: can only reset a Resolved invasion (current=%s)", ErrInvalidInvasionTransition, next.Invasion.State)
+	}
+	if next.InvasionSeq == math.MaxUint64 {
+		return ErrNumericOverflow
+	}
+	// Ensure no un-accounted campaign groups remain in tactical state.
+	for _, g := range next.Groups {
+		if g.PopulationWeight > 0 && !g.Accounted {
+			return fmt.Errorf("%w: un-accounted group %q still present before invasion reset", ErrInvalidState, g.GroupID)
+		}
+	}
+	next.InvasionSeq++
+	next.Invasion = InvasionRecord{
+		InvasionID:          fmt.Sprintf("%s-inv-%d", next.SimulationID, next.InvasionSeq),
+		Sequence:            next.InvasionSeq,
+		State:               InvasionPeace,
+		Outcome:             ports.InvasionOutcomeNone,
+		ObjectivesCompleted: []string{},
+	}
+	// Restore settlement defense HP to at least MinDefense or MaxDefense for the next campaign cycle
+	// only if it was defended or prepared for a fresh scenario; captured settlements keep 0 HP until reconstructed.
+	if next.SettlementDefenseHP > 0 {
+		next.SettlementDefenseHP = next.SettlementMaxDefenseHP
+	}
+	next.Defenders = []DefenderEntity{}
+	next.Contributions = []PlayerContribution{}
+	next.RegionalThreat = 0
+	return nil
+}
+
+// applyDirectorAbortPreparedInvasion cleanly returns a Threatened invasion to Peace if its
+// owning campaign is cancelled or expired before entering UnderAttack.
+func applyDirectorAbortPreparedInvasion(next *WorldState, cmd Command, cfg Config, events *[]DomainEvent) error {
+	if next.Invasion.State != InvasionThreatened {
+		return fmt.Errorf("%w: can only abort a Threatened invasion (current=%s)", ErrInvalidInvasionTransition, next.Invasion.State)
+	}
+	if cmd.CampaignID != "" && next.Invasion.CampaignID != "" && next.Invasion.CampaignID != cmd.CampaignID {
+		return fmt.Errorf("%w: invasion belongs to campaign %q, not %q", ErrInvalidCommand, next.Invasion.CampaignID, cmd.CampaignID)
+	}
+	if err := transitionInvasion(next, InvasionPeace, cfg, events); err != nil {
+		return err
+	}
+	next.Invasion.CampaignID = ""
+	next.Invasion.InvadingFactionID = ""
+	return nil
+}
+
+// SpawnCampaignReinforcement spawns an ecologically reserved reinforcement group during an
+// active campaign invasion while strictly obeying MaxReinforcementWaves and MaxActiveGroups.
+func SpawnCampaignReinforcement(
+	state *WorldState,
+	callerGroupID string,
+	cmd DirectorCommand,
+	cfg Config,
+) ([]DomainEvent, error) {
+	if state == nil {
+		return nil, fmt.Errorf("%w: nil world state", ErrInvalidState)
+	}
+	if state.Invasion.State != InvasionUnderAttack {
+		return nil, fmt.Errorf("%w: reinforcement spawn requires UnderAttack state", ErrInvasionNotActive)
+	}
+	if state.Invasion.ReinforcementWaves >= cfg.MaxReinforcementWaves {
+		return nil, fmt.Errorf("%w: max reinforcement waves %d reached", ErrCapacityExceeded, cfg.MaxReinforcementWaves)
+	}
+	if len(state.Groups) >= cfg.MaxActiveGroups {
+		return nil, fmt.Errorf("%w: max active groups %d reached", ErrCapacityExceeded, cfg.MaxActiveGroups)
+	}
+	c, err := cmd.ToCommand()
+	if err != nil {
+		return nil, err
+	}
+	if c.Kind != CmdDirectorSpawnCampaignGroup {
+		return nil, fmt.Errorf("%w: expected CmdDirectorSpawnCampaignGroup, got %q", ErrInvalidCommand, c.Kind)
+	}
+	events := make([]DomainEvent, 0, 2)
+	if err := applyDirectorSpawnCampaignGroup(state, c, cfg, &events); err != nil {
+		return nil, err
+	}
+	state.Invasion.ReinforcementWaves++
+	events = append(events, state.newEvent(EventReinforcementsCalled, callerGroupID, c.GroupID, c.Count, nil))
+	return events, nil
+}
+
+// RecallCampaignGroups removes all un-accounted groups owned by campaignID from active tactical
+// state, retires their IDs against immediate reuse, and returns them so the caller reconciles
+// every individual into the ecosystem reservation ledger.
+func RecallCampaignGroups(state *WorldState, campaignID string, cfg Config) ([]CreatureGroup, error) {
+	if state == nil {
+		return nil, fmt.Errorf("%w: nil world state", ErrInvalidState)
+	}
+	if strings.TrimSpace(campaignID) == "" {
+		return nil, fmt.Errorf("%w: empty campaign_id for recall", ErrInvalidCommand)
+	}
+	recalled := make([]CreatureGroup, 0)
+	kept := make([]CreatureGroup, 0, len(state.Groups))
+	for _, g := range state.Groups {
+		if g.CampaignID == campaignID {
+			if g.PopulationWeight > 0 && !g.Accounted {
+				recalled = append(recalled, g)
+			}
+			recordRetiredGroupID(state, g.GroupID, cfg.MaxRetiredGroupIDs)
+			continue
+		}
+		kept = append(kept, g)
+	}
+	state.Groups = kept
+	return recalled, nil
 }
