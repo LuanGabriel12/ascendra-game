@@ -18,3 +18,4 @@ A partir do **Ciclo 02 / Session 02**, novos ADRs utilizam prefixos explícitos 
 ## Série CARBON Session 02+
 - [CARBON-0003-polyglot-go-typescript-boundary.md](CARBON-0003-polyglot-go-typescript-boundary.md) — Fronteira poliglota Go (NEON) + TypeScript/PostgreSQL (CARBON) (Proposed)
 - [CARBON-0004-canonical-idempotency-and-64bit-identifiers.md](CARBON-0004-canonical-idempotency-and-64bit-identifiers.md) — Identificadores opacos, inteiros de 64 bits e idempotência por fingerprint canônico (Accepted / Proposed Wire)
+- [CARBON-0005-character-progression-and-emergent-builds.md](CARBON-0005-character-progression-and-emergent-builds.md) — Motor persistente de personagens, 26 povos orientados a dados, 10 atributos e isolamento Genesis (Accepted)
