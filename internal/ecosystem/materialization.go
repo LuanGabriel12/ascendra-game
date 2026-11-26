@@ -10,8 +10,15 @@ import (
 )
 
 // MaterializationTicket links a materialized tactical CreatureGroup back to its exact
-// source population and camp so losses and surviving returns are conserved strictly once.
+// source population, camp, and optional idempotent ReservationID so losses and surviving
+// returns are conserved strictly once.
+//
+// NOTE (Cycle 04): ReserveForMaterialization / ReconcileDematerialization operate on aggregate
+// balances and are retained strictly for internal/legacy Cycle 03 paths. All Campaign & World
+// Event Director flows MUST use CreateReservation / MaterializeFromReservation /
+// ReconcileReservationContingent for per-reservation identity and idempotency.
 type MaterializationTicket struct {
+	ReservationID  string    `json:"reservation_id,omitempty"`
 	PopulationID   string    `json:"population_id"`
 	CampID         string    `json:"camp_id"`
 	RegionID       string    `json:"region_id"`

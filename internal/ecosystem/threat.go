@@ -33,7 +33,10 @@ func processRegionalThreat(state *EcosystemState, cfg Config, events *[]Ecologic
 			if fIdx < 0 || !state.Factions[fIdx].HostileToSettlement {
 				continue
 			}
-			tot := pop.FreePopulation + pop.MaterializedPopulation
+			tot, err := pop.TotalSize()
+			if err != nil {
+				return err
+			}
 			if tot > (math.MaxInt64-hostileStrength)/pop.StrengthPerIndividual {
 				hostileStrength = math.MaxInt64
 			} else {

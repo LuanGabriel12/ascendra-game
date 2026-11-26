@@ -39,7 +39,7 @@ func processCamps(state *EcosystemState, cfg Config, events *[]EcologicalEvent) 
 		}
 
 		// Check abandonment due to collapsed population.
-		if pop.FreePopulation == 0 && pop.MaterializedPopulation == 0 {
+		if pop.FreePopulation == 0 && pop.ReservedPopulation == 0 && pop.MaterializedPopulation == 0 {
 			c.State = CampAbandoned
 			c.AssignedPopulation = 0
 			c.Reserves = 0
@@ -339,7 +339,7 @@ func hasHostileRivalInRegion(state *EcosystemState, regionID, factionID string) 
 		if p.RegionID != regionID || p.FactionID == factionID {
 			continue
 		}
-		if p.FreePopulation+p.MaterializedPopulation == 0 {
+		if p.FreePopulation+p.ReservedPopulation+p.MaterializedPopulation == 0 {
 			continue
 		}
 		if GetStance(state.Factions, factionID, p.FactionID) == StanceHostile {

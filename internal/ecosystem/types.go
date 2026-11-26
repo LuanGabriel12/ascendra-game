@@ -300,9 +300,10 @@ type Population struct {
 	SpeciesID             string    `json:"species_id"`
 	FamilyID              ai.Family `json:"family_id"`
 	FactionID             string    `json:"faction_id"`
-	FreePopulation        int64     `json:"free_population"`
-	MaterializedPopulation int64    `json:"materialized_population"`
-	CarryingCapacity      int64     `json:"carrying_capacity"`
+	FreePopulation         int64     `json:"free_population"`
+	ReservedPopulation     int64     `json:"reserved_population,omitempty"`
+	MaterializedPopulation int64     `json:"materialized_population"`
+	CarryingCapacity       int64     `json:"carrying_capacity"`
 	GrowthRateBP          int64     `json:"growth_rate_bp"`
 	MortalityRateBP       int64     `json:"mortality_rate_bp"`
 	GrowthResidualBP      int64     `json:"growth_residual_bp"`
@@ -317,9 +318,13 @@ type Population struct {
 	ActiveCampCount       int       `json:"active_camp_count"`
 }
 
-// TotalSize returns FreePopulation + MaterializedPopulation safely.
+// TotalSize returns FreePopulation + ReservedPopulation + MaterializedPopulation safely.
 func (p Population) TotalSize() (int64, error) {
-	return safeAddInt64(p.FreePopulation, p.MaterializedPopulation)
+	sum, err := safeAddInt64(p.FreePopulation, p.ReservedPopulation)
+	if err != nil {
+		return 0, err
+	}
+	return safeAddInt64(sum, p.MaterializedPopulation)
 }
 
 // Camp models a dynamic regional creature camp tied to a population and faction.
@@ -381,6 +386,9 @@ type Config struct {
 	ThreatCriticalExit         int64  `json:"threat_critical_exit"`
 	EventIntentCooldownEpochs  uint64 `json:"event_intent_cooldown_epochs"`
 	ConflictDecayPerEpoch      int64  `json:"conflict_decay_per_epoch"`
+	MaxReservations            int    `json:"max_reservations"`
+	MaxOpsPerReservation       int    `json:"max_ops_per_reservation"`
+	MaxRetiredReservationKeys  int    `json:"max_retired_reservation_keys"`
 }
 
 // DefaultConfig returns balanced, provisional Cycle 03 ecosystem parameters.
@@ -426,6 +434,9 @@ func DefaultConfig() Config {
 		ThreatCriticalExit:         1150,
 		EventIntentCooldownEpochs:  5,
 		ConflictDecayPerEpoch:      40,
+		MaxReservations:            128,
+		MaxOpsPerReservation:       64,
+		MaxRetiredReservationKeys:  256,
 	}
 }
 
@@ -438,7 +449,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("%w: ticks_per_epoch, max_snapshot_bytes, and max_identifier_length must be > 0", ErrInvalidConfig)
 	}
 	if c.MaxRegions <= 0 || c.MaxFactions <= 0 || c.MaxPopulations <= 0 || c.MaxCampsTotal <= 0 ||
-		c.MaxCampsPerRegion <= 0 || c.MaxCampsPerFaction <= 0 || c.MaxCommandsPerEpoch <= 0 {
+		c.MaxCampsPerRegion <= 0 || c.MaxCampsPerFaction <= 0 || c.MaxCommandsPerEpoch <= 0 ||
+		c.MaxReservations <= 0 || c.MaxOpsPerReservation <= 0 || c.MaxRetiredReservationKeys <= 0 {
 		return fmt.Errorf("%w: entity capacity limits must be > 0", ErrInvalidConfig)
 	}
 	if c.MaxBirthsPerEpoch < 0 || c.StarvationMortalityBP < 0 || c.StarvationMortalityBP > BasisPointsScale ||
@@ -480,17 +492,20 @@ type CampCooldownRecord struct {
 // EcosystemState is the complete, deterministic, serializable macro ecological state.
 // All slices are maintained in strict canonical sorted order by stable ID.
 type EcosystemState struct {
-	SimulationID    string                     `json:"simulation_id"`
-	Epoch           uint64                     `json:"epoch"`
-	RNG             simulation.DeterministicRNG `json:"rng"`
-	Factions        []FactionProfile           `json:"factions"`
-	Regions         []Region                   `json:"regions"`
-	Populations     []Population               `json:"populations"`
-	Camps           []Camp                     `json:"camps"`
-	CampCooldowns   []CampCooldownRecord       `json:"camp_cooldowns"`
-	EventSeq        uint64                     `json:"event_seq"`
-	CampSeq         uint64                     `json:"camp_seq"`
-	PopSeq          uint64                     `json:"pop_seq"`
+	SimulationID           string                      `json:"simulation_id"`
+	Epoch                  uint64                      `json:"epoch"`
+	RNG                    simulation.DeterministicRNG `json:"rng"`
+	Factions               []FactionProfile            `json:"factions"`
+	Regions                []Region                    `json:"regions"`
+	Populations            []Population                `json:"populations"`
+	Camps                  []Camp                      `json:"camps"`
+	CampCooldowns          []CampCooldownRecord        `json:"camp_cooldowns"`
+	Reservations           []PopulationReservation     `json:"reservations,omitempty"`
+	RetiredReservationKeys []string                    `json:"retired_reservation_keys,omitempty"`
+	EventSeq               uint64                      `json:"event_seq"`
+	CampSeq                uint64                      `json:"camp_seq"`
+	PopSeq                 uint64                      `json:"pop_seq"`
+	ReservationSeq         uint64                      `json:"reservation_seq,omitempty"`
 }
 
 // Clone returns a deep copy of EcosystemState for atomic StepEpoch execution.
@@ -528,6 +543,18 @@ func (s EcosystemState) Clone() EcosystemState {
 	if out.CampCooldowns == nil {
 		out.CampCooldowns = []CampCooldownRecord{}
 	}
+	out.Reservations = make([]PopulationReservation, len(s.Reservations))
+	for i, r := range s.Reservations {
+		r.AppliedOps = slices.Clone(r.AppliedOps)
+		if r.AppliedOps == nil {
+			r.AppliedOps = []string{}
+		}
+		out.Reservations[i] = r
+	}
+	out.RetiredReservationKeys = slices.Clone(s.RetiredReservationKeys)
+	if out.RetiredReservationKeys == nil {
+		out.RetiredReservationKeys = []string{}
+	}
 	return out
 }
 
@@ -540,7 +567,8 @@ func (s EcosystemState) Validate(cfg Config) error {
 		return fmt.Errorf("%w: simulation_id: %v", ErrInvalidState, err)
 	}
 	if len(s.Factions) > cfg.MaxFactions || len(s.Regions) > cfg.MaxRegions ||
-		len(s.Populations) > cfg.MaxPopulations || len(s.Camps) > cfg.MaxCampsTotal {
+		len(s.Populations) > cfg.MaxPopulations || len(s.Camps) > cfg.MaxCampsTotal ||
+		len(s.Reservations) > cfg.MaxReservations || len(s.RetiredReservationKeys) > cfg.MaxRetiredReservationKeys {
 		return fmt.Errorf("%w: state entity count exceeds config bounds", ErrCapacityExceeded)
 	}
 
@@ -640,7 +668,7 @@ func (s EcosystemState) Validate(cfg Config) error {
 		if !p.FamilyID.Valid() {
 			return fmt.Errorf("%w: population %q invalid family %q", ErrInvalidState, p.PopulationID, p.FamilyID)
 		}
-		if p.FreePopulation < 0 || p.MaterializedPopulation < 0 || p.CarryingCapacity < 0 {
+		if p.FreePopulation < 0 || p.ReservedPopulation < 0 || p.MaterializedPopulation < 0 || p.CarryingCapacity < 0 {
 			return fmt.Errorf("%w: population %q negative size or capacity", ErrInvalidState, p.PopulationID)
 		}
 		if _, err := p.TotalSize(); err != nil {
@@ -700,6 +728,48 @@ func (s EcosystemState) Validate(cfg Config) error {
 		}
 		if i > 0 && s.CampCooldowns[i-1].Key >= cd.Key {
 			return fmt.Errorf("%w: camp_cooldowns not strictly sorted", ErrInvalidState)
+		}
+	}
+
+	// Validate population reservations and cross-check ReservedPopulation ledger strictly.
+	expectedReserved := make(map[string]int64, len(s.Populations))
+	expectedResMat := make(map[string]int64, len(s.Populations))
+	for i, r := range s.Reservations {
+		if err := r.Validate(cfg.MaxIdentifierLength); err != nil {
+			return err
+		}
+		if i > 0 && s.Reservations[i-1].ReservationID >= r.ReservationID {
+			return fmt.Errorf("%w: reservations not strictly sorted", ErrInvalidState)
+		}
+		if r.Seq > s.ReservationSeq {
+			return fmt.Errorf("%w: reservation %q seq %d exceeds ReservationSeq %d", ErrInvalidState, r.ReservationID, r.Seq, s.ReservationSeq)
+		}
+		if len(r.AppliedOps) > cfg.MaxOpsPerReservation {
+			return fmt.Errorf("%w: reservation %q applied ops exceed limit", ErrCapacityExceeded, r.ReservationID)
+		}
+		pop, ok := popSet[r.PopulationID]
+		if !ok || pop.RegionID != r.RegionID || pop.FactionID != r.FactionID || pop.FamilyID != r.FamilyID {
+			return fmt.Errorf("%w: reservation %q population reference mismatch", ErrInvalidReference, r.ReservationID)
+		}
+		if findCampIndex(s.Camps, r.CampID) < 0 {
+			return fmt.Errorf("%w: reservation %q references missing camp %q", ErrInvalidReference, r.ReservationID, r.CampID)
+		}
+		var err error
+		if expectedReserved[r.PopulationID], err = safeAddInt64(expectedReserved[r.PopulationID], r.RemainingReserved()); err != nil {
+			return err
+		}
+		if expectedResMat[r.PopulationID], err = safeAddInt64(expectedResMat[r.PopulationID], r.RemainingMaterialized()); err != nil {
+			return err
+		}
+	}
+	for _, p := range s.Populations {
+		if expectedReserved[p.PopulationID] != p.ReservedPopulation {
+			return fmt.Errorf("%w: population %q reserved_population %d != sum(reservations) %d",
+				ErrInvalidState, p.PopulationID, p.ReservedPopulation, expectedReserved[p.PopulationID])
+		}
+		if expectedResMat[p.PopulationID] > p.MaterializedPopulation {
+			return fmt.Errorf("%w: population %q materialized_population %d < sum(reservation materialized) %d",
+				ErrInvalidState, p.PopulationID, p.MaterializedPopulation, expectedResMat[p.PopulationID])
 		}
 	}
 	return nil
@@ -765,6 +835,7 @@ func (s EcosystemState) Checksum(cfg Config) (string, error) {
 		h.WriteUint8(p.FamilyID.Code())
 		h.WriteString(p.FactionID)
 		h.WriteInt64(p.FreePopulation)
+		h.WriteInt64(p.ReservedPopulation)
 		h.WriteInt64(p.MaterializedPopulation)
 		h.WriteInt64(p.CarryingCapacity)
 		h.WriteInt64(p.GrowthRateBP)
@@ -804,9 +875,40 @@ func (s EcosystemState) Checksum(cfg Config) (string, error) {
 		h.WriteUint64(cd.ReadyAtEpoch)
 	}
 
+	h.WriteUint64(uint64(len(s.Reservations)))
+	for _, r := range s.Reservations {
+		h.WriteString(r.ReservationID)
+		h.WriteUint64(r.Seq)
+		h.WriteString(r.IdempotencyKey)
+		h.WriteString(r.CampaignID)
+		h.WriteString(r.PopulationID)
+		h.WriteString(r.CampID)
+		h.WriteString(r.RegionID)
+		h.WriteString(r.FactionID)
+		h.WriteUint8(r.FamilyID.Code())
+		h.WriteInt64(r.ReservedAmount)
+		h.WriteInt64(r.MaterializedAmount)
+		h.WriteInt64(r.ReleasedAmount)
+		h.WriteInt64(r.ReturnedSurvivors)
+		h.WriteInt64(r.Casualties)
+		h.WriteUint8(r.State.Code())
+		h.WriteUint64(r.CreatedTick)
+		h.WriteUint64(r.ExpiryTick)
+		h.WriteUint64(uint64(len(r.AppliedOps)))
+		for _, op := range r.AppliedOps {
+			h.WriteString(op)
+		}
+	}
+
+	h.WriteUint64(uint64(len(s.RetiredReservationKeys)))
+	for _, rk := range s.RetiredReservationKeys {
+		h.WriteString(rk)
+	}
+
 	h.WriteUint64(s.EventSeq)
 	h.WriteUint64(s.CampSeq)
 	h.WriteUint64(s.PopSeq)
+	h.WriteUint64(s.ReservationSeq)
 	return h.SumHex(), nil
 }
 
@@ -861,8 +963,10 @@ const (
 	EventPopulationMigrated         EventType = "PopulationMigrated"
 	EventTerritorialInfluenceChanged EventType = "TerritorialInfluenceChanged"
 	EventRegionalThreatChanged      EventType = "RegionalThreatChanged"
-	EventCreatureGroupMaterialized  EventType = "CreatureGroupMaterialized"
+	EventCreatureGroupMaterialized   EventType = "CreatureGroupMaterialized"
 	EventCreatureGroupDematerialized EventType = "CreatureGroupDematerialized"
+	EventPopulationReserved          EventType = "PopulationReserved"
+	EventReservationReleased         EventType = "ReservationReleased"
 )
 
 // EcologicalEvent represents an immutable deterministic event emitted during an epoch or handoff.

@@ -252,7 +252,10 @@ func totalRegionPopulation(pops []Population, regionID string) int64 {
 	var total int64
 	for _, p := range pops {
 		if p.RegionID == regionID {
-			size := p.FreePopulation + p.MaterializedPopulation
+			size, err := p.TotalSize()
+			if err != nil {
+				return math.MaxInt64
+			}
 			if size > math.MaxInt64-total {
 				return math.MaxInt64
 			}

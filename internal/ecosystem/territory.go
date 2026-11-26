@@ -35,7 +35,10 @@ func processTerritory(state *EcosystemState, cfg Config, events *[]EcologicalEve
 				if pop.RegionID != reg.RegionID || pop.FactionID != f.FactionID {
 					continue
 				}
-				tot := pop.FreePopulation + pop.MaterializedPopulation
+				tot, err := pop.TotalSize()
+				if err != nil {
+					return err
+				}
 				if tot <= 0 {
 					continue
 				}

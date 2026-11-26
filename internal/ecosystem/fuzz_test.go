@@ -50,7 +50,7 @@ func FuzzEcosystemCommandsAndInvariants(f *testing.F) {
 				t.Fatalf("StepEpoch produced invalid state: %v", err)
 			}
 			for _, p := range next.Populations {
-				if p.FreePopulation < 0 || p.MaterializedPopulation < 0 {
+				if p.FreePopulation < 0 || p.ReservedPopulation < 0 || p.MaterializedPopulation < 0 {
 					t.Fatalf("negative population invariant broken: %+v", p)
 				}
 			}
@@ -67,7 +67,7 @@ func FuzzEcosystemSnapshotDecode(f *testing.F) {
 
 	f.Add(valid)
 	f.Add([]byte(`{}`))
-	f.Add([]byte(`{"schema_version":3,"checksum":"deadbeef","payload":{}}`))
+	f.Add([]byte(`{"schema_version":4,"checksum":"deadbeef","payload":{}}`))
 	f.Add([]byte(`corrupt`))
 
 	f.Fuzz(func(t *testing.T, data []byte) {

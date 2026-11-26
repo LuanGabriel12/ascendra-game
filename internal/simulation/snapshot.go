@@ -10,9 +10,9 @@ import (
 )
 
 // SnapshotVersion identifies the current logical snapshot wire format.
-// v3 incorporates Cycle 03 typed targets, entity lifecycle retention, ecosystem links,
-// and explicit pre-decode byte-size enforcement.
-const SnapshotVersion uint32 = 3
+// v4 incorporates Cycle 04 World Event Director state, idempotent population reservations,
+// durable monotonic sequences, and command-separated orchestration state.
+const SnapshotVersion uint32 = 4
 
 // DefaultMaxSnapshotBytes caps snapshot input size BEFORE allocating a JSON decoder.
 const DefaultMaxSnapshotBytes int = 2 * 1024 * 1024 // 2 MiB
