@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"time"
@@ -12,25 +13,43 @@ import (
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+	if err := runAllScenarios(os.Stdout); err != nil {
+		os.Exit(1)
+	}
+}
+
+func runAllScenarios(out io.Writer) error {
+	logger := slog.New(slog.NewJSONHandler(out, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 
 	reader, err := memory.NewSettlementReader(memory.DefaultSettlementFixtures()...)
 	if err != nil {
 		logger.Error("bootstrap_failed", slog.String("error", err.Error()))
-		os.Exit(1)
+		return err
 	}
 
 	cfg := world.DefaultConfig()
-	if err := runAndVerify(logger, reader, cfg, "sim-defended-01", 20261126, 35, 200, world.BuildDefendedScenarioScript()); err != nil {
-		logger.Error("scenario_failed", slog.String("simulation_id", "sim-defended-01"), slog.String("error", err.Error()))
-		os.Exit(1)
+	scenarios := []struct {
+		simID        string
+		seed         uint64
+		snapshotTick uint64
+		totalTicks   uint64
+		script       map[uint64][]world.Command
+	}{
+		{"sim-defended-01", 20261126, 35, 200, world.BuildDefendedScenarioScript()},
+		{"sim-captured-01", 20261126, 25, 350, world.BuildCapturedScenarioScript()},
+		{"sim-warband-02", 20260202, 32, 180, world.BuildWarbandCoordinationScenarioScript()},
+		{"sim-territory-02", 31337, 20, 65, world.BuildTerritorialLeashScenarioScript()},
 	}
-	if err := runAndVerify(logger, reader, cfg, "sim-captured-01", 20261126, 25, 350, world.BuildCapturedScenarioScript()); err != nil {
-		logger.Error("scenario_failed", slog.String("simulation_id", "sim-captured-01"), slog.String("error", err.Error()))
-		os.Exit(1)
+
+	for _, sc := range scenarios {
+		if err := runAndVerify(logger, reader, cfg, sc.simID, sc.seed, sc.snapshotTick, sc.totalTicks, sc.script); err != nil {
+			logger.Error("scenario_failed", slog.String("simulation_id", sc.simID), slog.String("error", err.Error()))
+			return err
+		}
 	}
+	return nil
 }
 
 func runAndVerify(
@@ -85,7 +104,12 @@ func runAndVerify(
 	}
 
 	for _, ev := range resA.Events {
-		if ev.Type == world.EventInvasionPhaseChanged || ev.Type == world.EventContributionRecorded {
+		switch ev.Type {
+		case world.EventInvasionPhaseChanged,
+			world.EventContributionRecorded,
+			world.EventReinforcementsCalled,
+			world.EventMoraleChanged,
+			world.EventTerritoryAlert:
 			logger.Info(string(ev.Type),
 				slog.String("event", string(ev.Type)),
 				slog.Uint64("tick", ev.Tick),
@@ -105,6 +129,7 @@ func runAndVerify(
 		slog.String("outcome", string(resA.FinalState.Invasion.Outcome)),
 		slog.String("checksum", resA.FinalChecksum),
 		slog.Int("snapshot_bytes", len(snapRaw)),
+		slog.Int("reinforcement_waves", resA.FinalState.Invasion.ReinforcementWaves),
 		slog.Int("contributions_dispatched", resA.ContributionsDispatched),
 		slog.Bool("snapshot_verified", true),
 		slog.Duration("duration", time.Since(start)),

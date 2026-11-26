@@ -62,17 +62,23 @@ func TestSnapshotRoundTripAndTamperRejection(t *testing.T) {
 	}
 
 	// Tampered payload with original checksum must fail checksum verification.
-	tampered := []byte(`{"schema_version":1,"checksum":"` + sum + `","payload":{"tick":50,"hp":999,"name":"valewatch"}}`)
+	tampered := []byte(`{"schema_version":2,"checksum":"` + sum + `","payload":{"tick":50,"hp":999,"name":"valewatch"}}`)
 	_, err = simulation.DecodeSnapshot(tampered, checksumSample)
 	if !errors.Is(err, simulation.ErrSnapshotChecksumMismatch) {
 		t.Fatalf("expected ErrSnapshotChecksumMismatch, got %v", err)
 	}
 
-	// Unsupported version must fail explicitly.
+	// Older v1 and future v99 schema versions must fail explicitly.
+	oldVer := []byte(`{"schema_version":1,"checksum":"` + sum + `","payload":{"tick":50,"hp":900,"name":"valewatch"}}`)
+	_, err = simulation.DecodeSnapshot(oldVer, checksumSample)
+	if !errors.Is(err, simulation.ErrUnsupportedSnapshotVersion) {
+		t.Fatalf("expected ErrUnsupportedSnapshotVersion for v1, got %v", err)
+	}
+
 	badVer := []byte(`{"schema_version":99,"checksum":"` + sum + `","payload":{"tick":50,"hp":900,"name":"valewatch"}}`)
 	_, err = simulation.DecodeSnapshot(badVer, checksumSample)
 	if !errors.Is(err, simulation.ErrUnsupportedSnapshotVersion) {
-		t.Fatalf("expected ErrUnsupportedSnapshotVersion, got %v", err)
+		t.Fatalf("expected ErrUnsupportedSnapshotVersion for v99, got %v", err)
 	}
 
 	// Trailing tokens must fail explicitly.

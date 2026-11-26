@@ -10,7 +10,8 @@ import (
 )
 
 // SnapshotVersion identifies the current logical snapshot wire format.
-const SnapshotVersion uint32 = 1
+// v2 incorporates Cycle 02 Creature AI state (morale, territory anchor, reinforcements, defenders).
+const SnapshotVersion uint32 = 2
 
 var (
 	ErrInvalidSnapshot            = errors.New("invalid snapshot")
