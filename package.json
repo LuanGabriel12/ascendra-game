@@ -13,7 +13,8 @@
     "test": "node --import tsx --test \"tests/**/*.test.ts\"",
     "migrate:up": "node --import tsx src/scripts/migrate.ts up",
     "migrate:down": "node --import tsx src/scripts/migrate.ts down",
-    "migrate:status": "node --import tsx src/scripts/migrate.ts status"
+    "migrate:status": "node --import tsx src/scripts/migrate.ts status",
+    "demo:session02": "node --import tsx src/scripts/demo-session-02.ts"
   },
   "dependencies": {
     "pg": "^8.23.1",

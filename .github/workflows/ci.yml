@@ -1,18 +1,47 @@
-name: Backend CI (CARBON)
+name: ASCENDRA Backend CI (CARBON & NEON)
 
 on:
   push:
     branches:
       - main
       - "feature/**"
+      - "carbon/**"
+      - "neon/**"
   pull_request:
     branches:
       - main
+      - "feature/**"
+      - "carbon/**"
+      - "neon/**"
 
 jobs:
-  verify:
-    name: Typecheck, Migrations & PostgreSQL Integration Tests
+  carbon-typescript:
+    name: CARBON TypeScript (Typecheck & Build)
     runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck strict TypeScript
+        run: npm run typecheck
+
+      - name: Build TypeScript artifacts
+        run: npm run build
+
+  carbon-postgres-integration:
+    name: CARBON PostgreSQL Integration & Demo
+    runs-on: ubuntu-latest
+    needs: [carbon-typescript]
 
     services:
       postgres:
@@ -47,17 +76,43 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Typecheck strict TypeScript
-        run: npm run typecheck
-
-      - name: Verify migrations (up -> down -> up) on clean PostgreSQL
+      - name: Verify full migration lifecycle (up -> down x3 -> up)
         run: |
           npm run migrate:up
           npm run migrate:down
+          npm run migrate:down
+          npm run migrate:down
           npm run migrate:up
 
-      - name: Run integration tests against real PostgreSQL
+      - name: Run real PostgreSQL integration test suites
         run: npm test
 
-      - name: Build production TypeScript artifacts
-        run: npm run build
+      - name: Run reproducible Session 02 integrated demonstration
+        run: npm run demo:session02
+
+  neon-go:
+    name: NEON Go Simulation & Race Detector
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go from go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Go vet & build
+        run: |
+          go vet ./...
+          go build ./...
+
+      - name: Go unit & determinism tests
+        run: go test -count=1 ./...
+
+      - name: Go race detector suite
+        run: go test -race -count=1 ./...
+
+      - name: Run headless simulation harness
+        run: go run ./cmd/sim

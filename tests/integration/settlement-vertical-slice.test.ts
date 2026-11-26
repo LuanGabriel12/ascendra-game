@@ -68,7 +68,7 @@ describe("CARBON Vertical Slice 01 — Settlement State Persistence (Real Postgr
     }
 
     const firstApply = await migrateUp(pgCtx.pool, MIGRATIONS_DIR);
-    assert.deepEqual(firstApply, ["0001_carbon_settlement_slice"]);
+    assert.ok(firstApply.includes("0001_carbon_settlement_slice"));
 
     const tablesAfterUp = await pgCtx.pool.query<{ table_name: string }>(
       `SELECT table_name
@@ -82,9 +82,9 @@ describe("CARBON Vertical Slice 01 — Settlement State Persistence (Real Postgr
       ["factions", "outbox_events", "processed_events", "settlement_history", "settlements"],
     );
 
-    // Rollback (down) must cleanly drop slice tables
-    const rolledBack = await migrateDown(pgCtx.pool, MIGRATIONS_DIR, 1);
-    assert.deepEqual(rolledBack, ["0001_carbon_settlement_slice"]);
+    // Rollback (down) across all applied migrations must cleanly drop slice tables
+    const rolledBack = await migrateDown(pgCtx.pool, MIGRATIONS_DIR, firstApply.length);
+    assert.ok(rolledBack.includes("0001_carbon_settlement_slice"));
 
     const tablesAfterDown = await pgCtx.pool.query<{ table_name: string }>(
       `SELECT table_name
@@ -96,7 +96,7 @@ describe("CARBON Vertical Slice 01 — Settlement State Persistence (Real Postgr
 
     // Re-apply on empty schema + verify idempotent second migrateUp over existing schema
     const secondApply = await migrateUp(pgCtx.pool, MIGRATIONS_DIR);
-    assert.deepEqual(secondApply, ["0001_carbon_settlement_slice"]);
+    assert.deepEqual(secondApply, firstApply);
 
     const noopApply = await migrateUp(pgCtx.pool, MIGRATIONS_DIR);
     assert.deepEqual(noopApply, []);
