@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+
+# Environment variables & secrets (NEVER commit real .env)
+.env
+.env.*
+!.env.example
+
+# Local PostgreSQL / test runtime data
+.pgdata/
+.tmp-pg/
+
+# Logs & OS files
+*.log
+npm-debug.log*
+Thumbs.db
+.DS_Store

@@ -1,0 +1,33 @@
+{
+  "name": "ascendra-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ASCENDRA modular backend — CARBON persistence & domain bounded contexts",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test \"tests/**/*.test.ts\"",
+    "migrate:up": "node --import tsx src/scripts/migrate.ts up",
+    "migrate:down": "node --import tsx src/scripts/migrate.ts down",
+    "migrate:status": "node --import tsx src/scripts/migrate.ts status"
+  },
+  "dependencies": {
+    "pg": "^8.23.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.11",
+    "@types/pg": "^8.23.1",
+    "embedded-postgres": "^19.0.0-beta.20",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "allowScripts": {
+    "@embedded-postgres/windows-x64@19.0.0-beta.20": true,
+    "esbuild@0.28.2": true
+  }
+}
