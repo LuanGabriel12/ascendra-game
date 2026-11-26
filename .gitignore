@@ -1,20 +1,44 @@
-# Dependencies
-node_modules/
+# IDE & Editor personal configs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
-# Build outputs
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Go build & test artifacts (NEON)
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Node.js / TypeScript dependencies & build outputs (CARBON)
+node_modules/
 dist/
 
-# Environment variables & secrets (NEVER commit real .env)
-.env
-.env.*
-!.env.example
-
-# Local PostgreSQL / test runtime data
+# Local PostgreSQL / test runtime data (CARBON)
 .pgdata/
 .tmp-pg/
 
-# Logs & OS files
+# Local environment & secrets (NEVER commit real .env or credentials)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+
+# Logs
 *.log
 npm-debug.log*
-Thumbs.db
-.DS_Store
