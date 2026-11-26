@@ -4,7 +4,7 @@ Data: 26/11/2026. Base examinada: a74ee92 na branch neon/backend-foundation.
 
 ## Resumo executivo
 
-O vertical slice headless compila e os testes executados passaram. Existem limites de integração e de operação que impedem tratar o projeto como pronto para produção. A revisão de segurança e dos casos extremos não é exaustiva. O histórico da main remota é independente do histórico NEON, o que bloqueia a comparação normal para PR.
+O vertical slice headless compila e os testes executados passaram. Existem limites de integração e de operação que impedem tratar o projeto como pronto para produção. A revisão de segurança e dos casos extremos não é exaustiva. Os históricos originalmente independentes foram integrados no commit d17379f. origin/main é ancestral da fundação NEON.
 
 ## Módulos e arquitetura observada
 
@@ -25,7 +25,7 @@ A demonstração go run ./cmd/sim concluiu os cenários Defended e Captured, com
 
 ## Achados e correções
 
-- P1 integração: origin/main (6c9b180) e NEON não possuem ancestral comum. A comparação de árvores mostra README divergente e notebook existente somente em main. Não foi feito merge nem alteração de histórico. Resolver a integração preservando ambos os conteúdos antes do PR.
+- P1 integração, resolvido: os históricos eram independentes. O merge d17379f integrou origin/main (6c9b180), preservou o notebook idêntico ao da main e consolidou os READMEs. A main é ancestral da fundação.
 - P2 limites numéricos: incremento do tick e sequência de eventos podiam transbordar, cooldown podia voltar no tempo e variâncias máximas provocavam overflow em variance+1. Foram adicionadas rejeições e testes de regressão. As funções falham atomicamente no Step.
 - P2 entrega: RunScenario despacha eventos durante a execução e retorna erro sem expor o estado parcial se o sink falhar. Retentativas exigem desenho conjunto de persistência e idempotência com CARBON.
 - P2 capacidade: listas de grupos, objetivos, contribuições, cooldowns e eventos do harness podem crescer sem limite. Limites e retenção dependem dos requisitos de operação.
@@ -40,4 +40,4 @@ Para o ciclo 02, revisar os limites e contratos, estabelecer ordenação explíc
 
 ## Limitações
 
-A auditoria não validou execução distribuída, transporte real, persistência, carga, segurança completa nem integração com CARBON. A análise do histórico e de segredos não constitui uma auditoria forense. A integração GitHub e a publicação dependem do resultado das ações posteriores registradas no relatório final.
+A auditoria não validou execução distribuída, transporte real, persistência, carga, segurança completa nem integração com CARBON. A análise do histórico e de segredos não constitui uma auditoria forense. Em 26/11/2026 os testes, vet, build, race e a demonstração foram executados novamente após a integração e passaram. O race e a cobertura utilizaram resultados em cache. O PR #1 está aberto para revisão.
