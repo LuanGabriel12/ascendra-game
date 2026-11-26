@@ -412,3 +412,34 @@ func BenchmarkSnapshotRoundTrip(b *testing.B) {
 		}
 	}
 }
+
+func TestNumericLimitsRejectOverflow(t *testing.T) {
+	cfg := world.DefaultConfig()
+	st := mustInitialState(t, "sim-limits", 1)
+	st.Tick = math.MaxUint64
+	if _, _, err := world.Step(st, nil, cfg); !errors.Is(err, world.ErrNumericOverflow) {
+		t.Fatalf("tick overflow: %v", err)
+	}
+	st.Tick = 0
+	st.EventSeq = math.MaxUint64
+	if _, _, err := world.Step(st, []world.Command{{Kind: world.CmdIncreaseThreat, Tick: 1, Delta: 1}}, cfg); !errors.Is(err, world.ErrNumericOverflow) {
+		t.Fatalf("event sequence overflow: %v", err)
+	}
+	cfg.PlayerDamageVariance = math.MaxInt64
+	if err := cfg.Validate(); !errors.Is(err, world.ErrInvalidConfig) {
+		t.Fatalf("player variance: %v", err)
+	}
+	cfg = world.DefaultConfig()
+	cfg.HostileDamageVariance = math.MaxInt64
+	if err := cfg.Validate(); !errors.Is(err, world.ErrInvalidConfig) {
+		t.Fatalf("hostile variance: %v", err)
+	}
+	cfg = world.DefaultConfig()
+	st = mustInitialState(t, "sim-cooldown-limit", 1)
+	st.Tick = math.MaxUint64 - 2
+	st.Invasion.State = world.InvasionUnderAttack
+	st.Invasion.StartedTick = st.Tick
+	if _, _, err := world.Step(st, []world.Command{{Kind: world.CmdPlayerSupportDefense, Tick: math.MaxUint64 - 1, PlayerID: "p"}}, cfg); !errors.Is(err, world.ErrNumericOverflow) {
+		t.Fatalf("cooldown overflow: %v", err)
+	}
+}

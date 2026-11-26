@@ -2,6 +2,7 @@ package world
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 
@@ -64,6 +65,9 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 	}
 	if err := state.Validate(); err != nil {
 		return WorldState{}, nil, err
+	}
+	if state.Tick == math.MaxUint64 {
+		return WorldState{}, nil, ErrNumericOverflow
 	}
 
 	next := state.Clone()
@@ -242,6 +246,9 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 		}
 	}
 
+	if next.EventSeq < state.EventSeq {
+		return WorldState{}, nil, ErrNumericOverflow
+	}
 	if err := next.Validate(); err != nil {
 		return WorldState{}, nil, err
 	}
@@ -503,6 +510,9 @@ func applyCompleteObjective(next *WorldState, cmd Command) error {
 }
 
 func checkAndSetPlayerCooldown(next *WorldState, playerID string, cooldownTicks int64) error {
+	if uint64(cooldownTicks) > math.MaxUint64-next.Tick {
+		return ErrNumericOverflow
+	}
 	idx, found := slices.BinarySearchFunc(next.PlayerCooldowns, playerID, func(pc PlayerCooldown, id string) int {
 		return strings.Compare(pc.PlayerID, id)
 	})

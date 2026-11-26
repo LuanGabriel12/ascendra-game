@@ -105,13 +105,13 @@ func (c Config) Validate() error {
 	if c.HostileRetreatExitDistance <= c.HostileAttackRange {
 		return fmt.Errorf("%w: hostile_retreat_exit_distance must exceed attack_range", ErrInvalidConfig)
 	}
-	if c.HostileAttackCooldown < 0 || c.HostileBaseDamage <= 0 || c.HostileDamageVariance < 0 || c.HostileBaseHP <= 0 {
+	if c.HostileAttackCooldown < 0 || c.HostileBaseDamage <= 0 || c.HostileDamageVariance < 0 || c.HostileDamageVariance == math.MaxInt64 || c.HostileBaseHP <= 0 {
 		return fmt.Errorf("%w: invalid hostile combat parameters", ErrInvalidConfig)
 	}
 	if c.HostileRetreatThresholdBP < 0 || c.HostileRetreatThresholdBP > BasisPointsScale {
 		return fmt.Errorf("%w: retreat threshold out of [0, %d]", ErrInvalidConfig, BasisPointsScale)
 	}
-	if c.PlayerAttackCooldown < 0 || c.PlayerStrikeBaseDamage <= 0 || c.PlayerDamageVariance < 0 || c.PlayerSupportHeal <= 0 {
+	if c.PlayerAttackCooldown < 0 || c.PlayerStrikeBaseDamage <= 0 || c.PlayerDamageVariance < 0 || c.PlayerDamageVariance == math.MaxInt64 || c.PlayerSupportHeal <= 0 {
 		return fmt.Errorf("%w: invalid player defense parameters", ErrInvalidConfig)
 	}
 	if c.EligibilityMinScore < 0 {
