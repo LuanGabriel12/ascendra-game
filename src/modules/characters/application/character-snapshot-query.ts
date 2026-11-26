@@ -1,0 +1,241 @@
+import { z } from "zod";
+import { NonNegativeInt64Schema } from "../../../shared/contracts/int64-wire.js";
+import { BoundaryValidationError } from "../../../shared/contracts/world-events.js";
+import type { PgPool } from "../../../shared/db/pool.js";
+import {
+  PRIMARY_ATTRIBUTE_KEYS,
+  type AttributeBlock,
+  type CharacterSnapshotV1,
+  type CharacterSnapshotWireV1,
+  type CompetitiveNormalizationProfile,
+} from "../../peoples/domain/character-snapshot-proposal.js";
+import type { AuthorityPrincipal } from "../domain/character.js";
+import {
+  CharacterNotFoundError,
+  GenesisTemporaryStatePersistenceForbiddenError,
+} from "../domain/errors.js";
+import { PostgresCharacterRepository } from "../infrastructure/postgres-character-unit-of-work.js";
+
+const AttributeBlockSchema = z
+  .object({
+    strength: z.number().int().min(0),
+    fortitude: z.number().int().min(0),
+    vigor: z.number().int().min(0),
+    agility: z.number().int().min(0),
+    dexterity: z.number().int().min(0),
+    intelligence: z.number().int().min(0),
+    wisdom: z.number().int().min(0),
+    determination: z.number().int().min(0),
+    luck: z.number().int().min(0),
+    charisma: z.number().int().min(0),
+  })
+  .strict();
+
+export const CharacterSnapshotWireV1Schema = z
+  .object({
+    contract_version: z.literal(1),
+    snapshot_version: z.number().int().min(1),
+    build_version: z.number().int().min(1),
+    character_id: z.string().uuid(),
+    account_id: z.string().uuid().optional(),
+    display_name: z.string().min(3).max(24),
+    race_code: z.string().min(2).max(64),
+    lineage_code: z.string().min(2).max(64),
+    culture_code: z.string().min(2).max(64),
+    background_code: z.string().min(2).max(64),
+    origin_region_id: z.string().min(1).max(64),
+    rules_version: z.number().int().min(1),
+    level: z.number().int().min(1).max(1000),
+    experience_total: NonNegativeInt64Schema,
+    earned_attribute_points: z.number().int().min(0),
+    allocated_attribute_points: z.number().int().min(0),
+    unspent_attribute_points: z.number().int().min(0),
+    base_attributes: AttributeBlockSchema,
+    allocated_attributes: AttributeBlockSchema,
+    equipped_items: z.array(
+      z
+        .object({
+          slotCode: z.string().min(1).max(64),
+          itemDefinitionCode: z.string().min(1).max(128),
+          itemInstanceId: z.string().min(1).max(128),
+          schemaVersion: z.number().int().min(1),
+        })
+        .strict(),
+    ),
+    equipped_abilities: z.array(
+      z
+        .object({
+          slotIndex: z.number().int().min(0).max(31),
+          abilityCode: z.string().min(1).max(128),
+          rank: z.number().int().min(1).max(99),
+        })
+        .strict(),
+    ),
+    normalization_profile: z.enum([
+      "open_world_persistent",
+      "legacy_ranked_md3",
+      "genesis_ranked_md3_scratch",
+    ]),
+  })
+  .strict();
+
+export function serializeCharacterSnapshotWireV1(
+  snapshot: CharacterSnapshotV1,
+): CharacterSnapshotWireV1 {
+  return {
+    contract_version: 1,
+    snapshot_version: snapshot.snapshotVersion,
+    build_version: snapshot.buildVersion,
+    character_id: snapshot.identity.characterId,
+    ...(snapshot.identity.accountId !== undefined
+      ? { account_id: snapshot.identity.accountId }
+      : {}),
+    display_name: snapshot.identity.displayName,
+    race_code: snapshot.identity.raceCode,
+    lineage_code: snapshot.identity.lineageCode,
+    culture_code: snapshot.identity.cultureCode,
+    background_code: snapshot.identity.backgroundCode,
+    origin_region_id: snapshot.identity.originRegionId,
+    rules_version: snapshot.progression.rulesVersion,
+    level: snapshot.progression.level,
+    experience_total: snapshot.progression.experienceTotal.toString(),
+    earned_attribute_points: snapshot.progression.earnedAttributePoints,
+    allocated_attribute_points: snapshot.progression.allocatedAttributePoints,
+    unspent_attribute_points: snapshot.progression.unspentAttributePoints,
+    base_attributes: snapshot.baseAttributes,
+    allocated_attributes: snapshot.allocatedAttributes,
+    equipped_items: snapshot.equippedItems,
+    equipped_abilities: snapshot.equippedAbilities,
+    normalization_profile: snapshot.normalizationProfile,
+  };
+}
+
+export function parseCharacterSnapshotWireV1(raw: unknown): CharacterSnapshotV1 {
+  const parsed = CharacterSnapshotWireV1Schema.safeParse(raw);
+  if (!parsed.success) {
+    const issues = parsed.error.issues.map(
+      (i) => `${i.path.join(".") || "<root>"}: ${i.message}`,
+    );
+    throw new BoundaryValidationError(
+      `Invalid CharacterSnapshotWireV1: ${issues.join("; ")}`,
+      issues,
+    );
+  }
+  const d = parsed.data;
+  if (d.allocated_attribute_points + d.unspent_attribute_points !== d.earned_attribute_points) {
+    throw new BoundaryValidationError(
+      "CharacterSnapshotWireV1 violated attribute budget conservation.",
+      ["allocated_attribute_points + unspent_attribute_points != earned_attribute_points"],
+    );
+  }
+
+  let allocSum = 0;
+  for (const key of PRIMARY_ATTRIBUTE_KEYS) {
+    allocSum += d.allocated_attributes[key];
+  }
+  if (allocSum !== d.allocated_attribute_points) {
+    throw new BoundaryValidationError(
+      "CharacterSnapshotWireV1 sum(allocated_attributes) mismatch.",
+      ["sum(allocated_attributes) != allocated_attribute_points"],
+    );
+  }
+
+  return {
+    contractVersion: 1,
+    snapshotVersion: d.snapshot_version,
+    buildVersion: d.build_version,
+    identity: {
+      characterId: d.character_id,
+      ...(d.account_id !== undefined ? { accountId: d.account_id } : {}),
+      displayName: d.display_name,
+      raceCode: d.race_code,
+      lineageCode: d.lineage_code,
+      cultureCode: d.culture_code,
+      backgroundCode: d.background_code,
+      originRegionId: d.origin_region_id,
+    },
+    baseAttributes: d.base_attributes as AttributeBlock,
+    allocatedAttributes: d.allocated_attributes as AttributeBlock,
+    progression: {
+      rulesVersion: d.rules_version,
+      level: d.level,
+      experienceTotal: d.experience_total,
+      earnedAttributePoints: d.earned_attribute_points,
+      allocatedAttributePoints: d.allocated_attribute_points,
+      unspentAttributePoints: d.unspent_attribute_points,
+    },
+    equippedItems: d.equipped_items,
+    equippedAbilities: d.equipped_abilities,
+    normalizationProfile: d.normalization_profile,
+  };
+}
+
+export interface GetCharacterSnapshotOptions {
+  readonly principal: AuthorityPrincipal;
+  readonly normalizationProfile?: "open_world_persistent" | "legacy_ranked_md3" | undefined;
+  readonly includeAccountId?: boolean | undefined;
+}
+
+export class PostgresCharacterSnapshotReader {
+  private readonly characterRepo: PostgresCharacterRepository;
+
+  constructor(pool: PgPool) {
+    this.characterRepo = new PostgresCharacterRepository(pool);
+  }
+
+  /**
+   * Projects a validated, read-only `CharacterSnapshotV1` for open-world or Legacy Ranked consumption.
+   * Never exposes credentials, never invents non-existent items/abilities, and omits `accountId` by default.
+   */
+  public async getCharacterSnapshot(
+    characterId: string,
+    options: GetCharacterSnapshotOptions,
+  ): Promise<CharacterSnapshotV1> {
+    const profile: CompetitiveNormalizationProfile =
+      options.normalizationProfile ?? "open_world_persistent";
+
+    if ((profile as string) === "genesis_ranked_md3_scratch") {
+      throw new GenesisTemporaryStatePersistenceForbiddenError("getCharacterSnapshot");
+    }
+
+    const character = await this.characterRepo.findCharacterById(characterId);
+    if (!character) {
+      throw new CharacterNotFoundError(characterId);
+    }
+
+    character.assertOwnedByOrSystem(options.principal);
+
+    const snapshot: CharacterSnapshotV1 = {
+      contractVersion: 1,
+      snapshotVersion: character.snapshotVersion,
+      buildVersion: character.buildVersion,
+      identity: {
+        characterId: character.id,
+        ...(options.includeAccountId === true ? { accountId: character.accountId } : {}),
+        displayName: character.displayName,
+        raceCode: character.raceCode,
+        lineageCode: character.lineageCode,
+        cultureCode: character.cultureCode,
+        backgroundCode: character.backgroundCode,
+        originRegionId: character.originRegionId,
+      },
+      baseAttributes: { ...character.baseAttributes },
+      allocatedAttributes: { ...character.allocatedAttributes },
+      progression: {
+        rulesVersion: character.rulesVersion,
+        level: character.level,
+        experienceTotal: character.experienceTotal,
+        earnedAttributePoints: character.earnedAttributePoints,
+        allocatedAttributePoints: character.allocatedAttributePoints,
+        unspentAttributePoints: character.unspentAttributePoints,
+      },
+      equippedItems: [],
+      equippedAbilities: [],
+      normalizationProfile: profile,
+    };
+
+    // Validate wire roundtrip integrity before returning
+    const wire = serializeCharacterSnapshotWireV1(snapshot);
+    return parseCharacterSnapshotWireV1(wire);
+  }
+}

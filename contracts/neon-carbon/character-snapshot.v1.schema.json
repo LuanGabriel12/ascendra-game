@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ascendra.game/contracts/neon-carbon/character-snapshot.v1.schema.json",
+  "title": "CharacterSnapshotWireV1",
+  "description": "PROPOSED JOINT CONTRACT (v1) — Read-only character projection from CARBON to NEON for future combat, bosses, PvP, and Legacy Ranked consumption. Requires NEON review before becoming mandatory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "snapshot_version",
+    "build_version",
+    "character_id",
+    "display_name",
+    "race_code",
+    "lineage_code",
+    "culture_code",
+    "background_code",
+    "origin_region_id",
+    "rules_version",
+    "level",
+    "experience_total",
+    "earned_attribute_points",
+    "allocated_attribute_points",
+    "unspent_attribute_points",
+    "base_attributes",
+    "allocated_attributes",
+    "equipped_items",
+    "equipped_abilities",
+    "normalization_profile"
+  ],
+  "properties": {
+    "contract_version": { "type": "integer", "const": 1 },
+    "snapshot_version": { "type": "integer", "minimum": 1 },
+    "build_version": { "type": "integer", "minimum": 1 },
+    "character_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "account_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "display_name": { "type": "string", "minLength": 3, "maxLength": 24 },
+    "race_code": { "type": "string", "minLength": 2, "maxLength": 64 },
+    "lineage_code": { "type": "string", "minLength": 2, "maxLength": 64 },
+    "culture_code": { "type": "string", "minLength": 2, "maxLength": 64 },
+    "background_code": { "type": "string", "minLength": 2, "maxLength": 64 },
+    "origin_region_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "rules_version": { "type": "integer", "minimum": 1 },
+    "level": { "type": "integer", "minimum": 1, "maximum": 1000 },
+    "experience_total": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,18})$"
+    },
+    "earned_attribute_points": { "type": "integer", "minimum": 0 },
+    "allocated_attribute_points": { "type": "integer", "minimum": 0 },
+    "unspent_attribute_points": { "type": "integer", "minimum": 0 },
+    "base_attributes": { "$ref": "#/$defs/AttributeBlock" },
+    "allocated_attributes": { "$ref": "#/$defs/AttributeBlock" },
+    "equipped_items": { "type": "array" },
+    "equipped_abilities": { "type": "array" },
+    "normalization_profile": {
+      "type": "string",
+      "enum": ["open_world_persistent", "legacy_ranked_md3", "genesis_ranked_md3_scratch"]
+    }
+  },
+  "$defs": {
+    "AttributeBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strength",
+        "fortitude",
+        "vigor",
+        "agility",
+        "dexterity",
+        "intelligence",
+        "wisdom",
+        "determination",
+        "luck",
+        "charisma"
+      ],
+      "properties": {
+        "strength": { "type": "integer", "minimum": 0 },
+        "fortitude": { "type": "integer", "minimum": 0 },
+        "vigor": { "type": "integer", "minimum": 0 },
+        "agility": { "type": "integer", "minimum": 0 },
+        "dexterity": { "type": "integer", "minimum": 0 },
+        "intelligence": { "type": "integer", "minimum": 0 },
+        "wisdom": { "type": "integer", "minimum": 0 },
+        "determination": { "type": "integer", "minimum": 0 },
+        "luck": { "type": "integer", "minimum": 0 },
+        "charisma": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

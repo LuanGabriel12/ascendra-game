@@ -1,14 +1,14 @@
 /**
- * CARBON — Preparatory Proposal for `CharacterSnapshot` (Cycle 03+ Discussion Artifact)
+ * CARBON — Versioned `CharacterSnapshot` Contract (Session 03 Implementation)
  *
- * STATUS: DESIGN PROPOSAL ONLY — NOT IMPLEMENTED AS PERSISTENT TABLES IN SESSION 02.
- * Combat formulas, competitive normalization coefficients, and equipment scaling MUST NOT
- * be frozen unilaterally without joint NEON <-> CARBON alignment.
+ * Evolves the Session 02 proposal into the single authoritative read-only projection
+ * contract without introducing contradictory duplicate definitions.
  *
- * Design Principles:
- * 1. Original ASCENDRA worldbuilding (~26 potential playable peoples long-term).
- * 2. Race, Lineage, and Culture NEVER lock morality, faction allegiance, or combat class/specialization.
- * 3. Ten canonical primary attributes separated into `baseAttributes` and `allocatedAttributes`.
+ * Design Invariants:
+ * 1. Read-only projection decoupled from internal SQL row shapes; never exposes secrets/credentials.
+ * 2. `accountId` is omitted by default and included ONLY when explicitly requested by an authorized internal consumer.
+ * 3. Equipment and ability arrays remain empty unless backed by real persistent records (no fake items invented).
+ * 4. Genesis Ranked temporary match builds NEVER overwrite persistent character state.
  */
 
 export const PRIMARY_ATTRIBUTE_KEYS = [
@@ -35,18 +35,36 @@ export type CompetitiveNormalizationProfile =
   | "legacy_ranked_md3"
   | "genesis_ranked_md3_scratch";
 
+/**
+ * Preparatory container for secondary combat/world resources.
+ * Definitive combat formulas (damage, frame data, hitstun, crit) belong to joint NEON <-> CARBON contracts.
+ */
+export interface SecondaryResourcePreview {
+  readonly rulesProfile: "dev_preview_v1";
+  readonly maxHealth: number;
+  readonly maxMana: number;
+  readonly maxStamina: number;
+  readonly maxGuard: number;
+  readonly maxFocus: number;
+}
+
 export interface CharacterIdentityRef {
   readonly characterId: string;
-  readonly accountId: string;
+  readonly accountId?: string | undefined;
+  readonly displayName: string;
   readonly raceCode: string;
-  readonly lineageCode: string | null;
+  readonly lineageCode: string;
   readonly cultureCode: string;
+  readonly backgroundCode: string;
   readonly originRegionId: string;
 }
 
 export interface CharacterProgressionState {
+  readonly rulesVersion: number;
   readonly level: number;
   readonly experienceTotal: bigint;
+  readonly earnedAttributePoints: number;
+  readonly allocatedAttributePoints: number;
   readonly unspentAttributePoints: number;
 }
 
@@ -63,11 +81,7 @@ export interface CharacterAbilitySlotSummary {
   readonly rank: number;
 }
 
-/**
- * Read-only snapshot candidate that CARBON will project for NEON's simulation/combat
- * boundaries once character persistence is implemented in Cycle 03+.
- */
-export interface CharacterSnapshotProposalV1 {
+export interface CharacterSnapshotV1 {
   readonly contractVersion: 1;
   readonly snapshotVersion: number;
   readonly buildVersion: number;
@@ -78,4 +92,34 @@ export interface CharacterSnapshotProposalV1 {
   readonly equippedItems: ReadonlyArray<CharacterEquipmentSlotSummary>;
   readonly equippedAbilities: ReadonlyArray<CharacterAbilitySlotSummary>;
   readonly normalizationProfile: CompetitiveNormalizationProfile;
+}
+
+/**
+ * Backward-compatible alias preserving Session 02 imports.
+ */
+export type CharacterSnapshotProposalV1 = CharacterSnapshotV1;
+
+export interface CharacterSnapshotWireV1 {
+  readonly contract_version: 1;
+  readonly snapshot_version: number;
+  readonly build_version: number;
+  readonly character_id: string;
+  readonly account_id?: string | undefined;
+  readonly display_name: string;
+  readonly race_code: string;
+  readonly lineage_code: string;
+  readonly culture_code: string;
+  readonly background_code: string;
+  readonly origin_region_id: string;
+  readonly rules_version: number;
+  readonly level: number;
+  readonly experience_total: string;
+  readonly earned_attribute_points: number;
+  readonly allocated_attribute_points: number;
+  readonly unspent_attribute_points: number;
+  readonly base_attributes: AttributeBlock;
+  readonly allocated_attributes: AttributeBlock;
+  readonly equipped_items: ReadonlyArray<CharacterEquipmentSlotSummary>;
+  readonly equipped_abilities: ReadonlyArray<CharacterAbilitySlotSummary>;
+  readonly normalization_profile: CompetitiveNormalizationProfile;
 }
