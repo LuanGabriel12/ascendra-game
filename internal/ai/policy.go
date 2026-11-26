@@ -92,11 +92,14 @@ type Perception struct {
 	InvasionActive       bool
 	SettlementAlive      bool
 
-	// Cycle 02 Creature AI Engine inputs (active when Profile.Archetype != "").
+	// Cycle 02 & 03 Creature AI Engine inputs (active when Profile.Archetype != "").
 	Profile                     Profile
 	HomePosition                int64 // Territorial anchor in WorldUnits, >= 0
 	MoraleBP                    int64 // Current morale in [0, 10000]
 	RecentDamageTaken           int64 // Authoritative damage taken since last tick, >= 0
+	CommanderFallenShock        bool  // Explicit morale shock when a nearby same-family commander falls
+	RetainedTarget              TargetRef
+	TargetMemoryTicks           int64 // Remaining ticks of target retention memory, >= 0
 	ReinforceCooldownTicks      int64 // Remaining ticks before calling reinforcements, >= 0
 	RemainingReinforcementCalls int   // Remaining calls allowed for this group, >= 0
 	Targets                     []PerceivedTarget
@@ -137,6 +140,9 @@ func (p Perception) Validate() error {
 		if p.RecentDamageTaken < 0 {
 			return fmt.Errorf("%w: negative recent_damage_taken %d", ErrInvalidPerception, p.RecentDamageTaken)
 		}
+		if p.TargetMemoryTicks < 0 || !p.RetainedTarget.Valid() {
+			return fmt.Errorf("%w: invalid target retention state", ErrInvalidPerception)
+		}
 		if p.ReinforceCooldownTicks < 0 || p.RemainingReinforcementCalls < 0 {
 			return fmt.Errorf("%w: negative reinforcement cooldown or calls", ErrInvalidPerception)
 		}
@@ -168,6 +174,8 @@ type Decision struct {
 	MoveDelta              int64 // Signed change to DistanceToSettlement (- closer to 0, + farther from 0)
 	TargetID               string
 	TargetKind             TargetKind
+	Target                 TargetRef
+	NextTargetMemoryTicks  int64
 	NewMoraleBP            int64
 	RequestReinforcements  bool
 	ReinforcementArchetype string
@@ -357,8 +365,19 @@ func evaluateWithProfile(p Perception, rng *simulation.DeterministicRNG) Decisio
 		}
 	}
 
-	sel, hasTarget := SelectTarget(pos, p.HomePosition, prof, targetList, p.Order, p.InvasionActive)
+	memOpts := TargetMemoryOptions{}
+	if !p.RetainedTarget.IsZero() && p.TargetMemoryTicks > 0 {
+		memOpts = TargetMemoryOptions{
+			RetainedTarget: p.RetainedTarget,
+			RetentionBonus: 750,
+		}
+	}
+	sel, hasTarget := SelectTargetWithMemory(pos, p.HomePosition, prof, targetList, p.Order, p.InvasionActive, memOpts)
 	if hasTarget {
+		nextMemTicks := int64(8)
+		if sel.Ref() == p.RetainedTarget && p.TargetMemoryTicks > 1 {
+			nextMemTicks = p.TargetMemoryTicks - 1
+		}
 		territoryAlert := !p.InvasionActive && absDiffInt64(sel.Position, p.HomePosition) <= prof.TerritoryRadius
 		if sel.Distance <= attackRange {
 			action := ActionHold
@@ -375,6 +394,8 @@ func evaluateWithProfile(p Perception, rng *simulation.DeterministicRNG) Decisio
 				MoveDelta:              0,
 				TargetID:               sel.TargetID,
 				TargetKind:             sel.Kind,
+				Target:                 sel.Ref(),
+				NextTargetMemoryTicks:  nextMemTicks,
 				NewMoraleBP:            newMorale,
 				RequestReinforcements:  reqReinf,
 				ReinforcementArchetype: reinfArchetype,
@@ -401,6 +422,8 @@ func evaluateWithProfile(p Perception, rng *simulation.DeterministicRNG) Decisio
 			MoveDelta:              delta,
 			TargetID:               sel.TargetID,
 			TargetKind:             sel.Kind,
+			Target:                 sel.Ref(),
+			NextTargetMemoryTicks:  nextMemTicks,
 			NewMoraleBP:            newMorale,
 			RequestReinforcements:  reqReinf,
 			ReinforcementArchetype: reinfArchetype,
@@ -455,6 +478,15 @@ func computeMorale(p Perception, inHomeTerritory, lowHP bool) int64 {
 		dmgFracBP := ratioBasisPoints(p.RecentDamageTaken, p.MaxHP)
 		shock := prof.MoraleLossPerHitBP + (dmgFracBP / 2)
 		morale -= shock
+	}
+
+	// Explicit morale shock when a nearby same-family commander falls in battle.
+	if p.CommanderFallenShock {
+		if prof.Family == FamilyGoblin {
+			morale -= 1400
+		} else {
+			morale -= 900
+		}
 	}
 
 	// Sustained low-HP pressure.
