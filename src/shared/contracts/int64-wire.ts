@@ -62,6 +62,21 @@ function parseBigIntToken(
   return z.NEVER;
 }
 
+export const SignedInt64Schema = z.unknown().transform((val, ctx): bigint => {
+  const parsed = parseBigIntToken(val, true, ctx, "signed int64");
+  if (parsed === z.NEVER) {
+    return z.NEVER;
+  }
+  if (parsed < MIN_INT64 || parsed > MAX_INT64) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `Value ${parsed.toString()} is outside signed int64 bounds [${MIN_INT64.toString()}, ${MAX_INT64.toString()}].`,
+    });
+    return z.NEVER;
+  }
+  return parsed;
+});
+
 export const NonNegativeInt64Schema = z.unknown().transform((val, ctx): bigint => {
   const parsed = parseBigIntToken(val, true, ctx, "non-negative int64");
   if (parsed === z.NEVER) {
