@@ -136,11 +136,104 @@ export const Uint64Schema = z.unknown().transform((val, ctx): bigint => {
   return parsed;
 });
 
+function assertNoDuplicateJsonObjectKeys(rawJson: string): void {
+  type ContainerCtx =
+    | { readonly kind: "object"; readonly keys: Set<string>; expectingKey: boolean; lastString: string | null }
+    | { readonly kind: "array" };
+
+  const stack: ContainerCtx[] = [];
+  let i = 0;
+  const len = rawJson.length;
+
+  while (i < len) {
+    const ch = rawJson[i]!;
+    if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n") {
+      i++;
+      continue;
+    }
+
+    if (ch === "{") {
+      stack.push({ kind: "object", keys: new Set<string>(), expectingKey: true, lastString: null });
+      i++;
+      continue;
+    }
+
+    if (ch === "[") {
+      stack.push({ kind: "array" });
+      i++;
+      continue;
+    }
+
+    if (ch === "}" || ch === "]") {
+      stack.pop();
+      const parent = stack[stack.length - 1];
+      if (parent && parent.kind === "object") {
+        parent.expectingKey = false;
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === '"') {
+      let end = i + 1;
+      while (end < len) {
+        const c = rawJson[end]!;
+        if (c === "\\") {
+          end += 2;
+          continue;
+        }
+        if (c === '"') {
+          break;
+        }
+        end++;
+      }
+      if (end >= len) {
+        return; // Let JSON.parse raise syntax error on unterminated string
+      }
+      const literal = rawJson.slice(i, end + 1);
+      const top = stack[stack.length - 1];
+      if (top && top.kind === "object" && top.expectingKey) {
+        top.lastString = JSON.parse(literal) as string;
+      }
+      i = end + 1;
+      continue;
+    }
+
+    if (ch === ":") {
+      const top = stack[stack.length - 1];
+      if (top && top.kind === "object" && top.expectingKey && top.lastString !== null) {
+        if (top.keys.has(top.lastString)) {
+          throw new Error(`Duplicate JSON object key '${top.lastString}' is forbidden.`);
+        }
+        top.keys.add(top.lastString);
+        top.expectingKey = false;
+        top.lastString = null;
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === ",") {
+      const top = stack[stack.length - 1];
+      if (top && top.kind === "object") {
+        top.expectingKey = true;
+        top.lastString = null;
+      }
+      i++;
+      continue;
+    }
+
+    i++;
+  }
+}
+
 /**
  * Decodes raw JSON text produced by Go (`encoding/json`) without losing 64-bit integer precision.
- * Any JSON integer literal outside JavaScript safe integer bounds (`|n| > 9007199254740991`)
- * is preserved verbatim as its exact decimal string before `JSON.parse` executes, while
- * fractional/exponent numbers remain untouched.
+ * - Rejects oversized payloads (> 64 KiB).
+ * - Rejects duplicate JSON object keys at any nesting depth (preventing parser key-smuggling).
+ * - Any JSON integer literal outside JavaScript safe integer bounds (`|n| > 9007199254740991`)
+ *   is preserved verbatim as its exact decimal string before `JSON.parse` executes, while
+ *   fractional/exponent numbers remain untouched.
  */
 export function decodeWireJsonLossless(rawJson: string): unknown {
   const byteLength = Buffer.byteLength(rawJson, "utf8");
@@ -218,5 +311,7 @@ export function decodeWireJsonLossless(rawJson: string): unknown {
     i++;
   }
 
-  return JSON.parse(out);
+  const parsed = JSON.parse(out) as unknown;
+  assertNoDuplicateJsonObjectKeys(rawJson);
+  return parsed;
 }

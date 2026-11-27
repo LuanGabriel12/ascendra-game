@@ -13,10 +13,11 @@ import type { Logger } from "../../../shared/observability/logger.js";
 import type { CompetitiveNormalizationProfile } from "../../peoples/domain/character-snapshot-proposal.js";
 import type { IdempotentCommandOutcome } from "../../characters/application/character-engine-service.js";
 import {
+  assertAccountActive,
   assertNotGenesisContext,
   type AuthorityPrincipal,
 } from "../../characters/domain/character.js";
-import { CharacterNotFoundError } from "../../characters/domain/errors.js";
+import { AccountNotFoundError, CharacterNotFoundError } from "../../characters/domain/errors.js";
 import { PgCharacterTransactionScope } from "../../characters/infrastructure/postgres-character-unit-of-work.js";
 import {
   evaluateTitleConditionAst,
@@ -992,6 +993,8 @@ export class SocialEngineService {
       severity: cmd.severity,
       confirmation_level: cmd.confirmationLevel,
       evidence_reference: cmd.evidenceReference.trim(),
+      notoriety_fame_grant: notorietyFame.toString(),
+      reputation_penalty: cmd.reputationPenaltyWithControllingFaction ?? null,
     });
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
@@ -1018,14 +1021,89 @@ export class SocialEngineService {
 
       const currentSocial = await scope.ensureAndLockSocialStanding(offender.id);
       if (claim.status === "duplicate_verified") {
+        const crRes = await scope.client.query<Record<string, unknown>>(
+          "SELECT * FROM criminal_records WHERE id = $1::uuid",
+          [detCrimeId],
+        );
+        const crRow = crRes.rows[0];
+        if (!crRow) {
+          const jur = await scope.findJurisdiction(cmd.jurisdictionId);
+          const jurStat = await scope.ensureAndLockJurisdictionStatus(
+            offender.id,
+            jur.jurisdictionId,
+          );
+          const evalDup = evaluateIncidentUnderJurisdiction({
+            offenseCode: cmd.offenseCode,
+            combatContext,
+            confirmationLevel: cmd.confirmationLevel,
+            severity: cmd.severity,
+            currentState: jurStat.criminalState,
+            jurisdiction: jur,
+          });
+          return {
+            status: "duplicate_idempotent",
+            duplicate: true,
+            data: {
+              constitutedCrime: false,
+              exemptionReason: evalDup.exemptionReason,
+              crimeRecord: null,
+              autoWarrant: null,
+              socialStanding: currentSocial,
+            },
+          };
+        }
+
+        const existingCrime: CriminalRecord = {
+          id: String(crRow["id"]),
+          offenderCharacterId: String(crRow["offender_character_id"]),
+          victimCharacterId: (crRow["victim_character_id"] as string | null) ?? null,
+          victimReference: (crRow["victim_reference"] as string | null) ?? null,
+          offenseCode: crRow["offense_code"] as OffenseCode,
+          combatContext: crRow["combat_context"] as CombatLegalContext,
+          jurisdictionId: String(crRow["jurisdiction_id"]),
+          settlementId: (crRow["settlement_id"] as string | null) ?? null,
+          factionId: (crRow["faction_id"] as string | null) ?? null,
+          regionId: String(crRow["region_id"]),
+          severity: crRow["severity"] as CrimeSeverity,
+          legalStatus: crRow["legal_status"] as CriminalRecord["legalStatus"],
+          moralDeltaApplied: BigInt(String(crRow["moral_delta_applied"])),
+          notorietyFameGranted: BigInt(String(crRow["notoriety_fame_granted"])),
+          sourceEventId: String(crRow["source_event_id"]),
+          evidenceReference: String(crRow["evidence_reference"]),
+          rulesVersion: Number(crRow["rules_version"]),
+          recordedAt: crRow["recorded_at"] as Date,
+          updatedAt: crRow["updated_at"] as Date,
+        };
+
+        const awRes = await scope.client.query<Record<string, unknown>>(
+          "SELECT * FROM criminal_warrants WHERE id = $1::uuid",
+          [detWarrantId],
+        );
+        const awRow = awRes.rows[0];
+        const existingAutoWarrant: CriminalWarrant | null = awRow
+          ? {
+              id: String(awRow["id"]),
+              targetCharacterId: String(awRow["target_character_id"]),
+              issuingAuthorityId: String(awRow["issuing_authority_id"]),
+              jurisdictionId: String(awRow["jurisdiction_id"]),
+              sourceCrimeId: String(awRow["source_crime_id"]),
+              status: awRow["status"] as CriminalWarrant["status"],
+              authorizedExceptions: awRow["authorized_exceptions"] as ReadonlyArray<string>,
+              version: Number(awRow["version"]),
+              issuedAt: awRow["issued_at"] as Date,
+              resolvedAt: (awRow["resolved_at"] as Date | null) ?? null,
+              resolutionReference: (awRow["resolution_reference"] as string | null) ?? null,
+            }
+          : null;
+
         return {
           status: "duplicate_idempotent",
           duplicate: true,
           data: {
             constitutedCrime: true,
             exemptionReason: null,
-            crimeRecord: null,
-            autoWarrant: null,
+            crimeRecord: existingCrime,
+            autoWarrant: existingAutoWarrant,
             socialStanding: currentSocial,
           },
         };
@@ -2360,6 +2438,18 @@ export class SocialEngineService {
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      character.assertOwnedByOrSystem(cmd.principal);
+      character.assertActiveStatus();
+      const account = await charScope.lockAccountById(character.accountId);
+      if (!account) {
+        throw new AccountNotFoundError(character.accountId);
+      }
+      assertAccountActive(account);
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -2374,12 +2464,6 @@ export class SocialEngineService {
         payloadFingerprint: fingerprint,
         canonicalPayload: canonicalJson,
       });
-
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
-      character.assertOwnedByOrSystem(cmd.principal);
 
       const social = await scope.ensureAndLockSocialStanding(character.id);
       if (claim.status === "duplicate_verified") {
@@ -2991,7 +3075,9 @@ export class SocialEngineService {
     readonly contextJurisdictionId?: string | undefined;
     readonly npcSocialRole: NpcSocialRole;
     readonly authoritativePowerStanding?: number | null | undefined;
+    readonly executionProfile?: CompetitiveNormalizationProfile | undefined;
   }): Promise<WorldRecognitionEvaluationResult> {
+    assertNotGenesisContext("evaluateCharacterContextualRecognition", params.executionProfile);
     const client = await this.pool.connect();
     try {
       const charScope = new PgCharacterTransactionScope(this.pool, client);
@@ -3072,11 +3158,23 @@ export class SocialEngineService {
 
       const histRes = params.contextSettlementId
         ? await client.query<{ contribution_role: string }>(
-            "SELECT contribution_role FROM historical_social_records WHERE character_id = $1::uuid AND (settlement_id = $2::uuid OR region_id = $3)",
+            `SELECT contribution_role
+             FROM historical_social_records
+             WHERE character_id = $1::uuid
+               AND visibility <> 'restricted_archive'
+               AND (settlement_id = $2::uuid OR region_id = $3)
+             ORDER BY recorded_at DESC
+             LIMIT 200`,
             [character.id, params.contextSettlementId, params.contextRegionId],
           )
         : await client.query<{ contribution_role: string }>(
-            "SELECT contribution_role FROM historical_social_records WHERE character_id = $1::uuid AND region_id = $2",
+            `SELECT contribution_role
+             FROM historical_social_records
+             WHERE character_id = $1::uuid
+               AND visibility <> 'restricted_archive'
+               AND region_id = $2
+             ORDER BY recorded_at DESC
+             LIMIT 200`,
             [character.id, params.contextRegionId],
           );
 

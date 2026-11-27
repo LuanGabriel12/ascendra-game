@@ -502,9 +502,21 @@ export class PostgresSocialSnapshotReader {
         [character.id],
       );
 
-      const filteredWarrants = warrantsRes.rows.filter(
-        (w) => !options.jurisdictionFilterId || w.jurisdiction_id === options.jurisdictionFilterId,
+      const publiclyVisibleWantedJurisdictions = new Set(
+        jurStatusesRes.rows
+          .filter((j) => j.criminal_state === "Wanted" || j.criminal_state === "Fugitive")
+          .map((j) => j.jurisdiction_id),
       );
+
+      const filteredWarrants = warrantsRes.rows.filter((w) => {
+        if (options.jurisdictionFilterId && w.jurisdiction_id !== options.jurisdictionFilterId) {
+          return false;
+        }
+        if (isPublicLimited) {
+          return publiclyVisibleWantedJurisdictions.has(w.jurisdiction_id);
+        }
+        return true;
+      });
       if (filteredWarrants.length > 0) {
         flags.push("wanted_warrant_active");
       }

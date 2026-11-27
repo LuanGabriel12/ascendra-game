@@ -35,6 +35,15 @@ export class CharacterNotFoundError extends CharacterDomainError {
   }
 }
 
+export class CharacterInactiveError extends CharacterDomainError {
+  constructor(characterId: string, status: string) {
+    super(
+      "CHARACTER_INACTIVE",
+      `Character '${characterId}' has non-active status '${status}' and cannot perform persistent mutations.`,
+    );
+  }
+}
+
 export class CharacterOwnershipForbiddenError extends CharacterDomainError {
   constructor(characterId: string, callerAccountId: string) {
     super(

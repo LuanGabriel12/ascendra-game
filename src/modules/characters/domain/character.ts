@@ -14,6 +14,7 @@ import {
   AccountInactiveError,
   CharacterBuildConflictError,
   CharacterCompetitiveLockedError,
+  CharacterInactiveError,
   CharacterOwnershipForbiddenError,
   GenesisTemporaryStatePersistenceForbiddenError,
 } from "./errors.js";
@@ -235,6 +236,12 @@ export class Character {
     }
     if (principal.accountId.toLowerCase() !== this.accountId.toLowerCase()) {
       throw new CharacterOwnershipForbiddenError(this.id, principal.accountId);
+    }
+  }
+
+  public assertActiveStatus(): void {
+    if (this.status !== "active") {
+      throw new CharacterInactiveError(this.id, this.status);
     }
   }
 

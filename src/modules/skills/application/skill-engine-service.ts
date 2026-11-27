@@ -186,17 +186,23 @@ export interface SkillEngineDependencies {
     | undefined;
 }
 
-async function assertCharacterMutableByPrincipal(params: {
+async function assertCharacterAuthorizedByPrincipal(params: {
   readonly scope: PgSkillTransactionScope;
   readonly character: Character;
   readonly principal: AuthorityPrincipal;
-  readonly expectedBuildVersion?: number | undefined;
 }): Promise<void> {
   params.character.assertOwnedByOrSystem(params.principal);
+  params.character.assertActiveStatus();
   const accStatus = await params.scope.findAccountStatus(params.character.accountId);
   if (accStatus && accStatus !== "active") {
     throw new AccountInactiveError(params.character.accountId, accStatus);
   }
+}
+
+function assertCharacterMutableBuildState(params: {
+  readonly character: Character;
+  readonly expectedBuildVersion?: number | undefined;
+}): void {
   if (params.character.competitiveLockState === "in_ranked_series") {
     throw new CharacterCompetitiveLockedError(params.character.id);
   }
@@ -775,6 +781,16 @@ export class SkillEngineService {
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      await assertCharacterAuthorizedByPrincipal({
+        scope,
+        character,
+        principal: cmd.principal,
+      });
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -790,10 +806,6 @@ export class SkillEngineService {
         canonicalPayload: canonicalJson,
       });
 
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
       const rules = await scope.loadRules(1);
       const specPts = await scope.ensureAndLockSpecializationPoints(
         character.id,
@@ -816,10 +828,8 @@ export class SkillEngineService {
         };
       }
 
-      await assertCharacterMutableByPrincipal({
-        scope,
+      assertCharacterMutableBuildState({
         character,
-        principal: cmd.principal,
         expectedBuildVersion: cmd.expectedBuildVersion,
       });
 
@@ -980,6 +990,16 @@ export class SkillEngineService {
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      await assertCharacterAuthorizedByPrincipal({
+        scope,
+        character,
+        principal: cmd.principal,
+      });
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -995,10 +1015,6 @@ export class SkillEngineService {
         canonicalPayload: canonicalJson,
       });
 
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
       const rules = await scope.loadRules(1);
       const specPts = await scope.ensureAndLockSpecializationPoints(
         character.id,
@@ -1022,10 +1038,8 @@ export class SkillEngineService {
         };
       }
 
-      await assertCharacterMutableByPrincipal({
-        scope,
+      assertCharacterMutableBuildState({
         character,
-        principal: cmd.principal,
         expectedBuildVersion: cmd.expectedBuildVersion,
       });
 
@@ -1203,6 +1217,16 @@ export class SkillEngineService {
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      await assertCharacterAuthorizedByPrincipal({
+        scope,
+        character,
+        principal: cmd.principal,
+      });
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -1218,10 +1242,6 @@ export class SkillEngineService {
         canonicalPayload: canonicalJson,
       });
 
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
       const rules = await scope.loadRules(1);
       const specPts = await scope.ensureAndLockSpecializationPoints(
         character.id,
@@ -1243,10 +1263,8 @@ export class SkillEngineService {
         };
       }
 
-      await assertCharacterMutableByPrincipal({
-        scope,
+      assertCharacterMutableBuildState({
         character,
-        principal: cmd.principal,
         expectedBuildVersion: cmd.expectedBuildVersion,
       });
 
@@ -1399,6 +1417,16 @@ export class SkillEngineService {
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
       const invScope = new PgInventoryTransactionScope(scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      await assertCharacterAuthorizedByPrincipal({
+        scope,
+        character,
+        principal: cmd.principal,
+      });
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -1414,10 +1442,6 @@ export class SkillEngineService {
         canonicalPayload: canonicalJson,
       });
 
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
       const { activeLoadout } = await invScope.ensureAndLockPrimaryContainers(character.id, 40);
       const targetLoadoutId = cmd.targetLoadoutId ?? activeLoadout.id;
 
@@ -1446,10 +1470,8 @@ export class SkillEngineService {
         };
       }
 
-      await assertCharacterMutableByPrincipal({
-        scope,
+      assertCharacterMutableBuildState({
         character,
-        principal: cmd.principal,
         expectedBuildVersion: cmd.expectedBuildVersion,
       });
 
@@ -1620,6 +1642,16 @@ export class SkillEngineService {
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
       const invScope = new PgInventoryTransactionScope(scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      await assertCharacterAuthorizedByPrincipal({
+        scope,
+        character,
+        principal: cmd.principal,
+      });
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -1635,10 +1667,6 @@ export class SkillEngineService {
         canonicalPayload: canonicalJson,
       });
 
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
       const { activeLoadout } = await invScope.ensureAndLockPrimaryContainers(character.id, 40);
       const targetLoadoutId = cmd.targetLoadoutId ?? activeLoadout.id;
 
@@ -1655,10 +1683,8 @@ export class SkillEngineService {
         };
       }
 
-      await assertCharacterMutableByPrincipal({
-        scope,
+      assertCharacterMutableBuildState({
         character,
-        principal: cmd.principal,
         expectedBuildVersion: cmd.expectedBuildVersion,
       });
 
@@ -1774,6 +1800,16 @@ export class SkillEngineService {
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      await assertCharacterAuthorizedByPrincipal({
+        scope,
+        character,
+        principal: cmd.principal,
+      });
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -1788,11 +1824,6 @@ export class SkillEngineService {
         payloadFingerprint: fingerprint,
         canonicalPayload: canonicalJson,
       });
-
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
 
       const loRes = await scope.client.query<{ character_id: string; is_active: boolean }>(
         "SELECT character_id, is_active FROM equipment_loadouts WHERE id = $1::uuid FOR UPDATE",
@@ -1818,10 +1849,8 @@ export class SkillEngineService {
         };
       }
 
-      await assertCharacterMutableByPrincipal({
-        scope,
+      assertCharacterMutableBuildState({
         character,
-        principal: cmd.principal,
         expectedBuildVersion: cmd.expectedBuildVersion,
       });
 
@@ -1955,6 +1984,16 @@ export class SkillEngineService {
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      await assertCharacterAuthorizedByPrincipal({
+        scope,
+        character,
+        principal: cmd.principal,
+      });
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -1970,10 +2009,6 @@ export class SkillEngineService {
         canonicalPayload: canonicalJson,
       });
 
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
       const rules = await scope.loadRules(1);
       const specPts = await scope.ensureAndLockSpecializationPoints(
         character.id,
@@ -1997,10 +2032,8 @@ export class SkillEngineService {
         };
       }
 
-      await assertCharacterMutableByPrincipal({
-        scope,
+      assertCharacterMutableBuildState({
         character,
-        principal: cmd.principal,
         expectedBuildVersion: cmd.expectedBuildVersion,
       });
 

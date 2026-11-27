@@ -219,6 +219,12 @@ export class CharacterEngineService {
     });
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
+      const account = await scope.lockAccountById(cmd.accountId);
+      if (!account) {
+        throw new AccountNotFoundError(cmd.accountId);
+      }
+      assertAccountActive(account);
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -239,14 +245,9 @@ export class CharacterEngineService {
         if (!existing) {
           throw new CharacterNotFoundError(targetCharacterId);
         }
+        existing.assertOwnedByOrSystem(cmd.principal);
         return { status: "duplicate_idempotent", duplicate: true, data: existing };
       }
-
-      const account = await scope.lockAccountById(cmd.accountId);
-      if (!account) {
-        throw new AccountNotFoundError(cmd.accountId);
-      }
-      assertAccountActive(account);
 
       const rules = await scope.loadProgressionRules(rulesVersion);
       if (!rules) {
@@ -393,6 +394,18 @@ export class CharacterEngineService {
     });
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
+      const current = await scope.lockCharacterById(cmd.characterId);
+      if (!current) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      current.assertOwnedByOrSystem(cmd.principal);
+      current.assertActiveStatus();
+      const account = await scope.lockAccountById(current.accountId);
+      if (!account) {
+        throw new AccountNotFoundError(current.accountId);
+      }
+      assertAccountActive(account);
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -407,12 +420,6 @@ export class CharacterEngineService {
         payloadFingerprint: fingerprint,
         canonicalPayload: canonicalJson,
       });
-
-      const current = await scope.lockCharacterById(cmd.characterId);
-      if (!current) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
-      current.assertOwnedByOrSystem(cmd.principal);
 
       if (claim.status === "duplicate_verified") {
         return { status: "duplicate_idempotent", duplicate: true, data: current };
@@ -511,6 +518,18 @@ export class CharacterEngineService {
     });
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
+      const current = await scope.lockCharacterById(cmd.characterId);
+      if (!current) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      current.assertOwnedByOrSystem(cmd.principal);
+      current.assertActiveStatus();
+      const account = await scope.lockAccountById(current.accountId);
+      if (!account) {
+        throw new AccountNotFoundError(current.accountId);
+      }
+      assertAccountActive(account);
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -525,12 +544,6 @@ export class CharacterEngineService {
         payloadFingerprint: fingerprint,
         canonicalPayload: canonicalJson,
       });
-
-      const current = await scope.lockCharacterById(cmd.characterId);
-      if (!current) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
-      current.assertOwnedByOrSystem(cmd.principal);
 
       if (claim.status === "duplicate_verified") {
         return { status: "duplicate_idempotent", duplicate: true, data: current };
@@ -809,6 +822,18 @@ export class CharacterEngineService {
     });
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
+      const current = await scope.lockCharacterById(cmd.characterId);
+      if (!current) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      current.assertOwnedByOrSystem(cmd.principal);
+      current.assertActiveStatus();
+      const account = await scope.lockAccountById(current.accountId);
+      if (!account) {
+        throw new AccountNotFoundError(current.accountId);
+      }
+      assertAccountActive(account);
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -823,12 +848,6 @@ export class CharacterEngineService {
         payloadFingerprint: fingerprint,
         canonicalPayload: canonicalJson,
       });
-
-      const current = await scope.lockCharacterById(cmd.characterId);
-      if (!current) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
-      current.assertOwnedByOrSystem(cmd.principal);
 
       if (claim.status === "duplicate_verified") {
         return { status: "duplicate_idempotent", duplicate: true, data: current };
