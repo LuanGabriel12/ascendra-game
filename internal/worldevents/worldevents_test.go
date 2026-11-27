@@ -762,7 +762,7 @@ func TestMidCampaignSnapshotRestoreAndVersionRejection(t *testing.T) {
 		t.Fatalf("expected verified mid-campaign snapshot, got %+v", sumG)
 	}
 
-	// Verify v5 snapshot encodes schema_version == 5 and explicitly rejects v1, v2, v3, v4, and oversized payloads.
+	// Verify v6 snapshot encodes schema_version == 6 and explicitly rejects v1-v5 and oversized payloads.
 	raw, err := resG.FinalState.MarshalSnapshot(cfg)
 	if err != nil {
 		t.Fatalf("MarshalSnapshot: %v", err)
@@ -771,10 +771,10 @@ func TestMidCampaignSnapshotRestoreAndVersionRejection(t *testing.T) {
 	if err := json.Unmarshal(raw, &env); err != nil {
 		t.Fatalf("json.Unmarshal envelope: %v", err)
 	}
-	if v, ok := env["schema_version"].(float64); !ok || uint32(v) != 5 {
-		t.Fatalf("expected schema_version=5, got %v", env["schema_version"])
+	if v, ok := env["schema_version"].(float64); !ok || uint32(v) != 6 {
+		t.Fatalf("expected schema_version=6, got %v", env["schema_version"])
 	}
-	for _, legacyVer := range []uint32{1, 2, 3, 4} {
+	for _, legacyVer := range []uint32{1, 2, 3, 4, 5} {
 		env["schema_version"] = legacyVer
 		badRaw, _ := json.Marshal(env)
 		if _, err := worldevents.UnmarshalOrchestratedSnapshot(badRaw, cfg); !errors.Is(err, simulation.ErrUnsupportedSnapshotVersion) {
@@ -999,7 +999,7 @@ func TestLongDurationMultiSeedStabilityAndBoundedMemory(t *testing.T) {
 				t.Fatal("terminal delivery count mismatch")
 			}
 			for i, pending := range pendingOutcomes {
-				if pending != out.TerminalOutcomes[i] {
+				if !reflect.DeepEqual(pending, out.TerminalOutcomes[i]) {
 					t.Fatal("terminal outbox differs from emitted fact")
 				}
 				cur, err = worldevents.AcknowledgeTerminalOutcome(cur, pending.Sequence, cfg)
@@ -2210,56 +2210,38 @@ func TestOrchestratedV5RejectsLegacyReservationState(t *testing.T) {
 func TestBatchAndTotalDirectorEventLimits(t *testing.T) {
 	// 1. Incompatible config: MaxPendingDirectorEvents < MaxEventsPerBatch must fail upfront.
 	badCfg := worldevents.DefaultConfig()
-	badCfg.MaxEventsPerBatch = 16
-	badCfg.MaxPendingDirectorEvents = 8
+	badCfg.MaxEventsPerBatch = 20
+	badCfg.MaxPendingDirectorEvents = 16
 	if err := badCfg.Validate(); !errors.Is(err, worldevents.ErrInvalidConfig) {
 		t.Fatalf("expected ErrInvalidConfig for MaxPendingDirectorEvents < MaxEventsPerBatch, got %v", err)
 	}
 
-	// 2. Single-tick excess above MaxEventsPerBatch returns ErrTickEventCapacity atomically
-	// (NOT silent truncation and NOT retriable without config fix).
-	cfg := worldevents.DefaultOrchestratedConfig()
-	cfg.Director.MaxEventsPerUpdate = 1
-	cfg.Director.MaxEventsPerBatch = 1
-	cfg.Director.MaxPendingDirectorEvents = 4
-	st, err := worldevents.NewOrchestratedState("batch-cap", "settlement-valewatch", 101, mustReader(t), worldevents.NewHighThreatGoblinEco("batch-cap", 101))
-	if err != nil {
-		t.Fatal(err)
+	// 2. Incompatible config: MaxEventsPerBatch below mandatory minimum must fail UPFRONT
+	// so no valid configuration can permanently deadlock on ErrTickEventCapacity during normal ticks.
+	tinyBatchCfg := worldevents.DefaultConfig()
+	tinyBatchCfg.MaxEventsPerBatch = 1
+	tinyBatchCfg.MaxPendingDirectorEvents = 4
+	if err := tinyBatchCfg.Validate(); !errors.Is(err, worldevents.ErrInvalidConfig) {
+		t.Fatalf("expected upfront ErrInvalidConfig for impossible MaxEventsPerBatch=1, got %v", err)
 	}
-	cur := st
-	hitSingleTickCap := false
-	for tick := uint64(1); tick <= 15; tick++ {
-		before, _ := cur.Checksum(cfg)
-		next, _, err := worldevents.Step(cur, worldevents.StepInput{}, cfg)
-		if errors.Is(err, worldevents.ErrTickEventCapacity) {
-			after, _ := cur.Checksum(cfg)
-			if before != after {
-				t.Fatal("ErrTickEventCapacity mutated state")
-			}
-			hitSingleTickCap = true
-			break
-		}
-		if err != nil {
-			t.Fatalf("tick %d unexpected err: %v", tick, err)
-		}
-		cur = next
-	}
-	if !hitSingleTickCap {
-		t.Fatal("expected single tick producing >1 event to trigger ErrTickEventCapacity")
+	if minRequired := worldevents.MinEventsPerBatch(tinyBatchCfg); minRequired <= 1 {
+		t.Fatalf("expected MinEventsPerBatch > 1, got %d", minRequired)
 	}
 
 	// 3. Accumulated total events exceeding MaxPendingDirectorEvents returns recoverable ErrDirectorBackpressure.
 	cfg2 := worldevents.DefaultOrchestratedConfig()
+	cfg2.Director.MaxActiveCampaignsGlobal = 1
+	minBatch := worldevents.MinEventsPerBatch(cfg2.Director)
 	cfg2.Director.MaxEventsPerUpdate = 1
-	cfg2.Director.MaxEventsPerBatch = 8
+	cfg2.Director.MaxEventsPerBatch = minBatch
 	cfg2.Director.MaxPendingDirectorBatches = 10
-	cfg2.Director.MaxPendingDirectorEvents = 8 // holds 1 batch of ~3-4 events, blocks when total would exceed 8
+	cfg2.Director.MaxPendingDirectorEvents = minBatch // holds batches up to minBatch events, blocks cleanly when accumulated total would exceed it
 	cur2, err := worldevents.NewOrchestratedState("total-dir-cap", "settlement-valewatch", 101, mustReader(t), worldevents.NewHighThreatGoblinEco("total-dir-cap", 101))
 	if err != nil {
 		t.Fatal(err)
 	}
 	recovered := false
-	for tick := 0; tick < 80; tick++ {
+	for tick := 0; tick < 120; tick++ {
 		next, _, err := worldevents.Step(cur2, worldevents.StepInput{}, cfg2)
 		if errors.Is(err, worldevents.ErrDirectorBackpressure) {
 			stats, sErr := worldevents.PendingQueueStats(cur2, cfg2)
