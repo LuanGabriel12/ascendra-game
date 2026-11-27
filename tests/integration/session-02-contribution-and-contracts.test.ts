@@ -729,11 +729,11 @@ describe("CARBON Session 02 — SettlementSnapshot, Contribution Engine & Cross-
       assert.throws(() => parseContributionSubmission(vec), InvalidContributionError);
     }
 
-    // Documented static-vs-runtime boundary difference:
-    // A 19-digit string "9223372036854775808" (MAX_INT64 + 1) matches static regex `^(0|[1-9][0-9]{0,18})$`,
-    // whereas runtime Zod `NonNegativeInt64Schema` enforces exact BigInt <= 9223372036854775807!
+    // Hardened in CARBON Full Audit (CARBON-AUD-008):
+    // Static JSON Schema now enforces exact decimal int64 upper bound (9223372036854775807),
+    // achieving 100% rejection parity with runtime Zod `NonNegativeInt64Schema` on 19-digit overflows!
     const overflow19Digit = fixtures.contributions["invalid_19digit_int64_overflow_string"]!;
-    assert.equal(validateAgainstJsonSchema(contributionJsonSchema, overflow19Digit).valid, true);
+    assert.equal(validateAgainstJsonSchema(contributionJsonSchema, overflow19Digit).valid, false);
     assert.throws(() => parseContributionSubmission(overflow19Digit), InvalidContributionError);
 
     // Reject Snapshot unknown fields in both JSON Schema and Zod

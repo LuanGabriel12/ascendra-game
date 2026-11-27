@@ -24,7 +24,10 @@
     },
     "buildVersion": { "type": "integer", "minimum": 1 },
     "snapshotVersion": { "type": "integer", "minimum": 1 },
-    "activeLoadoutId": { "type": ["string", "null"] },
+    "activeLoadoutId": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
     "normalizationProfile": {
       "type": "string",
       "enum": ["open_world_persistent", "legacy_ranked_md3"]
@@ -86,7 +89,25 @@
         "specialEffects"
       ],
       "properties": {
-        "slotCode": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "slotCode": {
+          "type": "string",
+          "enum": [
+            "main_hand",
+            "off_hand",
+            "head",
+            "chest",
+            "hands",
+            "legs",
+            "feet",
+            "waist",
+            "neck",
+            "ring_1",
+            "ring_2",
+            "back",
+            "trinket_1",
+            "trinket_2"
+          ]
+        },
         "occupiesOffHand": { "type": "boolean" },
         "itemInstanceId": { "type": "string", "minLength": 1, "maxLength": 128 },
         "definitionCode": { "type": "string", "minLength": 1, "maxLength": 128 },
@@ -100,10 +121,29 @@
         "currentDurability": { "type": ["integer", "null"], "minimum": 0 },
         "maxDurability": { "type": ["integer", "null"], "minimum": 1 },
         "isActiveForCombat": { "type": "boolean" },
-        "suppressionReason": { "type": ["string", "null"] },
+        "suppressionReason": { "type": ["string", "null"], "minLength": 1, "maxLength": 512 },
         "implicitAttributes": { "$ref": "#/$defs/AttributeBlock" },
         "generatedAttributes": { "$ref": "#/$defs/AttributeBlock" },
-        "specialEffects": { "type": "array" }
+        "specialEffects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["effectCode", "params"],
+            "properties": {
+              "effectCode": { "type": "string", "minLength": 1, "maxLength": 64 },
+              "params": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": { "type": "integer" }
+                  },
+                  { "type": "null" }
+                ]
+              }
+            }
+          }
+        }
       }
     }
   }

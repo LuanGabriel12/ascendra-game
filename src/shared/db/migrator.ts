@@ -1,6 +1,28 @@
+import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { PgPool, PgPoolClient } from "./pool.js";
+
+export class MigrationChecksumMismatchError extends Error {
+  public readonly version: string;
+  public readonly expectedChecksum: string;
+  public readonly actualChecksum: string;
+
+  constructor(version: string, expectedChecksum: string, actualChecksum: string) {
+    super(
+      `Migration '${version}' checksum mismatch: applied='${expectedChecksum}', on-disk='${actualChecksum}'. Published migrations must never be modified retroactively.`,
+    );
+    this.name = "MigrationChecksumMismatchError";
+    this.version = version;
+    this.expectedChecksum = expectedChecksum;
+    this.actualChecksum = actualChecksum;
+  }
+}
+
+export function computeMigrationChecksumSha256(sqlText: string): string {
+  const normalizedLf = sqlText.replace(/\r\n/g, "\n");
+  return createHash("sha256").update(normalizedLf, "utf8").digest("hex");
+}
 
 export interface MigrationFilePair {
   readonly version: string;
@@ -13,6 +35,7 @@ export interface AppliedMigration {
   readonly version: string;
   readonly name: string;
   readonly applied_at: Date;
+  readonly checksum_sha256?: string | null | undefined;
 }
 
 const MIGRATION_ADVISORY_LOCK_KEY = 84291001;
@@ -22,8 +45,13 @@ async function ensureMigrationsTable(client: PgPoolClient): Promise<void> {
     CREATE TABLE IF NOT EXISTS schema_migrations (
       version VARCHAR(64) PRIMARY KEY,
       name VARCHAR(255) NOT NULL,
-      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      checksum_sha256 VARCHAR(64) NULL
     );
+  `);
+  await client.query(`
+    ALTER TABLE schema_migrations
+    ADD COLUMN IF NOT EXISTS checksum_sha256 VARCHAR(64) NULL;
   `);
 }
 
@@ -61,7 +89,7 @@ export async function listAppliedMigrations(pool: PgPool): Promise<ReadonlyArray
   try {
     await ensureMigrationsTable(client);
     const res = await client.query<AppliedMigration>(
-      "SELECT version, name, applied_at FROM schema_migrations ORDER BY version ASC",
+      "SELECT version, name, applied_at, checksum_sha256 FROM schema_migrations ORDER BY version ASC",
     );
     return res.rows;
   } finally {
@@ -81,23 +109,37 @@ export async function migrateUp(
     await client.query("SELECT pg_advisory_lock($1)", [MIGRATION_ADVISORY_LOCK_KEY]);
     await ensureMigrationsTable(client);
 
-    const appliedRes = await client.query<{ version: string }>(
-      "SELECT version FROM schema_migrations ORDER BY version ASC",
+    const appliedRes = await client.query<{ version: string; checksum_sha256: string | null }>(
+      "SELECT version, checksum_sha256 FROM schema_migrations ORDER BY version ASC",
     );
-    const appliedVersions = new Set(appliedRes.rows.map((r) => r.version));
+    const appliedChecksums = new Map<string, string | null>(
+      appliedRes.rows.map((r) => [r.version, r.checksum_sha256]),
+    );
 
     for (const migration of available) {
-      if (appliedVersions.has(migration.version)) {
+      const sql = await readFile(migration.upPath, "utf8");
+      const checksum = computeMigrationChecksumSha256(sql);
+
+      if (appliedChecksums.has(migration.version)) {
+        const storedChecksum = appliedChecksums.get(migration.version) ?? null;
+        if (storedChecksum !== null && storedChecksum !== checksum) {
+          throw new MigrationChecksumMismatchError(migration.version, storedChecksum, checksum);
+        }
+        if (storedChecksum === null) {
+          await client.query(
+            "UPDATE schema_migrations SET checksum_sha256 = $1 WHERE version = $2 AND checksum_sha256 IS NULL",
+            [checksum, migration.version],
+          );
+        }
         continue;
       }
 
-      const sql = await readFile(migration.upPath, "utf8");
       await client.query("BEGIN");
       try {
         await client.query(sql);
         await client.query(
-          "INSERT INTO schema_migrations (version, name) VALUES ($1, $2)",
-          [migration.version, migration.name],
+          "INSERT INTO schema_migrations (version, name, checksum_sha256) VALUES ($1, $2, $3)",
+          [migration.version, migration.name, checksum],
         );
         await client.query("COMMIT");
         newlyApplied.push(`${migration.version}_${migration.name}`);

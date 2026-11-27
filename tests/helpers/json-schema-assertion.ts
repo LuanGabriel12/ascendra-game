@@ -9,7 +9,7 @@ export interface JsonSchemaNode {
   readonly const?: unknown;
   readonly enum?: ReadonlyArray<unknown>;
   readonly required?: ReadonlyArray<string>;
-  readonly additionalProperties?: boolean;
+  readonly additionalProperties?: boolean | JsonSchemaNode;
   readonly properties?: Readonly<Record<string, JsonSchemaNode>>;
   readonly items?: JsonSchemaNode;
   readonly minLength?: number;
@@ -18,6 +18,7 @@ export interface JsonSchemaNode {
   readonly minimum?: number;
   readonly maximum?: number;
   readonly oneOf?: ReadonlyArray<JsonSchemaNode>;
+  readonly anyOf?: ReadonlyArray<JsonSchemaNode>;
   readonly $ref?: string;
   readonly $defs?: Readonly<Record<string, JsonSchemaNode>>;
 }
@@ -56,6 +57,16 @@ export function validateAgainstJsonSchema(
     );
     if (matches.length !== 1) {
       errors.push(`Expected exactly 1 oneOf branch match, got ${matches.length}.`);
+    }
+    return { valid: errors.length === 0, errors };
+  }
+
+  if (currentSchema.anyOf) {
+    const matches = currentSchema.anyOf.filter(
+      (branch) => validateAgainstJsonSchema(rootSchema, candidate, branch).valid,
+    );
+    if (matches.length < 1) {
+      errors.push("Expected at least 1 anyOf branch match, got 0.");
     }
     return { valid: errors.length === 0, errors };
   }
@@ -144,6 +155,22 @@ export function validateAgainstJsonSchema(
       for (const key of Object.keys(record)) {
         if (!(key in props)) {
           errors.push(`Additional property '${key}' is not allowed.`);
+        }
+      }
+    } else if (
+      typeof currentSchema.additionalProperties === "object" &&
+      currentSchema.additionalProperties !== null
+    ) {
+      for (const key of Object.keys(record)) {
+        if (!(key in props)) {
+          const sub = validateAgainstJsonSchema(
+            rootSchema,
+            record[key],
+            currentSchema.additionalProperties,
+          );
+          for (const err of sub.errors) {
+            errors.push(`${key}: ${err}`);
+          }
         }
       }
     }

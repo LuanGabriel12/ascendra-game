@@ -1,7 +1,10 @@
+import { z } from "zod";
+import { BoundaryValidationError } from "../../../shared/contracts/world-events.js";
 import type { PgPool } from "../../../shared/db/pool.js";
-import type {
-  AttributeBlock,
-  CompetitiveNormalizationProfile,
+import {
+  PRIMARY_ATTRIBUTE_KEYS,
+  type AttributeBlock,
+  type CompetitiveNormalizationProfile,
 } from "../../peoples/domain/character-snapshot-proposal.js";
 import type { AuthorityPrincipal } from "../../characters/domain/character.js";
 import {
@@ -14,8 +17,82 @@ import {
   checkIntrinsicCharacterEligibility,
   computeActiveEquipmentModifiers,
 } from "../domain/equipment-and-stack-rules.js";
-import type { CombatEquipmentSlot, ItemRarityCode } from "../domain/item-types.js";
+import {
+  COMBAT_EQUIPMENT_SLOTS,
+  ITEM_RARITIES,
+  type CombatEquipmentSlot,
+  type ItemRarityCode,
+} from "../domain/item-types.js";
 import { PgInventoryTransactionScope } from "../infrastructure/postgres-inventory-unit-of-work.js";
+
+const AttributeBlockWireSchema = z
+  .object({
+    strength: z.number().int().min(0),
+    fortitude: z.number().int().min(0),
+    vigor: z.number().int().min(0),
+    agility: z.number().int().min(0),
+    dexterity: z.number().int().min(0),
+    intelligence: z.number().int().min(0),
+    wisdom: z.number().int().min(0),
+    determination: z.number().int().min(0),
+    luck: z.number().int().min(0),
+    charisma: z.number().int().min(0),
+  })
+  .strict();
+
+export const EquipmentSnapshotWireV1Schema = z
+  .object({
+    contractVersion: z.literal(1),
+    characterId: z.string().uuid(),
+    buildVersion: z.number().int().min(1),
+    snapshotVersion: z.number().int().min(1),
+    activeLoadoutId: z.string().uuid().nullable(),
+    normalizationProfile: z.enum(["open_world_persistent", "legacy_ranked_md3"]),
+    equipmentModifiers: AttributeBlockWireSchema,
+    aggregatedEffectiveAttributes: AttributeBlockWireSchema,
+    equippedDetails: z.array(
+      z
+        .object({
+          slotCode: z.enum(COMBAT_EQUIPMENT_SLOTS),
+          occupiesOffHand: z.boolean(),
+          itemInstanceId: z.string().min(1).max(128),
+          definitionCode: z.string().min(1).max(128),
+          definitionVersion: z.number().int().min(1),
+          itemLevel: z.number().int().min(1).max(1000),
+          rarityCode: z.enum(ITEM_RARITIES),
+          qualityBp: z.number().int().min(0).max(10000),
+          currentDurability: z.number().int().min(0).nullable(),
+          maxDurability: z.number().int().min(1).nullable(),
+          isActiveForCombat: z.boolean(),
+          suppressionReason: z.string().min(1).max(512).nullable(),
+          implicitAttributes: AttributeBlockWireSchema,
+          generatedAttributes: AttributeBlockWireSchema,
+          specialEffects: z.array(
+            z
+              .object({
+                effectCode: z.string().min(1).max(64),
+                params: z.record(z.string(), z.number().int()).nullable(),
+              })
+              .strict(),
+          ),
+        })
+        .strict(),
+    ),
+  })
+  .strict();
+
+export function parseEquipmentSnapshotWireV1(raw: unknown): EquipmentSnapshotProposalV1 {
+  const parsed = EquipmentSnapshotWireV1Schema.safeParse(raw);
+  if (!parsed.success) {
+    const issues = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`);
+    throw new BoundaryValidationError(
+      `Invalid EquipmentSnapshotProposalV1: ${issues.join("; ")}`,
+      issues,
+    );
+  }
+  void PRIMARY_ATTRIBUTE_KEYS;
+  return parsed.data;
+}
 
 export interface EquippedProceduralItemDetailV1 {
   readonly slotCode: CombatEquipmentSlot;

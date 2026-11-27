@@ -18,8 +18,9 @@ export interface RunningPostgresTestContext {
 }
 
 const SAFE_TEST_DB_NAME_RE = /(?:_test|_ci)(?:_[a-z0-9]+)?$/i;
+const LOOPBACK_TEST_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
-function assertSafeTestDatabaseUrl(connectionString: string): void {
+export function assertSafeTestDatabaseUrl(connectionString: string): void {
   if (process.env["ALLOW_EXTERNAL_TEST_DB"] === "1") {
     return;
   }
@@ -28,6 +29,13 @@ function assertSafeTestDatabaseUrl(connectionString: string): void {
     parsed = new URL(connectionString);
   } catch {
     throw new Error("Invalid DATABASE_URL provided to test harness.");
+  }
+
+  const host = parsed.hostname.trim().toLowerCase();
+  if (!LOOPBACK_TEST_HOSTS.has(host)) {
+    throw new Error(
+      `Refusing to execute destructive integration tests against non-loopback host '${host}'. Set ALLOW_EXTERNAL_TEST_DB=1 explicitly only for isolated disposable test containers.`,
+    );
   }
 
   const dbName = parsed.pathname.replace(/^\//, "").trim();
