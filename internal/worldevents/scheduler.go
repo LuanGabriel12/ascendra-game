@@ -99,10 +99,14 @@ func effectivePriority(ev ScheduledEvent, cfg Config) int64 {
 // and dispatches eligible due events in strict deterministic priority order:
 //
 //	highest EffectivePriority -> earliest ScheduledTick -> lexicographically smallest EventID.
+//
+// maxOptionalEvents bounds optional expiry/dispatch director events emitted on a single tick
+// so mandatory tick events can never be crowded out into ErrTickEventCapacity.
 func processScheduler(
 	state *DirectorState,
 	cfg Config,
 	allowCampaignLaunch bool,
+	maxOptionalEvents int,
 	dirEvents *[]DirectorEvent,
 ) ([]ScheduledEvent, error) {
 	if len(state.PendingEvents) == 0 {
@@ -111,6 +115,7 @@ func processScheduler(
 
 	dueIndices := make([]int, 0, len(state.PendingEvents))
 	expiredOrCancelled := make(map[int]struct{})
+	optionalUsed := 0
 
 	for i := range state.PendingEvents {
 		ev := &state.PendingEvents[i]
@@ -119,6 +124,10 @@ func processScheduler(
 			continue
 		}
 		if state.Tick > ev.DeadlineTick {
+			if optionalUsed >= maxOptionalEvents {
+				// Defer remaining overdue expirations deterministically to the next tick.
+				continue
+			}
 			expiredOrCancelled[i] = struct{}{}
 			de, err := state.newDirectorEvent(
 				DirEventCampaignExpired,
@@ -134,6 +143,7 @@ func processScheduler(
 				return nil, err
 			}
 			*dirEvents = append(*dirEvents, de)
+			optionalUsed++
 			continue
 		}
 		if state.Tick >= ev.ScheduledTick {
@@ -181,6 +191,12 @@ func processScheduler(
 		ev := &state.PendingEvents[idx]
 		isCampaignLaunch := ev.Kind == EventGoblinRaidCampaign || ev.Kind == EventOrcWarbandCampaign
 
+		if optionalUsed >= maxOptionalEvents {
+			if ev.AgeTicks < math.MaxUint64 {
+				ev.AgeTicks++
+			}
+			continue
+		}
 		if isCampaignLaunch {
 			blocked := !allowCampaignLaunch || activeGlobal >= cfg.MaxActiveCampaignsGlobal ||
 				activeByRegion[ev.RegionID] >= cfg.MaxActiveCampaignsPerRegion ||
@@ -203,6 +219,7 @@ func processScheduler(
 
 		dispatched = append(dispatched, *ev)
 		dispatchedSet[idx] = struct{}{}
+		optionalUsed++
 	}
 
 	// Retain only non-expired, non-cancelled, non-dispatched pending events.

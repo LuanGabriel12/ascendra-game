@@ -11,6 +11,7 @@ import (
 	"ascendra-game/internal/ai"
 	"ascendra-game/internal/ecosystem"
 	"ascendra-game/internal/ports"
+	"ascendra-game/internal/siege"
 	"ascendra-game/internal/simulation"
 	"ascendra-game/internal/world"
 )
@@ -32,6 +33,18 @@ func DefaultOrchestratedConfig() OrchestratedConfig {
 		Ecosystem: ecosystem.DefaultConfig(),
 		Director:  DefaultConfig(),
 	}
+}
+
+// DefaultSiegeOrchestratedConfig returns balanced Cycle 05 siege-enabled orchestrated defaults
+// with fortified settlement layouts, NPC garrison defenders, and population-backed siege waves.
+func DefaultSiegeOrchestratedConfig() OrchestratedConfig {
+	cfg := DefaultOrchestratedConfig()
+	sCfg := siege.DefaultConfig()
+	cfg.Director.SiegeEnabled = true
+	cfg.Director.SpawnNPCDefenders = true
+	cfg.Director.SiegeConfig = &sCfg
+	cfg.Director.Policies = DefaultSiegeCampaignPolicies()
+	return cfg
 }
 
 // Validate enforces validity across all three configuration layers and requires CampaignDirector mode.
@@ -364,6 +377,9 @@ func Step(state OrchestratedState, input StepInput, cfg OrchestratedConfig) (Orc
 	}
 
 	// 4. Evaluate ecological campaign candidates periodically and enqueue top eligible candidates.
+	// Reserve mandatory tick headroom inside MaxEventsPerBatch so optional candidate bursts
+	// can never crowd out mandatory campaign transitions or resolution facts.
+	mandatoryReserve := mandatoryBatchReserve(cfg.Director)
 	if nextTick%cfg.Director.CandidateEvalIntervalTicks == 0 && campaignAdmissionError(next, cfg) == nil {
 		availDefenders := countAliveDefenders(next.World.Defenders)
 		candidates, err := EvaluateCandidates(next.Director, next.Ecosystem, next.World, cfg.Director, availDefenders)
@@ -371,6 +387,9 @@ func Step(state OrchestratedState, input StepInput, cfg OrchestratedConfig) (Orc
 			return OrchestratedState{}, StepOutput{}, err
 		}
 		for _, cand := range candidates {
+			if len(dirEvents) >= cfg.Director.MaxEventsPerBatch-mandatoryReserve {
+				break
+			}
 			// Keep one scheduler slot available for the active invasion's follow-up.
 			reservedSlots := reservedFollowupSlots(next.Director, cfg.Director)
 			if cfg.Director.MaxChainDepth > 0 {
@@ -424,7 +443,11 @@ func Step(state OrchestratedState, input StepInput, cfg OrchestratedConfig) (Orc
 	}
 
 	// 5. Run deterministic tick scheduler (expiry, anti-starvation aging, priority & canonical tie-break, concurrency caps).
-	dispatched, err := processScheduler(&next.Director, cfg.Director, campaignAdmissionError(next, cfg) == nil, &dirEvents)
+	optionalBudget := cfg.Director.MaxEventsPerBatch - mandatoryReserve - len(dirEvents)
+	if optionalBudget < 0 {
+		optionalBudget = 0
+	}
+	dispatched, err := processScheduler(&next.Director, cfg.Director, campaignAdmissionError(next, cfg) == nil, optionalBudget, &dirEvents)
 	if err != nil {
 		return OrchestratedState{}, StepOutput{}, err
 	}
@@ -506,9 +529,14 @@ func Step(state OrchestratedState, input StepInput, cfg OrchestratedConfig) (Orc
 		}
 	}
 
-	// 9. Fulfill tactical EventReinforcementRequested strictly via ecological population reservation debit!
+	// 9. Fulfill scheduled siege waves and tactical EventReinforcementRequested strictly via
+	//    ecological population reservation debit (bounded per tick for batch-capacity liveness).
 	if next.World.Invasion.State == world.InvasionUnderAttack {
-		if err := processEcologicalReinforcements(&next, wEvents, cfg, &wEvents, &dirEvents, &ecoEvents); err != nil {
+		deployedThisTick := 0
+		if err := processSiegeWaves(&next, cfg, &deployedThisTick, &wEvents, &dirEvents, &ecoEvents); err != nil {
+			return OrchestratedState{}, StepOutput{}, err
+		}
+		if err := processEcologicalReinforcements(&next, wEvents, cfg, &deployedThisTick, &wEvents, &dirEvents, &ecoEvents); err != nil {
 			return OrchestratedState{}, StepOutput{}, err
 		}
 	}
@@ -638,6 +666,7 @@ func applyDirectorCommands(
 				ScheduledTick:      schedTick,
 				DeadlineTick:       deadline,
 				ChainDepth:         0,
+				IsReconquest:       cmd.IsReconquest,
 			}, cfg.Director)
 			if err != nil {
 				return err
@@ -685,6 +714,102 @@ func applyDirectorCommands(
 	return nil
 }
 
+const maxWaveDeploymentsPerTick = 2
+
+// processSiegeWaves materializes scheduled population-backed SiegeWaves whose ScheduledTick
+// has arrived, strictly debiting from the owning campaign's ReservationID with an idempotent opKey.
+func processSiegeWaves(
+	next *OrchestratedState,
+	cfg OrchestratedConfig,
+	deployedThisTick *int,
+	worldEvents *[]world.DomainEvent,
+	dirEvents *[]DirectorEvent,
+	ecoEvents *[]ecosystem.EcologicalEvent,
+) error {
+	if next.World.Siege == nil || len(next.World.Siege.Waves) == 0 {
+		return nil
+	}
+	for i := range next.World.Siege.Waves {
+		if *deployedThisTick >= maxWaveDeploymentsPerTick || len(next.World.Groups) >= cfg.World.MaxActiveGroups {
+			break
+		}
+		wave := next.World.Siege.Waves[i]
+		if wave.State != siege.WaveScheduled || next.Director.Tick < wave.ScheduledTick {
+			continue
+		}
+		cIdx := findCampaignIndex(next.Director.Campaigns, wave.CampaignID)
+		if cIdx < 0 || next.Director.Campaigns[cIdx].State != CampaignActive {
+			continue
+		}
+		c := &next.Director.Campaigns[cIdx]
+		if wave.ReservationID != c.ReservationID || !isCampOperational(next.Ecosystem, c.SourceCampID, c.SourcePopulationID) {
+			next.World.Siege.Waves[i].State = siege.WaveCancelled
+			continue
+		}
+		opKey := "wave:" + wave.WaveID
+		ticket, matEv, err := ecosystem.MaterializeFromReservation(
+			&next.Ecosystem,
+			c.ReservationID,
+			opKey,
+			wave.Archetype,
+			wave.Count,
+			cfg.Ecosystem,
+		)
+		if err != nil {
+			next.World.Siege.Waves[i].State = siege.WaveExhausted
+			continue
+		}
+		grpID, err := world.NextDurableGroupID(&next.World, c.CampaignID, "wave", cfg.World.MaxIdentifierLength)
+		if err != nil {
+			return err
+		}
+		pos, ok := siege.PositionForZone(*next.World.Siege, wave.EntryZoneID)
+		if !ok {
+			pos = cfg.World.HostileSpawnDistance
+		}
+		spawnCmd := world.DirectorCommand{
+			Kind:               world.CmdDirectorSpawnCampaignGroup,
+			Tick:               next.Director.Tick,
+			CampaignID:         c.CampaignID,
+			InvadingFactionID:  c.FactionID,
+			GroupID:            grpID,
+			Archetype:          ticket.Archetype,
+			Count:              wave.Count,
+			Position:           pos,
+			HomePosition:       pos,
+			ZoneID:             wave.EntryZoneID,
+			ReservationID:      c.ReservationID,
+			SourcePopulationID: ticket.PopulationID,
+			SourceCampID:       ticket.CampID,
+			SourceRegionID:     ticket.RegionID,
+			PopulationWeight:   ticket.ContingentSize,
+		}
+		spawnEvs, err := world.SpawnCampaignWaveGroup(&next.World, wave.WaveID, spawnCmd, cfg.World)
+		if err != nil {
+			return err
+		}
+		c.ReinforcementsDeployed++
+		*deployedThisTick++
+		*ecoEvents = append(*ecoEvents, matEv)
+		*worldEvents = append(*worldEvents, spawnEvs...)
+		de, err := next.Director.newDirectorEvent(
+			DirEventSiegeWaveMobilized,
+			c.CampaignID,
+			c.RegionID,
+			c.SettlementID,
+			c.FactionID,
+			fmt.Sprintf("wave=%s group=%s archetype=%s zone=%s", wave.WaveID, grpID, ticket.Archetype, wave.EntryZoneID),
+			ticket.ContingentSize,
+			nil,
+		)
+		if err != nil {
+			return err
+		}
+		*dirEvents = append(*dirEvents, de)
+	}
+	return nil
+}
+
 // processEcologicalReinforcements converts EventReinforcementRequested emitted by linked tactical
 // groups into validated, ecologically debited reinforcement spawns strictly from the campaign's
 // pre-reserved population buffer. If the camp is destroyed, reservation exhausted, or caps hit,
@@ -693,6 +818,7 @@ func processEcologicalReinforcements(
 	next *OrchestratedState,
 	emitted []world.DomainEvent,
 	cfg OrchestratedConfig,
+	deployedThisTick *int,
 	worldEvents *[]world.DomainEvent,
 	dirEvents *[]DirectorEvent,
 	ecoEvents *[]ecosystem.EcologicalEvent,
@@ -716,7 +842,8 @@ func processEcologicalReinforcements(
 	}
 
 	for _, req := range requests {
-		if next.World.Invasion.ReinforcementWaves >= cfg.World.MaxReinforcementWaves ||
+		if *deployedThisTick >= maxWaveDeploymentsPerTick ||
+			next.World.Invasion.ReinforcementWaves >= cfg.World.MaxReinforcementWaves ||
 			len(next.World.Groups) >= cfg.World.MaxActiveGroups {
 			break
 		}
@@ -783,6 +910,7 @@ func processEcologicalReinforcements(
 			return err
 		}
 		c.ReinforcementsDeployed++
+		*deployedThisTick++
 		*ecoEvents = append(*ecoEvents, matEv)
 		*worldEvents = append(*worldEvents, spawnEvs...)
 		de, err := next.Director.newDirectorEvent(

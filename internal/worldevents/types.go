@@ -9,6 +9,7 @@ import (
 
 	"ascendra-game/internal/ai"
 	"ascendra-game/internal/ports"
+	"ascendra-game/internal/siege"
 	"ascendra-game/internal/simulation"
 )
 
@@ -176,29 +177,39 @@ type ForceUnit struct {
 	Position  int64  `json:"position"`
 }
 
+// SiegeWaveSpec configures a delayed population-backed siege wave inside a campaign template.
+type SiegeWaveSpec struct {
+	WaveTag     string `json:"wave_tag"`
+	DelayTicks  uint64 `json:"delay_ticks"`
+	Archetype   string `json:"archetype"`
+	Count       int64  `json:"count"`
+	EntryZoneID string `json:"entry_zone_id"`
+}
+
 // CampaignPolicyTemplate configures data-driven goblin, orc, or future faction campaign behavior.
 type CampaignPolicyTemplate struct {
-	TemplateID                    string         `json:"template_id"`
-	EventKind                     WorldEventKind `json:"event_kind"`
-	Family                        ai.Family      `json:"family"`
-	MinFreePopulation             int64          `json:"min_free_population"`
-	MinThreatScore                int64          `json:"min_threat_score"`
-	ReconTicks                    uint64         `json:"recon_ticks"`
-	PrepTicks                     uint64         `json:"prep_ticks"`
-	WarningTicks                  uint64         `json:"warning_ticks"`
-	DeadlineSlackTicks            uint64         `json:"deadline_slack_ticks"`
-	RecoverTicks                  uint64         `json:"recover_ticks"`
-	RegionCooldownTicks           uint64         `json:"region_cooldown_ticks"`
-	SettlementCooldownTicks       uint64         `json:"settlement_cooldown_ticks"`
-	ReconArchetype                string         `json:"recon_archetype"`
-	ReconCount                    int64          `json:"recon_count"`
-	MainForces                    []ForceUnit    `json:"main_forces"`
-	AllowEcologicalReinforcements bool           `json:"allow_ecological_reinforcements"`
-	ReinforcementArchetype        string         `json:"reinforcement_archetype,omitempty"`
-	ReinforcementCount            int64          `json:"reinforcement_count,omitempty"`
-	MaxCampaignReinforcements     int            `json:"max_campaign_reinforcements,omitempty"`
-	PriorityWeightLeadership      int64          `json:"priority_weight_leadership"`
-	PriorityWeightTerritory       int64          `json:"priority_weight_territory"`
+	TemplateID                    string          `json:"template_id"`
+	EventKind                     WorldEventKind  `json:"event_kind"`
+	Family                        ai.Family       `json:"family"`
+	MinFreePopulation             int64           `json:"min_free_population"`
+	MinThreatScore                int64           `json:"min_threat_score"`
+	ReconTicks                    uint64          `json:"recon_ticks"`
+	PrepTicks                     uint64          `json:"prep_ticks"`
+	WarningTicks                  uint64          `json:"warning_ticks"`
+	DeadlineSlackTicks            uint64          `json:"deadline_slack_ticks"`
+	RecoverTicks                  uint64          `json:"recover_ticks"`
+	RegionCooldownTicks           uint64          `json:"region_cooldown_ticks"`
+	SettlementCooldownTicks       uint64          `json:"settlement_cooldown_ticks"`
+	ReconArchetype                string          `json:"recon_archetype"`
+	ReconCount                    int64           `json:"recon_count"`
+	MainForces                    []ForceUnit     `json:"main_forces"`
+	SiegeWaves                    []SiegeWaveSpec `json:"siege_waves,omitempty"`
+	AllowEcologicalReinforcements bool            `json:"allow_ecological_reinforcements"`
+	ReinforcementArchetype        string          `json:"reinforcement_archetype,omitempty"`
+	ReinforcementCount            int64           `json:"reinforcement_count,omitempty"`
+	MaxCampaignReinforcements     int             `json:"max_campaign_reinforcements,omitempty"`
+	PriorityWeightLeadership      int64           `json:"priority_weight_leadership"`
+	PriorityWeightTerritory       int64           `json:"priority_weight_territory"`
 }
 
 // Validate enforces numeric and catalog integrity on a campaign policy template.
@@ -226,6 +237,20 @@ func (p CampaignPolicyTemplate) Validate() error {
 		fp, err := ai.LookupProfile(fu.Archetype)
 		if err != nil || fp.Family != p.Family {
 			return fmt.Errorf("%w: invalid main force archetype %q in template %q", ErrInvalidConfig, fu.Archetype, p.TemplateID)
+		}
+	}
+	seenWaves := make(map[string]struct{}, len(p.SiegeWaves))
+	for _, sw := range p.SiegeWaves {
+		if strings.TrimSpace(sw.WaveTag) == "" || sw.Count <= 0 || strings.TrimSpace(sw.EntryZoneID) == "" {
+			return fmt.Errorf("%w: invalid siege wave spec in template %q", ErrInvalidConfig, p.TemplateID)
+		}
+		if _, dup := seenWaves[sw.WaveTag]; dup {
+			return fmt.Errorf("%w: duplicate siege wave tag %q in template %q", ErrInvalidConfig, sw.WaveTag, p.TemplateID)
+		}
+		seenWaves[sw.WaveTag] = struct{}{}
+		wp, err := ai.LookupProfile(sw.Archetype)
+		if err != nil || wp.Family != p.Family {
+			return fmt.Errorf("%w: invalid siege wave archetype %q in template %q", ErrInvalidConfig, sw.Archetype, p.TemplateID)
 		}
 	}
 	if p.AllowEcologicalReinforcements {
@@ -268,8 +293,27 @@ type Config struct {
 	MinInvasionIntervalTicks        uint64                   `json:"min_invasion_interval_ticks"`
 	MinSimulatedDefenseHP           int64                    `json:"min_simulated_defense_hp"`
 	RequireAvailableDefenders       bool                     `json:"require_available_defenders"`
+	SiegeEnabled                    bool                     `json:"siege_enabled,omitempty"`
+	SpawnNPCDefenders               bool                     `json:"spawn_npc_defenders,omitempty"`
+	SiegeConfig                     *siege.Config            `json:"siege_config,omitempty"`
 	ProtectedRegions                []string                 `json:"protected_regions,omitempty"`
 	Policies                        []CampaignPolicyTemplate `json:"policies"`
+}
+
+func mandatoryBatchReserve(c Config) int {
+	g := c.MaxActiveCampaignsGlobal
+	if g < 1 {
+		g = 1
+	}
+	return 3*g + 6
+}
+
+// MinEventsPerBatch computes the minimum director batch capacity required so that
+// worst-case mandatory campaign transitions, resolution facts, and bounded per-tick
+// wave/reinforcement deployments PLUS forward optional scheduling headroom can never
+// permanently stall on ErrTickEventCapacity.
+func MinEventsPerBatch(c Config) int {
+	return mandatoryBatchReserve(c) + 2
 }
 
 // Validate checks all director config bounds and policy templates.
@@ -287,8 +331,16 @@ func (c Config) Validate() error {
 		c.MaxCooldownEntries <= 0 || c.MaxIdentifierLength <= 0 || c.MaxSnapshotBytes <= 0 {
 		return fmt.Errorf("%w: operational capacity limits must be > 0", ErrInvalidConfig)
 	}
+	if minBatch := MinEventsPerBatch(c); c.MaxEventsPerBatch < minBatch {
+		return fmt.Errorf("%w: max_events_per_batch (%d) must be >= mandatory tick minimum %d", ErrInvalidConfig, c.MaxEventsPerBatch, minBatch)
+	}
 	if c.MaxPendingDirectorEvents < c.MaxEventsPerBatch {
 		return fmt.Errorf("%w: max_pending_director_events (%d) must be >= max_events_per_batch (%d)", ErrInvalidConfig, c.MaxPendingDirectorEvents, c.MaxEventsPerBatch)
+	}
+	if c.SiegeConfig != nil {
+		if err := c.SiegeConfig.Validate(); err != nil {
+			return fmt.Errorf("%w: siege_config: %v", ErrInvalidConfig, err)
+		}
 	}
 	if c.PriorityAgingPerTick < 0 || c.MinSimulatedDefenseHP < 0 {
 		return fmt.Errorf("%w: negative aging or defense floor", ErrInvalidConfig)
@@ -349,6 +401,7 @@ type ScheduledEvent struct {
 	ParentEventID      string         `json:"parent_event_id,omitempty"`
 	ChainDepth         int            `json:"chain_depth"`
 	Cancelled          bool           `json:"cancelled,omitempty"`
+	IsReconquest       bool           `json:"is_reconquest,omitempty"`
 }
 
 // Campaign tracks a live or recovering multi-phase dynamic world campaign.
@@ -382,6 +435,7 @@ type Campaign struct {
 	ReconMobilized         bool                  `json:"recon_mobilized,omitempty"`
 	MainForcesMobilized    bool                  `json:"main_forces_mobilized,omitempty"`
 	TerminalFactEmitted    bool                  `json:"terminal_fact_emitted,omitempty"`
+	IsReconquest           bool                  `json:"is_reconquest,omitempty"`
 }
 
 // CampaignSummary is a compact immutable archive entry for bounded completed campaign history.
@@ -397,7 +451,8 @@ type CampaignSummary struct {
 }
 
 // TerminalSettlementOutcome is the authoritative global settlement resolution fact emitted
-// strictly once per resolved invasion — EVEN WHEN ZERO PLAYERS PARTICIPATED (Section 20).
+// strictly once per resolved invasion — EVEN WHEN ZERO PLAYERS PARTICIPATED.
+// Cycle 05 optional siege aftermath fields preserve full backwards compatibility with ports.InvasionOutcome.
 type TerminalSettlementOutcome struct {
 	Sequence             uint64                `json:"sequence"`
 	EventID              string                `json:"event_id"`
@@ -412,6 +467,12 @@ type TerminalSettlementOutcome struct {
 	CompletedTick        uint64                `json:"completed_tick"`
 	RulesVersion         uint32                `json:"rules_version"`
 	EligibleContributors int                   `json:"eligible_contributors"`
+	SiegePhase           siege.SiegePhase      `json:"siege_phase,omitempty"`
+	StructuresDestroyed  []string              `json:"structures_destroyed,omitempty"`
+	DistrictsCaptured    []string              `json:"districts_captured,omitempty"`
+	InvaderCasualties    int64                 `json:"invader_casualties,omitempty"`
+	DefenderCasualties   int64                 `json:"defender_casualties,omitempty"`
+	IsReconquest         bool                  `json:"is_reconquest,omitempty"`
 }
 
 // CooldownEntry tracks deterministic regional or settlement cooldown expiry ticks.
@@ -433,6 +494,7 @@ const (
 	DirEventCampaignCompleted         DirectorEventType = "WorldCampaignCompleted"
 	DirEventSettlementOutcomeRecorded DirectorEventType = "SettlementInvasionResolved"
 	DirEventReinforcementDeployed     DirectorEventType = "CampaignReinforcementDeployed"
+	DirEventSiegeWaveMobilized        DirectorEventType = "SiegeWaveMobilized"
 	DirEventChainedEventScheduled     DirectorEventType = "ChainedWorldEventScheduled"
 )
 
@@ -442,7 +504,7 @@ func (t DirectorEventType) Valid() bool {
 	case DirEventCandidateScheduled, DirEventCampaignPhaseChanged, DirEventSettlementWarning,
 		DirEventCampaignStarted, DirEventCampaignCancelled, DirEventCampaignExpired,
 		DirEventCampaignCompleted, DirEventSettlementOutcomeRecorded,
-		DirEventReinforcementDeployed, DirEventChainedEventScheduled:
+		DirEventReinforcementDeployed, DirEventSiegeWaveMobilized, DirEventChainedEventScheduled:
 		return true
 	default:
 		return false
@@ -485,6 +547,7 @@ type DirectorCommand struct {
 	Priority           int64               `json:"priority,omitempty"`
 	ScheduledTick      uint64              `json:"scheduled_tick,omitempty"`
 	Reason             string              `json:"reason,omitempty"`
+	IsReconquest       bool                `json:"is_reconquest,omitempty"`
 }
 
 // DirectorState holds the complete, deterministic, serializable state of the World Event Director.
@@ -518,6 +581,7 @@ type DirectorState struct {
 	PendingDirectorBatches []DirectorEventBatch        `json:"pending_director_batches"`
 	DirectorBatchSeq       uint64                      `json:"director_batch_seq"`
 	DirectorBatchAckSeq    uint64                      `json:"director_batch_ack_seq"`
+	OccupiedSettlements    []siege.OccupationRecord    `json:"occupied_settlements,omitempty"`
 	CampaignSeq            uint64                      `json:"campaign_seq"`
 	ScheduledEventSeq      uint64                      `json:"scheduled_event_seq"`
 	DirectorEventSeq       uint64                      `json:"director_event_seq"`
@@ -540,6 +604,7 @@ func NewDirectorState(simulationID string, seed uint64) DirectorState {
 		PendingOutcomes:        []TerminalSettlementOutcome{},
 		PendingContributions:   []PendingContribution{},
 		PendingDirectorBatches: []DirectorEventBatch{},
+		OccupiedSettlements:    []siege.OccupationRecord{},
 	}
 }
 
@@ -566,14 +631,8 @@ func (s DirectorState) Clone() DirectorState {
 	if out.CompletedHistory == nil {
 		out.CompletedHistory = []CampaignSummary{}
 	}
-	out.TerminalOutcomes = slices.Clone(s.TerminalOutcomes)
-	if out.TerminalOutcomes == nil {
-		out.TerminalOutcomes = []TerminalSettlementOutcome{}
-	}
-	out.PendingOutcomes = slices.Clone(s.PendingOutcomes)
-	if out.PendingOutcomes == nil {
-		out.PendingOutcomes = []TerminalSettlementOutcome{}
-	}
+	out.TerminalOutcomes = cloneTerminalOutcomes(s.TerminalOutcomes)
+	out.PendingOutcomes = cloneTerminalOutcomes(s.PendingOutcomes)
 	out.PendingContributions = slices.Clone(s.PendingContributions)
 	if out.PendingContributions == nil {
 		out.PendingContributions = []PendingContribution{}
@@ -581,6 +640,24 @@ func (s DirectorState) Clone() DirectorState {
 	out.PendingDirectorBatches = cloneDirectorBatches(s.PendingDirectorBatches)
 	if out.PendingDirectorBatches == nil {
 		out.PendingDirectorBatches = []DirectorEventBatch{}
+	}
+	out.OccupiedSettlements = make([]siege.OccupationRecord, len(s.OccupiedSettlements))
+	for i, occ := range s.OccupiedSettlements {
+		occCopy := occ
+		occCopy.StructuresDestroyed = slices.Clone(occ.StructuresDestroyed)
+		occCopy.DistrictsCaptured = slices.Clone(occ.DistrictsCaptured)
+		out.OccupiedSettlements[i] = occCopy
+	}
+	return out
+}
+
+func cloneTerminalOutcomes(in []TerminalSettlementOutcome) []TerminalSettlementOutcome {
+	out := make([]TerminalSettlementOutcome, len(in))
+	for i, o := range in {
+		c := o
+		c.StructuresDestroyed = slices.Clone(o.StructuresDestroyed)
+		c.DistrictsCaptured = slices.Clone(o.DistrictsCaptured)
+		out[i] = c
 	}
 	return out
 }
@@ -751,6 +828,19 @@ func (s DirectorState) Validate(cfg Config) error {
 			return fmt.Errorf("%w: settlement_cooldowns not strictly sorted", ErrInvalidState)
 		}
 	}
+	if len(s.OccupiedSettlements) > cfg.MaxCompletedHistory {
+		return ErrCapacityExceeded
+	}
+	for i, occ := range s.OccupiedSettlements {
+		if strings.TrimSpace(occ.SettlementID) == "" || len(occ.SettlementID) > cfg.MaxIdentifierLength ||
+			strings.TrimSpace(occ.OccupyingFactionID) == "" || len(occ.OccupyingFactionID) > cfg.MaxIdentifierLength ||
+			occ.CapturedTick > s.Tick {
+			return fmt.Errorf("%w: invalid occupation record for %q", ErrInvalidState, occ.SettlementID)
+		}
+		if i > 0 && s.OccupiedSettlements[i-1].SettlementID >= occ.SettlementID {
+			return fmt.Errorf("%w: occupied_settlements not strictly sorted", ErrInvalidState)
+		}
+	}
 	return nil
 }
 
@@ -786,6 +876,7 @@ func (s DirectorState) Checksum(cfg Config) (string, error) {
 		h.WriteString(ev.ParentEventID)
 		h.WriteInt64(int64(ev.ChainDepth))
 		h.WriteBool(ev.Cancelled)
+		h.WriteBool(ev.IsReconquest)
 	}
 
 	h.WriteUint64(uint64(len(s.Campaigns)))
@@ -819,6 +910,7 @@ func (s DirectorState) Checksum(cfg Config) (string, error) {
 		h.WriteBool(c.ReconMobilized)
 		h.WriteBool(c.MainForcesMobilized)
 		h.WriteBool(c.TerminalFactEmitted)
+		h.WriteBool(c.IsReconquest)
 	}
 
 	h.WriteUint64(uint64(len(s.RegionCooldowns)))
@@ -847,35 +939,11 @@ func (s DirectorState) Checksum(cfg Config) (string, error) {
 
 	h.WriteUint64(uint64(len(s.TerminalOutcomes)))
 	for _, o := range s.TerminalOutcomes {
-		h.WriteUint64(o.Sequence)
-		h.WriteString(o.EventID)
-		h.WriteString(o.SimulationID)
-		h.WriteString(o.CampaignID)
-		h.WriteString(o.InvasionID)
-		h.WriteString(o.SettlementID)
-		h.WriteString(o.RegionID)
-		h.WriteString(o.InvadingFactionID)
-		h.WriteString(string(o.Outcome))
-		h.WriteUint64(o.StartedTick)
-		h.WriteUint64(o.CompletedTick)
-		h.WriteUint32(o.RulesVersion)
-		h.WriteInt64(int64(o.EligibleContributors))
+		writeTerminalOutcomeChecksum(h, o)
 	}
 	h.WriteUint64(uint64(len(s.PendingOutcomes)))
 	for _, o := range s.PendingOutcomes {
-		h.WriteUint64(o.Sequence)
-		h.WriteString(o.EventID)
-		h.WriteString(o.SimulationID)
-		h.WriteString(o.CampaignID)
-		h.WriteString(o.InvasionID)
-		h.WriteString(o.SettlementID)
-		h.WriteString(o.RegionID)
-		h.WriteString(o.InvadingFactionID)
-		h.WriteString(string(o.Outcome))
-		h.WriteUint64(o.StartedTick)
-		h.WriteUint64(o.CompletedTick)
-		h.WriteUint32(o.RulesVersion)
-		h.WriteInt64(int64(o.EligibleContributors))
+		writeTerminalOutcomeChecksum(h, o)
 	}
 
 	h.WriteUint64(uint64(len(s.PendingContributions)))
@@ -913,21 +981,26 @@ func (s DirectorState) Checksum(cfg Config) (string, error) {
 			h.WriteInt64(event.Amount)
 			h.WriteBool(event.TerminalOutcome != nil)
 			if event.TerminalOutcome != nil {
-				o := event.TerminalOutcome
-				h.WriteUint64(o.Sequence)
-				h.WriteString(o.EventID)
-				h.WriteString(o.SimulationID)
-				h.WriteString(o.CampaignID)
-				h.WriteString(o.InvasionID)
-				h.WriteString(o.SettlementID)
-				h.WriteString(o.RegionID)
-				h.WriteString(o.InvadingFactionID)
-				h.WriteString(string(o.Outcome))
-				h.WriteUint64(o.StartedTick)
-				h.WriteUint64(o.CompletedTick)
-				h.WriteUint32(o.RulesVersion)
-				h.WriteInt64(int64(o.EligibleContributors))
+				writeTerminalOutcomeChecksum(h, *event.TerminalOutcome)
 			}
+		}
+	}
+	h.WriteUint64(uint64(len(s.OccupiedSettlements)))
+	for _, occ := range s.OccupiedSettlements {
+		h.WriteString(occ.SettlementID)
+		h.WriteString(occ.RegionID)
+		h.WriteString(occ.OccupyingFactionID)
+		h.WriteString(occ.CapturedCampaignID)
+		h.WriteString(occ.CapturedInvasionID)
+		h.WriteUint64(occ.CapturedTick)
+		h.WriteBool(occ.ReconquestPlanned)
+		h.WriteUint64(uint64(len(occ.StructuresDestroyed)))
+		for _, sd := range occ.StructuresDestroyed {
+			h.WriteString(sd)
+		}
+		h.WriteUint64(uint64(len(occ.DistrictsCaptured)))
+		for _, dc := range occ.DistrictsCaptured {
+			h.WriteString(dc)
 		}
 	}
 	h.WriteUint64(s.DirectorBatchSeq)
@@ -938,6 +1011,34 @@ func (s DirectorState) Checksum(cfg Config) (string, error) {
 	h.WriteUint64(s.OutcomeSeq)
 	h.WriteUint64(s.OutcomeAckSeq)
 	return h.SumHex(), nil
+}
+
+func writeTerminalOutcomeChecksum(h *simulation.CanonicalHasher, o TerminalSettlementOutcome) {
+	h.WriteUint64(o.Sequence)
+	h.WriteString(o.EventID)
+	h.WriteString(o.SimulationID)
+	h.WriteString(o.CampaignID)
+	h.WriteString(o.InvasionID)
+	h.WriteString(o.SettlementID)
+	h.WriteString(o.RegionID)
+	h.WriteString(o.InvadingFactionID)
+	h.WriteString(string(o.Outcome))
+	h.WriteUint64(o.StartedTick)
+	h.WriteUint64(o.CompletedTick)
+	h.WriteUint32(o.RulesVersion)
+	h.WriteInt64(int64(o.EligibleContributors))
+	h.WriteUint8(o.SiegePhase.Code())
+	h.WriteUint64(uint64(len(o.StructuresDestroyed)))
+	for _, sd := range o.StructuresDestroyed {
+		h.WriteString(sd)
+	}
+	h.WriteUint64(uint64(len(o.DistrictsCaptured)))
+	for _, dc := range o.DistrictsCaptured {
+		h.WriteString(dc)
+	}
+	h.WriteInt64(o.InvaderCasualties)
+	h.WriteInt64(o.DefenderCasualties)
+	h.WriteBool(o.IsReconquest)
 }
 
 func safeAddUint64(a, b uint64) (uint64, error) {

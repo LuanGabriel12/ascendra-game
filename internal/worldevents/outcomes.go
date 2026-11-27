@@ -47,6 +47,8 @@ func cloneDirectorEvents(events []DirectorEvent) []DirectorEvent {
 	for i := range cloned {
 		if cloned[i].TerminalOutcome != nil {
 			value := *cloned[i].TerminalOutcome
+			value.StructuresDestroyed = slices.Clone(value.StructuresDestroyed)
+			value.DistrictsCaptured = slices.Clone(value.DistrictsCaptured)
 			cloned[i].TerminalOutcome = &value
 		}
 	}

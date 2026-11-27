@@ -7,6 +7,7 @@ import (
 
 	"ascendra-game/internal/ai"
 	"ascendra-game/internal/ecosystem"
+	"ascendra-game/internal/siege"
 	"ascendra-game/internal/world"
 )
 
@@ -76,7 +77,26 @@ func DefaultCampaignPolicies() []CampaignPolicyTemplate {
 	}
 }
 
-// DefaultConfig returns balanced, bounded Cycle 04 World Event Director defaults.
+// DefaultSiegeCampaignPolicies returns data-driven Goblin and Orc siege campaign templates
+// that extend DefaultCampaignPolicies with population-backed scheduled SiegeWaves.
+func DefaultSiegeCampaignPolicies() []CampaignPolicyTemplate {
+	base := DefaultCampaignPolicies()
+	for i := range base {
+		switch base[i].TemplateID {
+		case TemplateGoblinRaid:
+			base[i].SiegeWaves = []SiegeWaveSpec{
+				{WaveTag: "goblin-wave-2", DelayTicks: 18, Archetype: "goblin-skirmisher", Count: 1, EntryZoneID: siege.ZoneIDExteriorField},
+			}
+		case TemplateOrcWarband:
+			base[i].SiegeWaves = []SiegeWaveSpec{
+				{WaveTag: "orc-wave-2", DelayTicks: 22, Archetype: "orc-vanguard", Count: 1, EntryZoneID: siege.ZoneIDExteriorField},
+			}
+		}
+	}
+	return base
+}
+
+// DefaultConfig returns balanced, bounded Cycle 04/05 World Event Director defaults.
 func DefaultConfig() Config {
 	return Config{
 		RulesVersion:                    RulesVersion,
@@ -136,6 +156,16 @@ func TemplateRequiredContingent(tpl CampaignPolicyTemplate) (int64, error) {
 	}
 	for _, fu := range tpl.MainForces {
 		w, err := ecosystem.UnitPopulationWeight(fu.Archetype, fu.Count)
+		if err != nil {
+			return 0, err
+		}
+		total, err = safeAddInt64(total, w)
+		if err != nil {
+			return 0, err
+		}
+	}
+	for _, sw := range tpl.SiegeWaves {
+		w, err := ecosystem.UnitPopulationWeight(sw.Archetype, sw.Count)
 		if err != nil {
 			return 0, err
 		}

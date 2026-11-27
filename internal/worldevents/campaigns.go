@@ -9,6 +9,7 @@ import (
 	"ascendra-game/internal/ai"
 	"ascendra-game/internal/ecosystem"
 	"ascendra-game/internal/ports"
+	"ascendra-game/internal/siege"
 	"ascendra-game/internal/world"
 )
 
@@ -188,6 +189,7 @@ func launchFromScheduledEvent(
 		PhaseStartedTick:   dir.Tick,
 		DeadlineTick:       deadline,
 		ChainDepth:         ev.ChainDepth,
+		IsReconquest:       ev.IsReconquest,
 	}
 	dir.CampaignSeq = nextSeq
 	if err := transitionCampaign(&c, CampaignScheduled, dir, dirEvents); err != nil {
@@ -393,6 +395,44 @@ func advanceCampaigns(
 					CampaignID:        c.CampaignID,
 					InvadingFactionID: c.FactionID,
 				})
+				if cfg.Director.SiegeEnabled {
+					*worldCmds = append(*worldCmds, world.DirectorCommand{
+						Kind:              world.CmdDirectorConfigureSiege,
+						Tick:              nextTick,
+						CampaignID:        c.CampaignID,
+						InvadingFactionID: c.FactionID,
+						InvadingFamily:    c.FamilyID,
+						IsReconquest:      c.IsReconquest,
+						SpawnNPCDefenders: cfg.Director.SpawnNPCDefenders,
+						SiegeConfig:       cfg.Director.SiegeConfig,
+					})
+					for _, sw := range tpl.SiegeWaves {
+						waveTick, wErr := safeAddUint64(nextTick, tpl.WarningTicks+1+sw.DelayTicks)
+						if wErr != nil {
+							return wErr
+						}
+						waveID := fmt.Sprintf("wave:%s:%s", c.CampaignID, sw.WaveTag)
+						if len(waveID) > cfg.World.MaxIdentifierLength {
+							waveID = fmt.Sprintf("wave:%s", sw.WaveTag)
+						}
+						wCopy := siege.SiegeWave{
+							WaveID:        waveID,
+							CampaignID:    c.CampaignID,
+							ReservationID: c.ReservationID,
+							Archetype:     sw.Archetype,
+							Count:         sw.Count,
+							ScheduledTick: waveTick,
+							EntryZoneID:   sw.EntryZoneID,
+							State:         siege.WaveScheduled,
+						}
+						*worldCmds = append(*worldCmds, world.DirectorCommand{
+							Kind:       world.CmdDirectorScheduleSiegeWave,
+							Tick:       nextTick,
+							CampaignID: c.CampaignID,
+							Wave:       &wCopy,
+						})
+					}
+				}
 				if err := transitionCampaign(c, CampaignWarning, dir, dirEvents); err != nil {
 					return err
 				}
@@ -445,6 +485,10 @@ func advanceCampaigns(
 					if pos <= 0 || pos > cfg.World.MaxBattlefieldDistance {
 						pos = cfg.World.HostileSpawnDistance
 					}
+					zoneID := ""
+					if w.Siege != nil {
+						zoneID = siege.ZoneIDExteriorField
+					}
 					*worldCmds = append(*worldCmds, world.DirectorCommand{
 						Kind:               world.CmdDirectorSpawnCampaignGroup,
 						Tick:               nextTick,
@@ -455,6 +499,7 @@ func advanceCampaigns(
 						Count:              fu.Count,
 						Position:           pos,
 						HomePosition:       pos,
+						ZoneID:             zoneID,
 						ReservationID:      c.ReservationID,
 						SourcePopulationID: ticket.PopulationID,
 						SourceCampID:       ticket.CampID,
@@ -699,6 +744,31 @@ func finalizeResolvedCampaigns(
 			CompletedTick:        dir.Tick,
 			RulesVersion:         c.RulesVersion,
 			EligibleContributors: eligible,
+			IsReconquest:         c.IsReconquest,
+		}
+		if w.Siege != nil {
+			fact.SiegePhase = w.Siege.Phase
+			fact.StructuresDestroyed = w.Siege.StructuresDestroyedIDs()
+			fact.DistrictsCaptured = w.Siege.DistrictsCapturedIDs()
+			fact.InvaderCasualties = w.Siege.InvaderCasualties
+			fact.DefenderCasualties = w.Siege.DefenderCasualties
+		}
+		if outcome == ports.InvasionOutcomeCaptured {
+			if c.IsReconquest {
+				clearOccupationRecord(&dir.OccupiedSettlements, c.SettlementID)
+			} else {
+				upsertOccupationRecord(&dir.OccupiedSettlements, siege.OccupationRecord{
+					SettlementID:        c.SettlementID,
+					RegionID:            c.RegionID,
+					OccupyingFactionID:  c.FactionID,
+					CapturedCampaignID:  c.CampaignID,
+					CapturedInvasionID:  c.InvasionID,
+					CapturedTick:        dir.Tick,
+					StructuresDestroyed: slices.Clone(fact.StructuresDestroyed),
+					DistrictsCaptured:   slices.Clone(fact.DistrictsCaptured),
+					ReconquestPlanned:   c.ChainDepth < cfg.Director.MaxChainDepth,
+				}, cfg.Director.MaxCompletedHistory)
+			}
 		}
 		c.TerminalFactEmitted = true
 		dir.PendingOutcomes = append(dir.PendingOutcomes, fact)
@@ -883,4 +953,48 @@ func countActiveCampaignGroups(groups []world.CreatureGroup, campaignID string) 
 		}
 	}
 	return n
+}
+
+func upsertOccupationRecord(list *[]siege.OccupationRecord, rec siege.OccupationRecord, maxEntries int) {
+	idx, found := slices.BinarySearchFunc(*list, rec.SettlementID, func(existing siege.OccupationRecord, id string) int {
+		if existing.SettlementID < id {
+			return -1
+		}
+		if existing.SettlementID > id {
+			return 1
+		}
+		return 0
+	})
+	if found {
+		(*list)[idx] = rec
+		return
+	}
+	if len(*list) >= maxEntries && maxEntries > 0 {
+		*list = (*list)[1:]
+		idx, _ = slices.BinarySearchFunc(*list, rec.SettlementID, func(existing siege.OccupationRecord, id string) int {
+			if existing.SettlementID < id {
+				return -1
+			}
+			if existing.SettlementID > id {
+				return 1
+			}
+			return 0
+		})
+	}
+	*list = slices.Insert(*list, idx, rec)
+}
+
+func clearOccupationRecord(list *[]siege.OccupationRecord, settlementID string) {
+	idx, found := slices.BinarySearchFunc(*list, settlementID, func(existing siege.OccupationRecord, id string) int {
+		if existing.SettlementID < id {
+			return -1
+		}
+		if existing.SettlementID > id {
+			return 1
+		}
+		return 0
+	})
+	if found {
+		*list = slices.Delete(*list, idx, idx+1)
+	}
 }
