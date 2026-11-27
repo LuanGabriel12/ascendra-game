@@ -1,0 +1,225 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ascendra.game/contracts/neon-carbon/ability-snapshot.v1.schema.json",
+  "title": "AbilitySnapshotWireV1",
+  "description": "PROPOSED JOINT CONTRACT (v1) — Read-only companion projection from CARBON to NEON carrying versioned equipped abilities, weapon masteries, specialization/build budgets, runtime eligibility, and suppression reasons.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "character_id",
+    "build_version",
+    "snapshot_version",
+    "active_loadout_id",
+    "rules_version",
+    "normalization_profile",
+    "competitive_build_locked",
+    "specialization_budget",
+    "build_budget",
+    "weapon_masteries",
+    "equipped_abilities"
+  ],
+  "properties": {
+    "contract_version": { "type": "integer", "const": 1 },
+    "character_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "build_version": { "type": "integer", "minimum": 1 },
+    "snapshot_version": { "type": "integer", "minimum": 1 },
+    "active_loadout_id": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "rules_version": { "type": "integer", "minimum": 1 },
+    "normalization_profile": {
+      "type": "string",
+      "enum": ["open_world_persistent", "legacy_ranked_md3"]
+    },
+    "competitive_build_locked": { "type": "boolean" },
+    "specialization_budget": { "$ref": "#/$defs/SpecializationBudget" },
+    "build_budget": { "$ref": "#/$defs/BuildBudget" },
+    "weapon_masteries": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/WeaponMasterySummary" }
+    },
+    "equipped_abilities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/EquippedAbilityDetail" }
+    }
+  },
+  "$defs": {
+    "WeaponFamilyCode": {
+      "type": "string",
+      "enum": [
+        "short_sword",
+        "longsword",
+        "greatsword_2h",
+        "dagger",
+        "axe",
+        "heavy_axe_2h",
+        "hammer",
+        "mace",
+        "spear",
+        "halberd_2h",
+        "scythe_2h",
+        "katana",
+        "staff_2h",
+        "wand",
+        "grimoire",
+        "gauntlets",
+        "claws",
+        "bow_2h",
+        "crossbow_2h",
+        "shield",
+        "dual_blades_2h",
+        "magic_catalyst",
+        "unarmed"
+      ]
+    },
+    "SpecializationBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["earned_points", "spent_points", "unspent_points"],
+      "properties": {
+        "earned_points": { "type": "integer", "minimum": 0 },
+        "spent_points": { "type": "integer", "minimum": 0 },
+        "unspent_points": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "BuildBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "used_equipment_cost",
+        "max_equipment_cost",
+        "active_slots_used",
+        "max_active_slots",
+        "passive_slots_used",
+        "max_passive_slots",
+        "ultimate_slots_used",
+        "max_ultimate_slots"
+      ],
+      "properties": {
+        "used_equipment_cost": { "type": "integer", "minimum": 0 },
+        "max_equipment_cost": { "type": "integer", "minimum": 1 },
+        "active_slots_used": { "type": "integer", "minimum": 0 },
+        "max_active_slots": { "type": "integer", "minimum": 1 },
+        "passive_slots_used": { "type": "integer", "minimum": 0 },
+        "max_passive_slots": { "type": "integer", "minimum": 1 },
+        "ultimate_slots_used": { "type": "integer", "minimum": 0 },
+        "max_ultimate_slots": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "WeaponMasterySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "weapon_family_code",
+        "mastery_experience",
+        "mastery_level",
+        "proficiency_rank"
+      ],
+      "properties": {
+        "weapon_family_code": { "$ref": "#/$defs/WeaponFamilyCode" },
+        "mastery_experience": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,18})$"
+        },
+        "mastery_level": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "proficiency_rank": {
+          "type": "string",
+          "enum": [
+            "novice",
+            "apprentice",
+            "practitioner",
+            "specialist",
+            "master",
+            "grandmaster"
+          ]
+        }
+      }
+    },
+    "EquippedAbilityDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "slot_index",
+        "slot_group",
+        "ability_code",
+        "ability_definition_version",
+        "school_code",
+        "ability_category",
+        "ability_rank",
+        "effective_competitive_rank",
+        "equipment_cost",
+        "required_weapon_families",
+        "resolved_weapon_family",
+        "gameplay_effect_reference",
+        "declarative_passive_params",
+        "mastery_level",
+        "is_eligible",
+        "suppression_reason"
+      ],
+      "properties": {
+        "slot_index": { "type": "integer", "minimum": 0, "maximum": 31 },
+        "slot_group": {
+          "type": "string",
+          "enum": ["active", "passive", "ultimate"]
+        },
+        "ability_code": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "ability_definition_version": { "type": "integer", "minimum": 1 },
+        "school_code": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "ability_category": {
+          "type": "string",
+          "enum": [
+            "active",
+            "passive",
+            "reactive",
+            "mobility",
+            "defensive",
+            "weapon_technique",
+            "magical_technique",
+            "ultimate_super"
+          ]
+        },
+        "ability_rank": { "type": "integer", "minimum": 1, "maximum": 99 },
+        "effective_competitive_rank": { "type": "integer", "minimum": 1, "maximum": 99 },
+        "equipment_cost": { "type": "integer", "minimum": 0 },
+        "required_weapon_families": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/WeaponFamilyCode" }
+        },
+        "resolved_weapon_family": {
+          "anyOf": [{ "$ref": "#/$defs/WeaponFamilyCode" }, { "type": "null" }]
+        },
+        "gameplay_effect_reference": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "declarative_passive_params": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": { "type": "integer" }
+            },
+            { "type": "null" }
+          ]
+        },
+        "mastery_level": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "is_eligible": { "type": "boolean" },
+        "suppression_reason": {
+          "type": ["string", "null"],
+          "enum": [
+            "ability_disabled",
+            "inactive_after_specialization_reset",
+            "inactive_prerequisite_node",
+            "insufficient_character_level",
+            "insufficient_attributes",
+            "insufficient_weapon_mastery",
+            "equipped_weapon_broken",
+            "incompatible_equipped_weapon",
+            null
+          ]
+        }
+      }
+    }
+  }
+}

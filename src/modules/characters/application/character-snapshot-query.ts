@@ -7,11 +7,17 @@ import { PgInventoryTransactionScope } from "../../inventory/infrastructure/post
 import {
   PRIMARY_ATTRIBUTE_KEYS,
   type AttributeBlock,
+  type CharacterAbilitySlotSummary,
   type CharacterEquipmentSlotSummary,
   type CharacterSnapshotV1,
   type CharacterSnapshotWireV1,
   type CompetitiveNormalizationProfile,
 } from "../../peoples/domain/character-snapshot-proposal.js";
+import {
+  evaluateRuntimeAbilityUsageEligibility,
+  type EquippedHandItemContext,
+} from "../../skills/domain/mastery-and-dag-rules.js";
+import { PgSkillTransactionScope } from "../../skills/infrastructure/postgres-skill-unit-of-work.js";
 import type { AuthorityPrincipal } from "../domain/character.js";
 import {
   CharacterNotFoundError,
@@ -132,16 +138,35 @@ export function parseCharacterSnapshotWireV1(raw: unknown): CharacterSnapshotV1 
     );
   }
 
-  let allocSum = 0;
-  for (const key of PRIMARY_ATTRIBUTE_KEYS) {
-    allocSum += d.allocated_attributes[key];
-  }
-  if (allocSum !== d.allocated_attribute_points) {
-    throw new BoundaryValidationError(
-      "CharacterSnapshotWireV1 sum(allocated_attributes) mismatch.",
-      ["sum(allocated_attributes) != allocated_attribute_points"],
-    );
-  }
+      let allocSum = 0;
+      for (const key of PRIMARY_ATTRIBUTE_KEYS) {
+        allocSum += d.allocated_attributes[key];
+      }
+      if (allocSum !== d.allocated_attribute_points) {
+        throw new BoundaryValidationError(
+          "CharacterSnapshotWireV1 sum(allocated_attributes) mismatch.",
+          ["sum(allocated_attributes) != allocated_attribute_points"],
+        );
+      }
+
+      const seenAbilitySlots = new Set<number>();
+      const seenAbilityCodes = new Set<string>();
+      for (const ab of d.equipped_abilities) {
+        if (seenAbilitySlots.has(ab.slotIndex)) {
+          throw new BoundaryValidationError(
+            "CharacterSnapshotWireV1 contains duplicate equipped_abilities slotIndex.",
+            [`duplicate slotIndex ${ab.slotIndex}`],
+          );
+        }
+        if (seenAbilityCodes.has(ab.abilityCode)) {
+          throw new BoundaryValidationError(
+            "CharacterSnapshotWireV1 contains duplicate equipped_abilities abilityCode.",
+            [`duplicate abilityCode ${ab.abilityCode}`],
+          );
+        }
+        seenAbilitySlots.add(ab.slotIndex);
+        seenAbilityCodes.add(ab.abilityCode);
+      }
 
   return {
     contractVersion: 1,
@@ -216,6 +241,8 @@ export class PostgresCharacterSnapshotReader {
       character.assertOwnedByOrSystem(options.principal);
 
       const equippedItems: CharacterEquipmentSlotSummary[] = [];
+      const equippedAbilities: CharacterAbilitySlotSummary[] = [];
+      const handItemsForAbilityCheck: EquippedHandItemContext[] = [];
 
       // Check if equipment_loadouts table is present (supports reading cleanly even if queried before 0007 in isolated migration tests)
       const hasLoadoutTableRes = await client.query<{ present: boolean }>(
@@ -225,6 +252,7 @@ export class PostgresCharacterSnapshotReader {
          ) AS present`,
       );
 
+      let activeLoadoutId: string | undefined;
       if (hasLoadoutTableRes.rows[0]?.present === true) {
         const activeLoadoutRes = await client.query<{ id: string }>(
           `SELECT id FROM equipment_loadouts
@@ -232,7 +260,7 @@ export class PostgresCharacterSnapshotReader {
            LIMIT 1`,
           [character.id],
         );
-        const activeLoadoutId = activeLoadoutRes.rows[0]?.id;
+        activeLoadoutId = activeLoadoutRes.rows[0]?.id;
         if (activeLoadoutId) {
           const slots = await invScope.listLoadoutSlots(activeLoadoutId);
           for (const slot of slots) {
@@ -247,6 +275,13 @@ export class PostgresCharacterSnapshotReader {
             if (!def) {
               continue;
             }
+            if (slot.slotCode === "main_hand" || slot.slotCode === "off_hand") {
+              handItemsForAbilityCheck.push({
+                slotCode: slot.slotCode,
+                instance: inst,
+                definition: def,
+              });
+            }
             const elig = checkIntrinsicCharacterEligibility(character, def, inst);
             if (!elig.eligible) {
               // Broken (durability === 0) or post-respec ineligible items do not provide active combat equipment
@@ -259,6 +294,63 @@ export class PostgresCharacterSnapshotReader {
               schemaVersion: inst.definitionVersion,
             });
           }
+        }
+      }
+
+      // Project eligible equipped abilities from Session 06 tables inside the SAME REPEATABLE READ snapshot!
+      if (activeLoadoutId) {
+        const hasAbilityLoadoutRes = await client.query<{ present: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1 FROM information_schema.tables
+             WHERE table_schema = current_schema() AND table_name = 'character_ability_loadout_slots'
+           ) AS present`,
+        );
+
+        if (hasAbilityLoadoutRes.rows[0]?.present === true) {
+          const skillScope = new PgSkillTransactionScope(client);
+          const masteryMap = await skillScope.listCharacterMasteriesMap(character.id, false);
+          const unlocks = await skillScope.listSpecializationUnlocks(character.id, false);
+          const learnedList = await skillScope.listLearnedAbilities(character.id, false);
+          const abilitySlots = await skillScope.listLoadoutAbilitySlots(activeLoadoutId, false);
+
+          const learnedByCode = new Map(learnedList.map((l) => [l.abilityCode, l]));
+          const activeUnlockedSet = new Set(
+            unlocks.filter((u) => u.isActive).map((u) => u.nodeCode),
+          );
+
+          for (const slot of abilitySlots) {
+            const learned = learnedByCode.get(slot.abilityCode);
+            if (!learned) {
+              continue;
+            }
+            const def = await skillScope.findAbilityDefinition(
+              learned.abilityCode,
+              learned.abilityVersion,
+            );
+            if (!def) {
+              continue;
+            }
+            const elig = evaluateRuntimeAbilityUsageEligibility({
+              character,
+              learned,
+              definition: def,
+              masteryMap,
+              activeUnlockedNodeCodes: activeUnlockedSet,
+              equippedHandItems: handItemsForAbilityCheck,
+            });
+            if (!elig.isEligible) {
+              // Suppressed abilities (incompatible weapon, broken weapon, post-respec) stay configured in DB
+              // and visible in AbilitySnapshotV1, while CharacterSnapshotV1 projects ONLY active eligible combat abilities!
+              continue;
+            }
+            equippedAbilities.push({
+              slotIndex: slot.slotIndex,
+              abilityCode: def.abilityCode,
+              rank: learned.currentRank,
+            });
+          }
+
+          equippedAbilities.sort((a, b) => a.slotIndex - b.slotIndex);
         }
       }
 
@@ -289,7 +381,7 @@ export class PostgresCharacterSnapshotReader {
           unspentAttributePoints: character.unspentAttributePoints,
         },
         equippedItems,
-        equippedAbilities: [],
+        equippedAbilities,
         normalizationProfile: profile,
       };
 
