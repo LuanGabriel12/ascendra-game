@@ -85,12 +85,13 @@ jobs:
       - name: Run real PostgreSQL integration test suites
         run: npm test
 
-      - name: Run reproducible Session 02..05 headless demonstrations
+      - name: Run reproducible Session 02..06 headless demonstrations
         run: |
           npm run demo:session02
           npm run demo:session03
           npm run demo:session04
           npm run demo:session05
+          npm run demo:session06
 
   neon-go:
     name: NEON Go Simulation & Race Detector
