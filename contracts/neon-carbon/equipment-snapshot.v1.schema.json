@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ascendra.game/contracts/neon-carbon/equipment-snapshot.v1.schema.json",
+  "title": "EquipmentSnapshotProposalV1",
+  "description": "PROPOSED COMPANION CONTRACT (v1) — Carries full procedural equipment modifiers, durability state, quality, and declarative special-effect references from CARBON to NEON without breaking CharacterSnapshotWireV1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contractVersion",
+    "characterId",
+    "buildVersion",
+    "snapshotVersion",
+    "activeLoadoutId",
+    "normalizationProfile",
+    "equipmentModifiers",
+    "aggregatedEffectiveAttributes",
+    "equippedDetails"
+  ],
+  "properties": {
+    "contractVersion": { "type": "integer", "const": 1 },
+    "characterId": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "buildVersion": { "type": "integer", "minimum": 1 },
+    "snapshotVersion": { "type": "integer", "minimum": 1 },
+    "activeLoadoutId": { "type": ["string", "null"] },
+    "normalizationProfile": {
+      "type": "string",
+      "enum": ["open_world_persistent", "legacy_ranked_md3"]
+    },
+    "equipmentModifiers": { "$ref": "#/$defs/AttributeBlock" },
+    "aggregatedEffectiveAttributes": { "$ref": "#/$defs/AttributeBlock" },
+    "equippedDetails": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/EquippedProceduralItemDetail" }
+    }
+  },
+  "$defs": {
+    "AttributeBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strength",
+        "fortitude",
+        "vigor",
+        "agility",
+        "dexterity",
+        "intelligence",
+        "wisdom",
+        "determination",
+        "luck",
+        "charisma"
+      ],
+      "properties": {
+        "strength": { "type": "integer", "minimum": 0 },
+        "fortitude": { "type": "integer", "minimum": 0 },
+        "vigor": { "type": "integer", "minimum": 0 },
+        "agility": { "type": "integer", "minimum": 0 },
+        "dexterity": { "type": "integer", "minimum": 0 },
+        "intelligence": { "type": "integer", "minimum": 0 },
+        "wisdom": { "type": "integer", "minimum": 0 },
+        "determination": { "type": "integer", "minimum": 0 },
+        "luck": { "type": "integer", "minimum": 0 },
+        "charisma": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "EquippedProceduralItemDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "slotCode",
+        "occupiesOffHand",
+        "itemInstanceId",
+        "definitionCode",
+        "definitionVersion",
+        "itemLevel",
+        "rarityCode",
+        "qualityBp",
+        "currentDurability",
+        "maxDurability",
+        "isActiveForCombat",
+        "suppressionReason",
+        "implicitAttributes",
+        "generatedAttributes",
+        "specialEffects"
+      ],
+      "properties": {
+        "slotCode": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "occupiesOffHand": { "type": "boolean" },
+        "itemInstanceId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "definitionCode": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "definitionVersion": { "type": "integer", "minimum": 1 },
+        "itemLevel": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "rarityCode": {
+          "type": "string",
+          "enum": ["common", "uncommon", "rare", "epic", "legendary", "mythic", "relic"]
+        },
+        "qualityBp": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "currentDurability": { "type": ["integer", "null"], "minimum": 0 },
+        "maxDurability": { "type": ["integer", "null"], "minimum": 1 },
+        "isActiveForCombat": { "type": "boolean" },
+        "suppressionReason": { "type": ["string", "null"] },
+        "implicitAttributes": { "$ref": "#/$defs/AttributeBlock" },
+        "generatedAttributes": { "$ref": "#/$defs/AttributeBlock" },
+        "specialEffects": { "type": "array" }
+      }
+    }
+  }
+}

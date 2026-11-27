@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ascendra.game/contracts/neon-carbon/character-snapshot.v1.schema.json",
   "title": "CharacterSnapshotWireV1",
-  "description": "PROPOSED JOINT CONTRACT (v1) — Read-only character projection from CARBON to NEON for future combat, bosses, PvP, and Legacy Ranked consumption. Requires NEON review before becoming mandatory.",
+  "description": "PROPOSED JOINT CONTRACT (v1) — Read-only character & active equipment projection from CARBON to NEON for future combat, bosses, PvP, and Legacy Ranked consumption. Element schemas aligned with Zod without breaking v1 consumers.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -57,8 +57,14 @@
     "unspent_attribute_points": { "type": "integer", "minimum": 0 },
     "base_attributes": { "$ref": "#/$defs/AttributeBlock" },
     "allocated_attributes": { "$ref": "#/$defs/AttributeBlock" },
-    "equipped_items": { "type": "array" },
-    "equipped_abilities": { "type": "array" },
+    "equipped_items": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/EquippedItemSlotSummary" }
+    },
+    "equipped_abilities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/EquippedAbilitySlotSummary" }
+    },
     "normalization_profile": {
       "type": "string",
       "enum": ["open_world_persistent", "legacy_ranked_md3", "genesis_ranked_md3_scratch"]
@@ -91,6 +97,27 @@
         "determination": { "type": "integer", "minimum": 0 },
         "luck": { "type": "integer", "minimum": 0 },
         "charisma": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "EquippedItemSlotSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slotCode", "itemDefinitionCode", "itemInstanceId", "schemaVersion"],
+      "properties": {
+        "slotCode": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "itemDefinitionCode": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "itemInstanceId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "schemaVersion": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "EquippedAbilitySlotSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slotIndex", "abilityCode", "rank"],
+      "properties": {
+        "slotIndex": { "type": "integer", "minimum": 0, "maximum": 31 },
+        "abilityCode": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "rank": { "type": "integer", "minimum": 1, "maximum": 99 }
       }
     }
   }

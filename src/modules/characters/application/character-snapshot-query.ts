@@ -2,9 +2,12 @@ import { z } from "zod";
 import { NonNegativeInt64Schema } from "../../../shared/contracts/int64-wire.js";
 import { BoundaryValidationError } from "../../../shared/contracts/world-events.js";
 import type { PgPool } from "../../../shared/db/pool.js";
+import { checkIntrinsicCharacterEligibility } from "../../inventory/domain/equipment-and-stack-rules.js";
+import { PgInventoryTransactionScope } from "../../inventory/infrastructure/postgres-inventory-unit-of-work.js";
 import {
   PRIMARY_ATTRIBUTE_KEYS,
   type AttributeBlock,
+  type CharacterEquipmentSlotSummary,
   type CharacterSnapshotV1,
   type CharacterSnapshotWireV1,
   type CompetitiveNormalizationProfile,
@@ -14,7 +17,7 @@ import {
   CharacterNotFoundError,
   GenesisTemporaryStatePersistenceForbiddenError,
 } from "../domain/errors.js";
-import { PostgresCharacterRepository } from "../infrastructure/postgres-character-unit-of-work.js";
+import { PgCharacterTransactionScope } from "../infrastructure/postgres-character-unit-of-work.js";
 
 const AttributeBlockSchema = z
   .object({
@@ -177,15 +180,16 @@ export interface GetCharacterSnapshotOptions {
 }
 
 export class PostgresCharacterSnapshotReader {
-  private readonly characterRepo: PostgresCharacterRepository;
+  private readonly pool: PgPool;
 
   constructor(pool: PgPool) {
-    this.characterRepo = new PostgresCharacterRepository(pool);
+    this.pool = pool;
   }
 
   /**
-   * Projects a validated, read-only `CharacterSnapshotV1` for open-world or Legacy Ranked consumption.
-   * Never exposes credentials, never invents non-existent items/abilities, and omits `accountId` by default.
+   * Projects a validated, read-only `CharacterSnapshotV1` from a consistent `REPEATABLE READ`
+   * PostgreSQL snapshot across `characters`, `character_attributes`, and active `equipment_loadouts`.
+   * Only active, non-broken (`durability > 0`), intrinsically eligible items are projected as active combat gear.
    */
   public async getCharacterSnapshot(
     characterId: string,
@@ -198,44 +202,104 @@ export class PostgresCharacterSnapshotReader {
       throw new GenesisTemporaryStatePersistenceForbiddenError("getCharacterSnapshot");
     }
 
-    const character = await this.characterRepo.findCharacterById(characterId);
-    if (!character) {
-      throw new CharacterNotFoundError(characterId);
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      const charScope = new PgCharacterTransactionScope(this.pool, client);
+      const invScope = new PgInventoryTransactionScope(client);
+
+      const character = await charScope.findCharacterById(characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(characterId);
+      }
+
+      character.assertOwnedByOrSystem(options.principal);
+
+      const equippedItems: CharacterEquipmentSlotSummary[] = [];
+
+      // Check if equipment_loadouts table is present (supports reading cleanly even if queried before 0007 in isolated migration tests)
+      const hasLoadoutTableRes = await client.query<{ present: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM information_schema.tables
+           WHERE table_schema = current_schema() AND table_name = 'equipment_loadouts'
+         ) AS present`,
+      );
+
+      if (hasLoadoutTableRes.rows[0]?.present === true) {
+        const activeLoadoutRes = await client.query<{ id: string }>(
+          `SELECT id FROM equipment_loadouts
+           WHERE character_id = $1 AND is_active = TRUE
+           LIMIT 1`,
+          [character.id],
+        );
+        const activeLoadoutId = activeLoadoutRes.rows[0]?.id;
+        if (activeLoadoutId) {
+          const slots = await invScope.listLoadoutSlots(activeLoadoutId);
+          for (const slot of slots) {
+            const inst = await invScope.findItemInstanceById(slot.itemInstanceId);
+            if (!inst || inst.locationState !== "equipped_active") {
+              continue;
+            }
+            const def = await invScope.findItemDefinition(
+              inst.definitionCode,
+              inst.definitionVersion,
+            );
+            if (!def) {
+              continue;
+            }
+            const elig = checkIntrinsicCharacterEligibility(character, def, inst);
+            if (!elig.eligible) {
+              // Broken (durability === 0) or post-respec ineligible items do not provide active combat equipment
+              continue;
+            }
+            equippedItems.push({
+              slotCode: slot.slotCode,
+              itemDefinitionCode: inst.definitionCode,
+              itemInstanceId: inst.id,
+              schemaVersion: inst.definitionVersion,
+            });
+          }
+        }
+      }
+
+      await client.query("COMMIT");
+
+      const snapshot: CharacterSnapshotV1 = {
+        contractVersion: 1,
+        snapshotVersion: character.snapshotVersion,
+        buildVersion: character.buildVersion,
+        identity: {
+          characterId: character.id,
+          ...(options.includeAccountId === true ? { accountId: character.accountId } : {}),
+          displayName: character.displayName,
+          raceCode: character.raceCode,
+          lineageCode: character.lineageCode,
+          cultureCode: character.cultureCode,
+          backgroundCode: character.backgroundCode,
+          originRegionId: character.originRegionId,
+        },
+        baseAttributes: { ...character.baseAttributes },
+        allocatedAttributes: { ...character.allocatedAttributes },
+        progression: {
+          rulesVersion: character.rulesVersion,
+          level: character.level,
+          experienceTotal: character.experienceTotal,
+          earnedAttributePoints: character.earnedAttributePoints,
+          allocatedAttributePoints: character.allocatedAttributePoints,
+          unspentAttributePoints: character.unspentAttributePoints,
+        },
+        equippedItems,
+        equippedAbilities: [],
+        normalizationProfile: profile,
+      };
+
+      const wire = serializeCharacterSnapshotWireV1(snapshot);
+      return parseCharacterSnapshotWireV1(wire);
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
     }
-
-    character.assertOwnedByOrSystem(options.principal);
-
-    const snapshot: CharacterSnapshotV1 = {
-      contractVersion: 1,
-      snapshotVersion: character.snapshotVersion,
-      buildVersion: character.buildVersion,
-      identity: {
-        characterId: character.id,
-        ...(options.includeAccountId === true ? { accountId: character.accountId } : {}),
-        displayName: character.displayName,
-        raceCode: character.raceCode,
-        lineageCode: character.lineageCode,
-        cultureCode: character.cultureCode,
-        backgroundCode: character.backgroundCode,
-        originRegionId: character.originRegionId,
-      },
-      baseAttributes: { ...character.baseAttributes },
-      allocatedAttributes: { ...character.allocatedAttributes },
-      progression: {
-        rulesVersion: character.rulesVersion,
-        level: character.level,
-        experienceTotal: character.experienceTotal,
-        earnedAttributePoints: character.earnedAttributePoints,
-        allocatedAttributePoints: character.allocatedAttributePoints,
-        unspentAttributePoints: character.unspentAttributePoints,
-      },
-      equippedItems: [],
-      equippedAbilities: [],
-      normalizationProfile: profile,
-    };
-
-    // Validate wire roundtrip integrity before returning
-    const wire = serializeCharacterSnapshotWireV1(snapshot);
-    return parseCharacterSnapshotWireV1(wire);
   }
 }
