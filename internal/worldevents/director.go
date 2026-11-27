@@ -2,6 +2,7 @@ package worldevents
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -44,7 +45,13 @@ func (c OrchestratedConfig) Validate() error {
 	if err := c.Ecosystem.Validate(); err != nil {
 		return err
 	}
-	return c.Director.Validate()
+	if err := c.Director.Validate(); err != nil {
+		return err
+	}
+	if c.Director.MaxPendingContributions < c.World.MaxContributions {
+		return fmt.Errorf("%w: contribution outbox must fit one entire invasion", ErrInvalidConfig)
+	}
+	return nil
 }
 
 // OrchestratedState unifies the three authoritative simulation layers with a single source of truth:
@@ -102,6 +109,17 @@ func (s OrchestratedState) Validate(cfg OrchestratedConfig) error {
 	if err := s.Ecosystem.Validate(cfg.Ecosystem); err != nil {
 		return err
 	}
+	// Orchestrated v5 accepts only sequenced reservation identities. A legacy
+	// history may have already forgotten arbitrary keys and cannot be migrated
+	// safely without an independent durable ledger.
+	if len(s.Ecosystem.RetiredReservationKeys) != 0 {
+		return fmt.Errorf("%w: legacy reservation keys require external reconciliation", ErrInvalidState)
+	}
+	for _, reservation := range s.Ecosystem.Reservations {
+		if reservation.IdempotencyKey != fmt.Sprintf("ordered-reservation:%d", reservation.Seq) {
+			return fmt.Errorf("%w: legacy reservation requires external reconciliation", ErrInvalidState)
+		}
+	}
 	if s.Director.Tick != s.World.Tick {
 		return fmt.Errorf("%w: director tick %d != world tick %d", ErrInvalidState, s.Director.Tick, s.World.Tick)
 	}
@@ -133,6 +151,12 @@ func (s OrchestratedState) Validate(cfg OrchestratedConfig) error {
 			}
 			if res.CampaignID != c.CampaignID || res.PopulationID != c.SourcePopulationID || res.CampID != c.SourceCampID {
 				return fmt.Errorf("%w: campaign %q reservation %q provenance mismatch", ErrInvalidState, c.CampaignID, c.ReservationID)
+			}
+		}
+		if c.State == CampaignActive {
+			if (s.World.Invasion.State != world.InvasionUnderAttack && s.World.Invasion.State != world.InvasionResolved) ||
+				s.World.Invasion.CampaignID != c.CampaignID {
+				return fmt.Errorf("%w: active campaign %q does not match tactical invasion state (%s, %q)", ErrInvalidState, c.CampaignID, s.World.Invasion.State, s.World.Invasion.CampaignID)
 			}
 		}
 	}
@@ -203,7 +227,7 @@ func (s OrchestratedState) Checksum(cfg OrchestratedConfig) (string, error) {
 	return h.SumHex(), nil
 }
 
-// MarshalSnapshot encodes OrchestratedState into Snapshot v4 with canonical checksum and size limit.
+// MarshalSnapshot encodes OrchestratedState into Snapshot v5 with canonical checksum and size limit.
 func (s OrchestratedState) MarshalSnapshot(cfg OrchestratedConfig) ([]byte, error) {
 	sum, err := s.Checksum(cfg)
 	if err != nil {
@@ -221,7 +245,7 @@ func (s OrchestratedState) MarshalSnapshot(cfg OrchestratedConfig) ([]byte, erro
 }
 
 // UnmarshalOrchestratedSnapshot enforces MaxSnapshotBytes BEFORE JSON decoding, rejects legacy
-// schema versions (v1/v2/v3), verifies the canonical checksum, and validates all cross-layer invariants.
+// schema versions (v1/v2/v3/v4), verifies the canonical checksum, and validates all cross-layer invariants.
 func UnmarshalOrchestratedSnapshot(data []byte, cfg OrchestratedConfig) (OrchestratedState, error) {
 	if err := cfg.Validate(); err != nil {
 		return OrchestratedState{}, err
@@ -263,6 +287,31 @@ type StepOutput struct {
 	WorldEvents      []world.DomainEvent         `json:"world_events"`
 	EcosystemEvents  []ecosystem.EcologicalEvent `json:"ecosystem_events"`
 	TerminalOutcomes []TerminalSettlementOutcome `json:"terminal_outcomes"`
+}
+
+// Admit optional campaigns only while their eventual terminal, director-batch, and
+// contribution facts can fit safely alongside already-accepted in-flight campaigns.
+// When remaining queue capacity covers (inFlightUnresolved + 1) worst-case outcomes
+// and contributions, independent campaigns proceed even under a slow consumer.
+func campaignAdmissionError(state OrchestratedState, cfg OrchestratedConfig) error {
+	if len(state.Director.PendingDirectorBatches) >= cfg.Director.MaxPendingDirectorBatches ||
+		totalPendingDirectorEvents(state.Director) >= cfg.Director.MaxPendingDirectorEvents {
+		return ErrDirectorBackpressure
+	}
+	inFlightUnresolved := 0
+	for _, c := range state.Director.Campaigns {
+		if c.State.IsInFlight() && !c.TerminalFactEmitted {
+			inFlightUnresolved++
+		}
+	}
+	if len(state.Director.PendingOutcomes)+inFlightUnresolved >= cfg.Director.MaxPendingOutcomes {
+		return ErrOutcomeBackpressure
+	}
+	neededContributions := (inFlightUnresolved + 1) * cfg.World.MaxContributions
+	if cfg.Director.MaxPendingContributions-len(state.Director.PendingContributions) < neededContributions {
+		return ErrContributionBackpressure
+	}
+	return nil
 }
 
 // Step advances the entire three-layer deterministic simulation (Director + World + Ecosystem)
@@ -315,14 +364,19 @@ func Step(state OrchestratedState, input StepInput, cfg OrchestratedConfig) (Orc
 	}
 
 	// 4. Evaluate ecological campaign candidates periodically and enqueue top eligible candidates.
-	if nextTick%cfg.Director.CandidateEvalIntervalTicks == 0 {
+	if nextTick%cfg.Director.CandidateEvalIntervalTicks == 0 && campaignAdmissionError(next, cfg) == nil {
 		availDefenders := countAliveDefenders(next.World.Defenders)
 		candidates, err := EvaluateCandidates(next.Director, next.Ecosystem, next.World, cfg.Director, availDefenders)
 		if err != nil {
 			return OrchestratedState{}, StepOutput{}, err
 		}
 		for _, cand := range candidates {
-			if len(next.Director.PendingEvents) >= cfg.Director.MaxPendingEvents {
+			// Keep one scheduler slot available for the active invasion's follow-up.
+			reservedSlots := reservedFollowupSlots(next.Director, cfg.Director)
+			if cfg.Director.MaxChainDepth > 0 {
+				reservedSlots = max(1, reservedSlots)
+			}
+			if len(next.Director.PendingEvents) >= cfg.Director.MaxPendingEvents-reservedSlots {
 				break
 			}
 			tpl, ok := LookupPolicy(cfg.Director, cand.TemplateID)
@@ -370,7 +424,7 @@ func Step(state OrchestratedState, input StepInput, cfg OrchestratedConfig) (Orc
 	}
 
 	// 5. Run deterministic tick scheduler (expiry, anti-starvation aging, priority & canonical tie-break, concurrency caps).
-	dispatched, err := processScheduler(&next.Director, cfg.Director, &dirEvents)
+	dispatched, err := processScheduler(&next.Director, cfg.Director, campaignAdmissionError(next, cfg) == nil, &dirEvents)
 	if err != nil {
 		return OrchestratedState{}, StepOutput{}, err
 	}
@@ -392,6 +446,21 @@ func Step(state OrchestratedState, input StepInput, cfg OrchestratedConfig) (Orc
 		return OrchestratedState{}, StepOutput{}, err
 	}
 	next.World = nextWorld
+	contributionsEnqueued := 0
+	for _, ev := range wEvents {
+		if ev.Type != world.EventContributionRecorded || ev.Contribution == nil {
+			continue
+		}
+		if len(next.Director.PendingContributions) >= cfg.Director.MaxPendingContributions {
+			return OrchestratedState{}, StepOutput{}, ErrContributionBackpressure
+		}
+		if next.Director.ContributionSeq == math.MaxUint64 {
+			return OrchestratedState{}, StepOutput{}, ErrNumericOverflow
+		}
+		next.Director.ContributionSeq++
+		next.Director.PendingContributions = append(next.Director.PendingContributions, PendingContribution{Sequence: next.Director.ContributionSeq, Result: *ev.Contribution})
+		contributionsEnqueued++
+	}
 
 	// 8. Reconcile newly dead or routed materialized groups strictly once via their owning ReservationID.
 	for i := range next.World.Groups {
@@ -450,14 +519,41 @@ func Step(state OrchestratedState, input StepInput, cfg OrchestratedConfig) (Orc
 		return OrchestratedState{}, StepOutput{}, err
 	}
 
-	// 11. Cap per-tick director event stream strictly to MaxEventsPerUpdate.
-	if len(dirEvents) > cfg.Director.MaxEventsPerUpdate {
-		dirEvents = dirEvents[:cfg.Director.MaxEventsPerUpdate]
+	// A whole tick is one durable batch. Consumers page through it independently
+	// of Step; a tick may produce more facts than one page can contain, while
+	// still obeying hard per-batch and total stored event caps.
+	if len(dirEvents) > 0 {
+		if len(dirEvents) > cfg.Director.MaxEventsPerBatch || len(dirEvents) > cfg.Director.MaxPendingDirectorEvents {
+			return OrchestratedState{}, StepOutput{}, fmt.Errorf("%w: tick produced %d events (batch cap=%d, total cap=%d)", ErrTickEventCapacity, len(dirEvents), cfg.Director.MaxEventsPerBatch, cfg.Director.MaxPendingDirectorEvents)
+		}
+		if len(next.Director.PendingDirectorBatches) >= cfg.Director.MaxPendingDirectorBatches ||
+			totalPendingDirectorEvents(next.Director)+len(dirEvents) > cfg.Director.MaxPendingDirectorEvents {
+			return OrchestratedState{}, StepOutput{}, ErrDirectorBackpressure
+		}
+		if next.Director.DirectorBatchSeq == math.MaxUint64 {
+			return OrchestratedState{}, StepOutput{}, ErrNumericOverflow
+		}
+		next.Director.DirectorBatchSeq++
+		next.Director.PendingDirectorBatches = append(next.Director.PendingDirectorBatches, DirectorEventBatch{Sequence: next.Director.DirectorBatchSeq, Events: cloneDirectorEvents(dirEvents)})
 	}
 
 	// 12. Re-validate all cross-layer invariants before committing return state.
 	if err := next.Validate(cfg); err != nil {
 		return OrchestratedState{}, StepOutput{}, err
+	}
+	// Never commit newly queued outbox facts that cannot be captured in a snapshot.
+	// Draining older queues can free space; a tick that cannot fit even alone
+	// requires a larger snapshot budget rather than a futile retry.
+	if len(dirEvents) > 0 || contributionsEnqueued > 0 {
+		if _, err := next.MarshalSnapshot(cfg); err != nil {
+			if errors.Is(err, simulation.ErrSnapshotTooLarge) {
+				if len(state.Director.PendingDirectorBatches) == 0 && len(state.Director.PendingOutcomes) == 0 && len(state.Director.PendingContributions) == 0 {
+					return OrchestratedState{}, StepOutput{}, fmt.Errorf("%w: complete tick cannot fit snapshot budget", ErrTickEventCapacity)
+				}
+				return OrchestratedState{}, StepOutput{}, fmt.Errorf("%w: snapshot budget exhausted", ErrDirectorBackpressure)
+			}
+			return OrchestratedState{}, StepOutput{}, err
+		}
 	}
 	return next, StepOutput{
 		DirectorEvents:   dirEvents,
@@ -501,6 +597,16 @@ func applyDirectorCommands(
 		}
 		switch cmd.Kind {
 		case DirCmdScheduleCampaign:
+			if err := campaignAdmissionError(*next, cfg); err != nil {
+				return err
+			}
+			reservedSlots := reservedFollowupSlots(next.Director, cfg.Director)
+			if cfg.Director.MaxChainDepth > 0 {
+				reservedSlots = max(1, reservedSlots)
+			}
+			if len(next.Director.PendingEvents) >= cfg.Director.MaxPendingEvents-reservedSlots {
+				return fmt.Errorf("%w: scheduler capacity reserved for mandatory follow-up", ErrCapacityExceeded)
+			}
 			if cmd.SettlementID == "" {
 				cmd.SettlementID = next.World.SettlementID
 			}
@@ -552,6 +658,9 @@ func applyDirectorCommands(
 			*dirEvents = append(*dirEvents, de)
 
 		case DirCmdCancelCampaign:
+			if len(cmd.Reason) > cfg.Director.MaxIdentifierLength {
+				return fmt.Errorf("%w: cancellation reason exceeds limit", ErrInvalidCommand)
+			}
 			idx := findCampaignIndex(next.Director.Campaigns, cmd.CampaignID)
 			if idx < 0 {
 				return fmt.Errorf("%w: %q", ErrCampaignNotFound, cmd.CampaignID)
@@ -737,6 +846,9 @@ func RunOrchestrated(
 	cfg OrchestratedConfig,
 	maxRetainedEvents int,
 ) (RunResult, error) {
+	if maxRetainedEvents <= 0 {
+		return RunResult{}, fmt.Errorf("%w: headless retention must be positive", ErrInvalidConfig)
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -745,11 +857,15 @@ func RunOrchestrated(
 	var wEvs []world.DomainEvent
 	var ecoEvs []ecosystem.EcologicalEvent
 	var outcomes []TerminalSettlementOutcome
+	partial := func() RunResult {
+		sum, _ := cur.Checksum(cfg)
+		return RunResult{FinalState: cur, FinalChecksum: sum, DirectorEvents: dirEvs, WorldEvents: wEvs, EcosystemEvents: ecoEvs, TerminalOutcomes: outcomes}
+	}
 
 	for cur.Director.Tick < targetTick {
 		select {
 		case <-ctx.Done():
-			return RunResult{}, ctx.Err()
+			return partial(), ctx.Err()
 		default:
 		}
 		nextTick := cur.Director.Tick + 1
@@ -759,12 +875,23 @@ func RunOrchestrated(
 		}
 		next, out, err := Step(cur, in, cfg)
 		if err != nil {
-			return RunResult{}, err
+			return partial(), err
 		}
-		dirEvs = appendBounded(dirEvs, out.DirectorEvents, maxRetainedEvents)
-		wEvs = appendBounded(wEvs, out.WorldEvents, maxRetainedEvents)
-		ecoEvs = appendBounded(ecoEvs, out.EcosystemEvents, maxRetainedEvents)
-		outcomes = appendBounded(outcomes, out.TerminalOutcomes, maxRetainedEvents)
+		// This harness acts as an in-memory development consumer (NOT durable production storage).
+		// Query pending queues via the real public paging/query APIs, verify retention headroom
+		// BEFORE confirming anything, process facts, and confirm ONLY facts actually retained.
+		if maxRetainedEvents > 0 && (len(dirEvs)+len(out.DirectorEvents) > maxRetainedEvents || len(wEvs)+len(out.WorldEvents) > maxRetainedEvents || len(ecoEvs)+len(out.EcosystemEvents) > maxRetainedEvents || len(outcomes)+len(out.TerminalOutcomes) > maxRetainedEvents) {
+			return partial(), fmt.Errorf("%w: headless consumer retention full", ErrCapacityExceeded)
+		}
+		var errAck error
+		next, errAck = drainPendingQueuesVerified(next, cfg, nil, nil, nil)
+		if errAck != nil {
+			return partial(), errAck
+		}
+		dirEvs = append(dirEvs, out.DirectorEvents...)
+		wEvs = append(wEvs, out.WorldEvents...)
+		ecoEvs = append(ecoEvs, out.EcosystemEvents...)
+		outcomes = append(outcomes, out.TerminalOutcomes...)
 		cur = next
 	}
 
@@ -782,13 +909,75 @@ func RunOrchestrated(
 	}, nil
 }
 
-func appendBounded[T any](dst []T, src []T, limit int) []T {
-	if len(src) == 0 {
-		return dst
+// drainPendingQueuesVerified executes the full public consumer protocol:
+// query pages/facts -> invoke optional processing callbacks -> acknowledge ONLY processed facts.
+func drainPendingQueuesVerified(
+	state OrchestratedState,
+	cfg OrchestratedConfig,
+	onDirectorBatch func(seq uint64, events []DirectorEvent),
+	onOutcome func(fact TerminalSettlementOutcome),
+	onContribution func(contrib PendingContribution),
+) (OrchestratedState, error) {
+	cur := state
+	// 1. Drain director event batches via deterministic pagination loop.
+	for {
+		stats, err := PendingQueueStats(cur, cfg)
+		if err != nil {
+			return OrchestratedState{}, err
+		}
+		if stats.PendingDirectorBatches == 0 {
+			break
+		}
+		var collected []DirectorEvent
+		var seq uint64
+		for offset := 0; ; {
+			var page []DirectorEvent
+			var more bool
+			seq, page, more, err = PendingDirectorEventPage(cur, offset, cfg)
+			if err != nil {
+				return OrchestratedState{}, err
+			}
+			collected = append(collected, page...)
+			offset += len(page)
+			if !more {
+				break
+			}
+		}
+		if onDirectorBatch != nil {
+			onDirectorBatch(seq, collected)
+		}
+		cur, err = AcknowledgeDirectorBatchVerified(cur, seq, len(collected), cfg)
+		if err != nil {
+			return OrchestratedState{}, err
+		}
 	}
-	dst = append(dst, src...)
-	if limit > 0 && len(dst) > limit {
-		dst = append([]T(nil), dst[len(dst)-limit:]...)
+	// 2. Drain pending terminal outcomes via public query + verified ack.
+	pendingOutcomes, err := PendingTerminalOutcomes(cur, cfg)
+	if err != nil {
+		return OrchestratedState{}, err
 	}
-	return dst
+	for _, fact := range pendingOutcomes {
+		if onOutcome != nil {
+			onOutcome(fact)
+		}
+		cur, err = AcknowledgeTerminalOutcomeVerified(cur, fact.Sequence, fact.EventID, cfg)
+		if err != nil {
+			return OrchestratedState{}, err
+		}
+	}
+	// 3. Drain pending player contributions via public query + verified ack.
+	pendingContribs, err := PendingContributionResults(cur, cfg)
+	if err != nil {
+		return OrchestratedState{}, err
+	}
+	for _, item := range pendingContribs {
+		if onContribution != nil {
+			onContribution(item)
+		}
+		cur, err = AcknowledgeContributionVerified(cur, item.Sequence, item.Result.EventID, cfg)
+		if err != nil {
+			return OrchestratedState{}, err
+		}
+	}
+	return cur, nil
 }

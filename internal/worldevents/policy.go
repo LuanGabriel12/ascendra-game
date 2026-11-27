@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	TemplateGoblinRaid  = "goblin-raid-campaign"
-	TemplateOrcWarband  = "orc-warband-campaign"
+	TemplateGoblinRaid = "goblin-raid-campaign"
+	TemplateOrcWarband = "orc-warband-campaign"
 )
 
 // DefaultCampaignPolicies defines the provisional data-driven Goblin and Orc campaign policies.
@@ -21,20 +21,20 @@ const (
 func DefaultCampaignPolicies() []CampaignPolicyTemplate {
 	return []CampaignPolicyTemplate{
 		{
-			TemplateID:                    TemplateGoblinRaid,
-			EventKind:                     EventGoblinRaidCampaign,
-			Family:                        ai.FamilyGoblin,
-			MinFreePopulation:             45,
-			MinThreatScore:                350,
-			ReconTicks:                    6,
-			PrepTicks:                     8,
-			WarningTicks:                  6,
-			DeadlineSlackTicks:            80,
-			RecoverTicks:                  18,
-			RegionCooldownTicks:           55,
-			SettlementCooldownTicks:       45,
-			ReconArchetype:                "goblin-skirmisher",
-			ReconCount:                    1,
+			TemplateID:              TemplateGoblinRaid,
+			EventKind:               EventGoblinRaidCampaign,
+			Family:                  ai.FamilyGoblin,
+			MinFreePopulation:       45,
+			MinThreatScore:          350,
+			ReconTicks:              6,
+			PrepTicks:               8,
+			WarningTicks:            6,
+			DeadlineSlackTicks:      80,
+			RecoverTicks:            18,
+			RegionCooldownTicks:     55,
+			SettlementCooldownTicks: 45,
+			ReconArchetype:          "goblin-skirmisher",
+			ReconCount:              1,
 			MainForces: []ForceUnit{
 				{Archetype: "goblin-raider-pack", Count: 1, Position: 11500},
 				{Archetype: "goblin-taskmaster", Count: 1, Position: 12000},
@@ -47,20 +47,20 @@ func DefaultCampaignPolicies() []CampaignPolicyTemplate {
 			PriorityWeightTerritory:       100,
 		},
 		{
-			TemplateID:                    TemplateOrcWarband,
-			EventKind:                     EventOrcWarbandCampaign,
-			Family:                        ai.FamilyOrc,
-			MinFreePopulation:             65,
-			MinThreatScore:                500,
-			ReconTicks:                    8,
-			PrepTicks:                     12,
-			WarningTicks:                  8,
-			DeadlineSlackTicks:            100,
-			RecoverTicks:                  25,
-			RegionCooldownTicks:           80,
-			SettlementCooldownTicks:       65,
-			ReconArchetype:                "orc-vanguard",
-			ReconCount:                    1,
+			TemplateID:              TemplateOrcWarband,
+			EventKind:               EventOrcWarbandCampaign,
+			Family:                  ai.FamilyOrc,
+			MinFreePopulation:       65,
+			MinThreatScore:          500,
+			ReconTicks:              8,
+			PrepTicks:               12,
+			WarningTicks:            8,
+			DeadlineSlackTicks:      100,
+			RecoverTicks:            25,
+			RegionCooldownTicks:     80,
+			SettlementCooldownTicks: 65,
+			ReconArchetype:          "orc-vanguard",
+			ReconCount:              1,
 			MainForces: []ForceUnit{
 				{Archetype: "orc-vanguard", Count: 1, Position: 11200},
 				{Archetype: "orc-berserker", Count: 1, Position: 11600},
@@ -88,8 +88,13 @@ func DefaultConfig() Config {
 		MaxCandidatesPerUpdate:          16,
 		MaxChainDepth:                   2,
 		MaxEventsPerUpdate:              64,
+		MaxEventsPerBatch:               128,
+		MaxPendingDirectorEvents:        1024,
 		MaxCompletedHistory:             64,
 		MaxOutcomesHistory:              64,
+		MaxPendingOutcomes:              64,
+		MaxPendingContributions:         256,
+		MaxPendingDirectorBatches:       256,
 		MaxCooldownEntries:              64,
 		MaxIdentifierLength:             128,
 		MaxSnapshotBytes:                DefaultMaxSnapshotBytes,

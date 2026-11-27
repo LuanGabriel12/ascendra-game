@@ -7,6 +7,39 @@ import (
 	"strings"
 )
 
+// Each in-flight campaign that can create a chained event owns one scheduler
+// slot until it terminates or produces that event.
+func reservedFollowupSlots(state DirectorState, cfg Config) int {
+	if cfg.MaxChainDepth == 0 {
+		return 0
+	}
+	count := 0
+	for _, campaign := range state.Campaigns {
+		if campaign.State.IsInFlight() && !campaign.TerminalFactEmitted && campaign.ChainDepth < cfg.MaxChainDepth {
+			count++
+		}
+	}
+	return count
+}
+
+// ReleaseCancelledEvents removes only events already marked cancelled. It is a
+// trusted recovery operation that can free scheduler capacity without a tick.
+func ReleaseCancelledEvents(state DirectorState, cfg Config) (DirectorState, int, error) {
+	if err := state.Validate(cfg); err != nil {
+		return DirectorState{}, 0, err
+	}
+	next := state.Clone()
+	kept := make([]ScheduledEvent, 0, len(next.PendingEvents))
+	for _, event := range next.PendingEvents {
+		if !event.Cancelled {
+			kept = append(kept, event)
+		}
+	}
+	removed := len(next.PendingEvents) - len(kept)
+	next.PendingEvents = kept
+	return next, removed, nil
+}
+
 // EnqueueScheduledEvent validates bounds, deadlines, and monotonic EventID generation before
 // inserting a future ScheduledEvent into DirectorState.PendingEvents in canonical order.
 func EnqueueScheduledEvent(
@@ -17,7 +50,7 @@ func EnqueueScheduledEvent(
 	if state == nil {
 		return ScheduledEvent{}, fmt.Errorf("%w: nil director state", ErrInvalidState)
 	}
-	if len(state.PendingEvents) >= cfg.MaxPendingEvents {
+	if len(state.PendingEvents)+reservedFollowupSlots(*state, cfg) >= cfg.MaxPendingEvents {
 		return ScheduledEvent{}, fmt.Errorf("%w: max pending events %d reached", ErrCapacityExceeded, cfg.MaxPendingEvents)
 	}
 	if !ev.Kind.Valid() || !ev.Category.Valid() {
@@ -64,10 +97,12 @@ func effectivePriority(ev ScheduledEvent, cfg Config) int64 {
 
 // processScheduler expires overdue events, ages waiting events to prevent starvation,
 // and dispatches eligible due events in strict deterministic priority order:
-//   highest EffectivePriority -> earliest ScheduledTick -> lexicographically smallest EventID.
+//
+//	highest EffectivePriority -> earliest ScheduledTick -> lexicographically smallest EventID.
 func processScheduler(
 	state *DirectorState,
 	cfg Config,
+	allowCampaignLaunch bool,
 	dirEvents *[]DirectorEvent,
 ) ([]ScheduledEvent, error) {
 	if len(state.PendingEvents) == 0 {
@@ -147,7 +182,7 @@ func processScheduler(
 		isCampaignLaunch := ev.Kind == EventGoblinRaidCampaign || ev.Kind == EventOrcWarbandCampaign
 
 		if isCampaignLaunch {
-			blocked := activeGlobal >= cfg.MaxActiveCampaignsGlobal ||
+			blocked := !allowCampaignLaunch || activeGlobal >= cfg.MaxActiveCampaignsGlobal ||
 				activeByRegion[ev.RegionID] >= cfg.MaxActiveCampaignsPerRegion ||
 				(ev.SettlementID != "" && activeBySettlement[ev.SettlementID] >= cfg.MaxActiveCampaignsPerSettlement) ||
 				!cooldownReady(state.RegionCooldowns, ev.RegionID, state.Tick) ||

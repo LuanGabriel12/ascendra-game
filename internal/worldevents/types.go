@@ -26,6 +26,10 @@ var (
 	ErrInvalidCampaignTransition = errors.New("invalid campaign state transition")
 	ErrCampaignNotFound          = errors.New("campaign not found")
 	ErrCapacityExceeded          = errors.New("world event director capacity exceeded")
+	ErrOutcomeBackpressure       = errors.New("terminal outcome delivery queue is full")
+	ErrContributionBackpressure  = errors.New("contribution delivery queue is full")
+	ErrDirectorBackpressure      = errors.New("director event delivery queue is full")
+	ErrTickEventCapacity         = fmt.Errorf("%w: events from a single tick exceed its limit", ErrCapacityExceeded)
 	ErrNumericOverflow           = errors.New("world event director integer overflow")
 	ErrDuplicateCampaign         = errors.New("duplicate active campaign for target")
 	ErrProtectedTarget           = errors.New("region or settlement is protected")
@@ -58,13 +62,13 @@ func (c EventCategory) Code() uint8 {
 type WorldEventKind string
 
 const (
-	EventGoblinRecon            WorldEventKind = "GoblinRecon"
-	EventGoblinRaidCampaign     WorldEventKind = "GoblinRaidCampaign"
-	EventOrcWarbandCampaign     WorldEventKind = "OrcWarbandCampaign"
-	EventSettlementWarning      WorldEventKind = "SettlementWarning"
-	EventEcologicalScarcity     WorldEventKind = "EcologicalScarcity"
-	EventRecoveryFollowup       WorldEventKind = "RecoveryFollowup"
-	EventReconquestIntent       WorldEventKind = "ReconquestIntent"
+	EventGoblinRecon        WorldEventKind = "GoblinRecon"
+	EventGoblinRaidCampaign WorldEventKind = "GoblinRaidCampaign"
+	EventOrcWarbandCampaign WorldEventKind = "OrcWarbandCampaign"
+	EventSettlementWarning  WorldEventKind = "SettlementWarning"
+	EventEcologicalScarcity WorldEventKind = "EcologicalScarcity"
+	EventRecoveryFollowup   WorldEventKind = "RecoveryFollowup"
+	EventReconquestIntent   WorldEventKind = "ReconquestIntent"
 )
 
 func (k WorldEventKind) Valid() bool {
@@ -250,8 +254,13 @@ type Config struct {
 	MaxCandidatesPerUpdate          int                      `json:"max_candidates_per_update"`
 	MaxChainDepth                   int                      `json:"max_chain_depth"`
 	MaxEventsPerUpdate              int                      `json:"max_events_per_update"`
+	MaxEventsPerBatch               int                      `json:"max_events_per_batch"`
+	MaxPendingDirectorEvents        int                      `json:"max_pending_director_events"`
 	MaxCompletedHistory             int                      `json:"max_completed_history"`
 	MaxOutcomesHistory              int                      `json:"max_outcomes_history"`
+	MaxPendingOutcomes              int                      `json:"max_pending_outcomes"`
+	MaxPendingContributions         int                      `json:"max_pending_contributions"`
+	MaxPendingDirectorBatches       int                      `json:"max_pending_director_batches"`
 	MaxCooldownEntries              int                      `json:"max_cooldown_entries"`
 	MaxIdentifierLength             int                      `json:"max_identifier_length"`
 	MaxSnapshotBytes                int                      `json:"max_snapshot_bytes"`
@@ -273,12 +282,19 @@ func (c Config) Validate() error {
 	}
 	if c.MaxActiveCampaignsGlobal <= 0 || c.MaxActiveCampaignsPerRegion <= 0 || c.MaxActiveCampaignsPerSettlement <= 0 ||
 		c.MaxPendingEvents <= 0 || c.MaxCandidatesPerUpdate <= 0 || c.MaxChainDepth < 0 ||
-		c.MaxEventsPerUpdate <= 0 || c.MaxCompletedHistory <= 0 || c.MaxOutcomesHistory <= 0 ||
+		c.MaxEventsPerUpdate <= 0 || c.MaxEventsPerBatch <= 0 || c.MaxPendingDirectorEvents <= 0 ||
+		c.MaxCompletedHistory <= 0 || c.MaxOutcomesHistory <= 0 || c.MaxPendingOutcomes <= 0 || c.MaxPendingContributions <= 0 || c.MaxPendingDirectorBatches <= 0 ||
 		c.MaxCooldownEntries <= 0 || c.MaxIdentifierLength <= 0 || c.MaxSnapshotBytes <= 0 {
 		return fmt.Errorf("%w: operational capacity limits must be > 0", ErrInvalidConfig)
 	}
+	if c.MaxPendingDirectorEvents < c.MaxEventsPerBatch {
+		return fmt.Errorf("%w: max_pending_director_events (%d) must be >= max_events_per_batch (%d)", ErrInvalidConfig, c.MaxPendingDirectorEvents, c.MaxEventsPerBatch)
+	}
 	if c.PriorityAgingPerTick < 0 || c.MinSimulatedDefenseHP < 0 {
 		return fmt.Errorf("%w: negative aging or defense floor", ErrInvalidConfig)
+	}
+	if c.MaxChainDepth > 0 && c.MaxPendingEvents < 2 {
+		return fmt.Errorf("%w: pending event capacity must allow a campaign and its follow-up", ErrInvalidConfig)
 	}
 	if len(c.Policies) == 0 {
 		return fmt.Errorf("%w: at least one campaign policy template is required", ErrInvalidConfig)
@@ -383,6 +399,7 @@ type CampaignSummary struct {
 // TerminalSettlementOutcome is the authoritative global settlement resolution fact emitted
 // strictly once per resolved invasion — EVEN WHEN ZERO PLAYERS PARTICIPATED (Section 20).
 type TerminalSettlementOutcome struct {
+	Sequence             uint64                `json:"sequence"`
 	EventID              string                `json:"event_id"`
 	SimulationID         string                `json:"simulation_id"`
 	CampaignID           string                `json:"campaign_id"`
@@ -418,6 +435,19 @@ const (
 	DirEventReinforcementDeployed     DirectorEventType = "CampaignReinforcementDeployed"
 	DirEventChainedEventScheduled     DirectorEventType = "ChainedWorldEventScheduled"
 )
+
+// Valid reports whether the DirectorEventType is a recognized canonical event type.
+func (t DirectorEventType) Valid() bool {
+	switch t {
+	case DirEventCandidateScheduled, DirEventCampaignPhaseChanged, DirEventSettlementWarning,
+		DirEventCampaignStarted, DirEventCampaignCancelled, DirEventCampaignExpired,
+		DirEventCampaignCompleted, DirEventSettlementOutcomeRecorded,
+		DirEventReinforcementDeployed, DirEventChainedEventScheduled:
+		return true
+	default:
+		return false
+	}
+}
 
 // DirectorEvent represents an immutable historical fact emitted by the Director on a tick.
 type DirectorEvent struct {
@@ -458,36 +488,58 @@ type DirectorCommand struct {
 }
 
 // DirectorState holds the complete, deterministic, serializable state of the World Event Director.
+type PendingContribution struct {
+	Sequence uint64                   `json:"sequence"`
+	Result   ports.ContributionResult `json:"result"`
+}
+
+// DirectorEventBatch retains every director fact from one committed tick.
+type DirectorEventBatch struct {
+	Sequence uint64          `json:"sequence"`
+	Events   []DirectorEvent `json:"events"`
+}
+
 type DirectorState struct {
-	SimulationID        string                      `json:"simulation_id"`
-	RulesVersion        uint32                      `json:"rules_version"`
-	Tick                uint64                      `json:"tick"`
-	RNG                 simulation.DeterministicRNG `json:"rng"`
-	PendingEvents       []ScheduledEvent            `json:"pending_events"`
-	Campaigns           []Campaign                  `json:"campaigns"`
-	RegionCooldowns     []CooldownEntry             `json:"region_cooldowns"`
-	SettlementCooldowns []CooldownEntry             `json:"settlement_cooldowns"`
-	CompletedHistory    []CampaignSummary           `json:"completed_history"`
-	TerminalOutcomes    []TerminalSettlementOutcome `json:"terminal_outcomes"`
-	CampaignSeq         uint64                      `json:"campaign_seq"`
-	ScheduledEventSeq   uint64                      `json:"scheduled_event_seq"`
-	DirectorEventSeq    uint64                      `json:"director_event_seq"`
-	OutcomeSeq          uint64                      `json:"outcome_seq"`
+	SimulationID           string                      `json:"simulation_id"`
+	RulesVersion           uint32                      `json:"rules_version"`
+	Tick                   uint64                      `json:"tick"`
+	RNG                    simulation.DeterministicRNG `json:"rng"`
+	PendingEvents          []ScheduledEvent            `json:"pending_events"`
+	Campaigns              []Campaign                  `json:"campaigns"`
+	RegionCooldowns        []CooldownEntry             `json:"region_cooldowns"`
+	SettlementCooldowns    []CooldownEntry             `json:"settlement_cooldowns"`
+	CompletedHistory       []CampaignSummary           `json:"completed_history"`
+	TerminalOutcomes       []TerminalSettlementOutcome `json:"terminal_outcomes"`
+	PendingOutcomes        []TerminalSettlementOutcome `json:"pending_outcomes"`
+	OutcomeAckSeq          uint64                      `json:"outcome_ack_seq"`
+	PendingContributions   []PendingContribution       `json:"pending_contributions"`
+	ContributionSeq        uint64                      `json:"contribution_seq"`
+	ContributionAckSeq     uint64                      `json:"contribution_ack_seq"`
+	PendingDirectorBatches []DirectorEventBatch        `json:"pending_director_batches"`
+	DirectorBatchSeq       uint64                      `json:"director_batch_seq"`
+	DirectorBatchAckSeq    uint64                      `json:"director_batch_ack_seq"`
+	CampaignSeq            uint64                      `json:"campaign_seq"`
+	ScheduledEventSeq      uint64                      `json:"scheduled_event_seq"`
+	DirectorEventSeq       uint64                      `json:"director_event_seq"`
+	OutcomeSeq             uint64                      `json:"outcome_seq"`
 }
 
 // NewDirectorState initializes a clean deterministic World Event Director state.
 func NewDirectorState(simulationID string, seed uint64) DirectorState {
 	return DirectorState{
-		SimulationID:        simulationID,
-		RulesVersion:        RulesVersion,
-		Tick:                0,
-		RNG:                 simulation.NewDeterministicRNG(seed),
-		PendingEvents:       []ScheduledEvent{},
-		Campaigns:           []Campaign{},
-		RegionCooldowns:     []CooldownEntry{},
-		SettlementCooldowns: []CooldownEntry{},
-		CompletedHistory:    []CampaignSummary{},
-		TerminalOutcomes:    []TerminalSettlementOutcome{},
+		SimulationID:           simulationID,
+		RulesVersion:           RulesVersion,
+		Tick:                   0,
+		RNG:                    simulation.NewDeterministicRNG(seed),
+		PendingEvents:          []ScheduledEvent{},
+		Campaigns:              []Campaign{},
+		RegionCooldowns:        []CooldownEntry{},
+		SettlementCooldowns:    []CooldownEntry{},
+		CompletedHistory:       []CampaignSummary{},
+		TerminalOutcomes:       []TerminalSettlementOutcome{},
+		PendingOutcomes:        []TerminalSettlementOutcome{},
+		PendingContributions:   []PendingContribution{},
+		PendingDirectorBatches: []DirectorEventBatch{},
 	}
 }
 
@@ -518,6 +570,18 @@ func (s DirectorState) Clone() DirectorState {
 	if out.TerminalOutcomes == nil {
 		out.TerminalOutcomes = []TerminalSettlementOutcome{}
 	}
+	out.PendingOutcomes = slices.Clone(s.PendingOutcomes)
+	if out.PendingOutcomes == nil {
+		out.PendingOutcomes = []TerminalSettlementOutcome{}
+	}
+	out.PendingContributions = slices.Clone(s.PendingContributions)
+	if out.PendingContributions == nil {
+		out.PendingContributions = []PendingContribution{}
+	}
+	out.PendingDirectorBatches = cloneDirectorBatches(s.PendingDirectorBatches)
+	if out.PendingDirectorBatches == nil {
+		out.PendingDirectorBatches = []DirectorEventBatch{}
+	}
 	return out
 }
 
@@ -536,10 +600,79 @@ func (s DirectorState) Validate(cfg Config) error {
 		len(s.RegionCooldowns) > cfg.MaxCooldownEntries ||
 		len(s.SettlementCooldowns) > cfg.MaxCooldownEntries ||
 		len(s.CompletedHistory) > cfg.MaxCompletedHistory ||
-		len(s.TerminalOutcomes) > cfg.MaxOutcomesHistory {
+		len(s.TerminalOutcomes) > cfg.MaxOutcomesHistory || len(s.PendingOutcomes) > cfg.MaxPendingOutcomes || len(s.PendingContributions) > cfg.MaxPendingContributions || len(s.PendingDirectorBatches) > cfg.MaxPendingDirectorBatches {
 		return ErrCapacityExceeded
 	}
+	if len(s.PendingEvents)+reservedFollowupSlots(s, cfg) > cfg.MaxPendingEvents {
+		return fmt.Errorf("%w: mandatory follow-up slots overcommitted", ErrInvalidState)
+	}
+	seenPending := make(map[string]struct{}, len(s.PendingOutcomes))
+	if s.OutcomeAckSeq > s.OutcomeSeq || uint64(len(s.PendingOutcomes)) != s.OutcomeSeq-s.OutcomeAckSeq {
+		return fmt.Errorf("%w: invalid outcome delivery sequence", ErrInvalidState)
+	}
+	for i, outcome := range s.PendingOutcomes {
+		if outcome.Sequence != s.OutcomeAckSeq+uint64(i)+1 {
+			return fmt.Errorf("%w: non-contiguous pending outcomes", ErrInvalidState)
+		}
+		if outcome.EventID == "" || len(outcome.EventID) > cfg.MaxIdentifierLength || outcome.SimulationID != s.SimulationID || !outcome.Outcome.ValidTerminal() || outcome.CompletedTick > s.Tick {
+			return fmt.Errorf("%w: invalid pending terminal outcome", ErrInvalidState)
+		}
+		if _, exists := seenPending[outcome.EventID]; exists {
+			return fmt.Errorf("%w: duplicate pending terminal outcome", ErrInvalidState)
+		}
+		seenPending[outcome.EventID] = struct{}{}
+	}
 
+	if s.ContributionAckSeq > s.ContributionSeq || uint64(len(s.PendingContributions)) != s.ContributionSeq-s.ContributionAckSeq {
+		return fmt.Errorf("%w: invalid contribution delivery sequence", ErrInvalidState)
+	}
+	seenContributions := make(map[string]struct{}, len(s.PendingContributions))
+	for i, pending := range s.PendingContributions {
+		if pending.Sequence != s.ContributionAckSeq+uint64(i)+1 || pending.Result.SimulationID != s.SimulationID || pending.Result.Tick > s.Tick || len(pending.Result.EventID) > cfg.MaxIdentifierLength {
+			return fmt.Errorf("%w: invalid pending contribution sequence", ErrInvalidState)
+		}
+		if err := pending.Result.Validate(); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidState, err)
+		}
+		if _, exists := seenContributions[pending.Result.EventID]; exists {
+			return fmt.Errorf("%w: duplicate pending contribution", ErrInvalidState)
+		}
+		seenContributions[pending.Result.EventID] = struct{}{}
+	}
+	if s.DirectorBatchAckSeq > s.DirectorBatchSeq || uint64(len(s.PendingDirectorBatches)) != s.DirectorBatchSeq-s.DirectorBatchAckSeq {
+		return fmt.Errorf("%w: invalid director batch sequence", ErrInvalidState)
+	}
+	seenDirectorFacts := make(map[string]struct{})
+	totalPendingDirEvents := 0
+	for i, batch := range s.PendingDirectorBatches {
+		if batch.Sequence != s.DirectorBatchAckSeq+uint64(i)+1 || len(batch.Events) == 0 {
+			return fmt.Errorf("%w: invalid director event batch", ErrInvalidState)
+		}
+		if len(batch.Events) > cfg.MaxEventsPerBatch {
+			return fmt.Errorf("%w: director event batch %d exceeds max_events_per_batch %d", ErrCapacityExceeded, batch.Sequence, cfg.MaxEventsPerBatch)
+		}
+		totalPendingDirEvents += len(batch.Events)
+		if totalPendingDirEvents > cfg.MaxPendingDirectorEvents {
+			return fmt.Errorf("%w: total pending director events %d exceeds max %d", ErrCapacityExceeded, totalPendingDirEvents, cfg.MaxPendingDirectorEvents)
+		}
+		for _, event := range batch.Events {
+			if event.EventID == "" || len(event.EventID) > cfg.MaxIdentifierLength || event.SimulationID != s.SimulationID || event.Tick > s.Tick {
+				return fmt.Errorf("%w: invalid pending director event", ErrInvalidState)
+			}
+			if event.Type != "" && !event.Type.Valid() {
+				return fmt.Errorf("%w: invalid pending director event type %q", ErrInvalidState, event.Type)
+			}
+			if event.TerminalOutcome != nil {
+				if event.TerminalOutcome.EventID == "" || event.TerminalOutcome.SimulationID != s.SimulationID || !event.TerminalOutcome.Outcome.ValidTerminal() || event.TerminalOutcome.CompletedTick > s.Tick {
+					return fmt.Errorf("%w: invalid embedded terminal outcome on director event", ErrInvalidState)
+				}
+			}
+			if _, exists := seenDirectorFacts[event.EventID]; exists {
+				return fmt.Errorf("%w: duplicate pending director event", ErrInvalidState)
+			}
+			seenDirectorFacts[event.EventID] = struct{}{}
+		}
+	}
 	activeGlobal := 0
 	activeByRegion := make(map[string]int)
 	activeBySettlement := make(map[string]int)
@@ -714,6 +847,23 @@ func (s DirectorState) Checksum(cfg Config) (string, error) {
 
 	h.WriteUint64(uint64(len(s.TerminalOutcomes)))
 	for _, o := range s.TerminalOutcomes {
+		h.WriteUint64(o.Sequence)
+		h.WriteString(o.EventID)
+		h.WriteString(o.SimulationID)
+		h.WriteString(o.CampaignID)
+		h.WriteString(o.InvasionID)
+		h.WriteString(o.SettlementID)
+		h.WriteString(o.RegionID)
+		h.WriteString(o.InvadingFactionID)
+		h.WriteString(string(o.Outcome))
+		h.WriteUint64(o.StartedTick)
+		h.WriteUint64(o.CompletedTick)
+		h.WriteUint32(o.RulesVersion)
+		h.WriteInt64(int64(o.EligibleContributors))
+	}
+	h.WriteUint64(uint64(len(s.PendingOutcomes)))
+	for _, o := range s.PendingOutcomes {
+		h.WriteUint64(o.Sequence)
 		h.WriteString(o.EventID)
 		h.WriteString(o.SimulationID)
 		h.WriteString(o.CampaignID)
@@ -728,10 +878,65 @@ func (s DirectorState) Checksum(cfg Config) (string, error) {
 		h.WriteInt64(int64(o.EligibleContributors))
 	}
 
+	h.WriteUint64(uint64(len(s.PendingContributions)))
+	for _, p := range s.PendingContributions {
+		c := p.Result
+		h.WriteUint64(p.Sequence)
+		h.WriteString(c.EventID)
+		h.WriteString(c.SimulationID)
+		h.WriteString(c.InvasionID)
+		h.WriteString(c.SettlementID)
+		h.WriteUint64(c.Tick)
+		h.WriteString(c.PlayerID)
+		h.WriteInt64(c.Damage)
+		h.WriteInt64(c.Support)
+		h.WriteInt64(c.Objectives)
+		h.WriteBool(c.Eligible)
+		h.WriteString(string(c.Outcome))
+	}
+	h.WriteUint64(s.ContributionSeq)
+	h.WriteUint64(s.ContributionAckSeq)
+	h.WriteUint64(uint64(len(s.PendingDirectorBatches)))
+	for _, batch := range s.PendingDirectorBatches {
+		h.WriteUint64(batch.Sequence)
+		h.WriteUint64(uint64(len(batch.Events)))
+		for _, event := range batch.Events {
+			h.WriteString(event.EventID)
+			h.WriteString(event.SimulationID)
+			h.WriteUint64(event.Tick)
+			h.WriteString(string(event.Type))
+			h.WriteString(event.CampaignID)
+			h.WriteString(event.RegionID)
+			h.WriteString(event.SettlementID)
+			h.WriteString(event.FactionID)
+			h.WriteString(event.Detail)
+			h.WriteInt64(event.Amount)
+			h.WriteBool(event.TerminalOutcome != nil)
+			if event.TerminalOutcome != nil {
+				o := event.TerminalOutcome
+				h.WriteUint64(o.Sequence)
+				h.WriteString(o.EventID)
+				h.WriteString(o.SimulationID)
+				h.WriteString(o.CampaignID)
+				h.WriteString(o.InvasionID)
+				h.WriteString(o.SettlementID)
+				h.WriteString(o.RegionID)
+				h.WriteString(o.InvadingFactionID)
+				h.WriteString(string(o.Outcome))
+				h.WriteUint64(o.StartedTick)
+				h.WriteUint64(o.CompletedTick)
+				h.WriteUint32(o.RulesVersion)
+				h.WriteInt64(int64(o.EligibleContributors))
+			}
+		}
+	}
+	h.WriteUint64(s.DirectorBatchSeq)
+	h.WriteUint64(s.DirectorBatchAckSeq)
 	h.WriteUint64(s.CampaignSeq)
 	h.WriteUint64(s.ScheduledEventSeq)
 	h.WriteUint64(s.DirectorEventSeq)
 	h.WriteUint64(s.OutcomeSeq)
+	h.WriteUint64(s.OutcomeAckSeq)
 	return h.SumHex(), nil
 }
 

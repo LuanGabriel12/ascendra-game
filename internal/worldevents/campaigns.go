@@ -293,14 +293,16 @@ func advanceCampaigns(
 			if err != nil {
 				return err
 			}
-			res, resEv, created, err := ecosystem.CreateReservation(eco, ecosystem.ReservationRequest{
-				IdempotencyKey: "camp-res:" + c.CampaignID,
-				CampaignID:     c.CampaignID,
-				CampID:         c.SourceCampID,
-				Amount:         reqPop,
-				CreatedTick:    nextTick,
-				ExpiryTick:     c.DeadlineTick,
-			}, cfg.Ecosystem)
+			if eco.ReservationSeq == math.MaxUint64 {
+				return ErrNumericOverflow
+			}
+			res, resEv, created, err := ecosystem.CreateSequencedReservation(eco, ecosystem.ReservationRequest{
+				CampaignID:  c.CampaignID,
+				CampID:      c.SourceCampID,
+				Amount:      reqPop,
+				CreatedTick: nextTick,
+				ExpiryTick:  c.DeadlineTick,
+			}, eco.ReservationSeq+1, cfg.Ecosystem)
 			if err != nil {
 				if errors.Is(err, ecosystem.ErrInsufficientPopulation) || errors.Is(err, ecosystem.ErrCampUnavailable) || errors.Is(err, ecosystem.ErrCapacityExceeded) {
 					if abortErr := abortPreActiveCampaign(c, CampaignCancelled, err.Error(), dir, eco, w, cfg, worldCmds, dirEvents, ecoEvents); abortErr != nil {
@@ -666,6 +668,9 @@ func finalizeResolvedCampaigns(
 
 	// 4. Emit authoritative TerminalSettlementOutcome strictly once — EVEN WITH ZERO PLAYERS.
 	if !c.TerminalFactEmitted {
+		if len(dir.PendingOutcomes) >= cfg.Director.MaxPendingOutcomes {
+			return ErrOutcomeBackpressure
+		}
 		if dir.OutcomeSeq == math.MaxUint64 {
 			return ErrNumericOverflow
 		}
@@ -681,6 +686,7 @@ func finalizeResolvedCampaigns(
 			outID = fmt.Sprintf("out:%06d", dir.OutcomeSeq)
 		}
 		fact := TerminalSettlementOutcome{
+			Sequence:             dir.OutcomeSeq,
 			EventID:              outID,
 			SimulationID:         dir.SimulationID,
 			CampaignID:           c.CampaignID,
@@ -695,6 +701,7 @@ func finalizeResolvedCampaigns(
 			EligibleContributors: eligible,
 		}
 		c.TerminalFactEmitted = true
+		dir.PendingOutcomes = append(dir.PendingOutcomes, fact)
 		dir.TerminalOutcomes = append(dir.TerminalOutcomes, fact)
 		if len(dir.TerminalOutcomes) > cfg.Director.MaxOutcomesHistory {
 			dir.TerminalOutcomes = append([]TerminalSettlementOutcome(nil), dir.TerminalOutcomes[len(dir.TerminalOutcomes)-cfg.Director.MaxOutcomesHistory:]...)
@@ -755,7 +762,7 @@ func finalizeResolvedCampaigns(
 		}
 
 		// Bounded depth-capped chained follow-up (never triggers an immediate second invasion).
-		if c.ChainDepth < cfg.Director.MaxChainDepth && len(dir.PendingEvents) < cfg.Director.MaxPendingEvents {
+		if c.ChainDepth < cfg.Director.MaxChainDepth {
 			followKind := EventRecoveryFollowup
 			followDelay := tpl.RecoverTicks
 			if outcome == ports.InvasionOutcomeCaptured {
@@ -837,7 +844,16 @@ func archiveCompletedCampaigns(dir *DirectorState, eco *ecosystem.EcosystemState
 	}
 	dir.Campaigns = kept
 	if archivedAny {
-		ecosystem.PruneClosedReservations(eco, 8, cfg.Ecosystem.MaxRetiredReservationKeys)
+		// Diagnostic retention must not consume the slots needed by active
+		// campaigns, especially under intentionally small capacities.
+		retainClosed := min(8, max(0, cfg.Ecosystem.MaxReservations-cfg.Director.MaxActiveCampaignsGlobal))
+		protected := make([]string, 0, len(dir.Campaigns))
+		for _, campaign := range dir.Campaigns {
+			if campaign.ReservationID != "" {
+				protected = append(protected, campaign.ReservationID)
+			}
+		}
+		ecosystem.PruneClosedReservationsExcept(eco, retainClosed, cfg.Ecosystem.MaxRetiredReservationKeys, protected)
 	}
 }
 
