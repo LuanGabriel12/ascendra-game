@@ -170,7 +170,9 @@ export async function startPostgresTestContext(): Promise<RunningPostgresTestCon
     async stop(): Promise<void> {
       await currentPool.end();
       await embedded.stop();
-      await rm(tempDir, { recursive: true, force: true });
+      await rm(tempDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 200 }).catch(
+        () => undefined,
+      );
     },
   };
 }

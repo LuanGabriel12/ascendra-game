@@ -16,7 +16,8 @@
     "migrate:down:all": "node --import tsx src/scripts/migrate.ts down:all",
     "migrate:status": "node --import tsx src/scripts/migrate.ts status",
     "demo:session02": "node --import tsx src/scripts/demo-session-02.ts",
-    "demo:session03": "node --import tsx src/scripts/demo-session-03.ts"
+    "demo:session03": "node --import tsx src/scripts/demo-session-03.ts",
+    "demo:session04": "node --import tsx src/scripts/demo-session-04.ts"
   },
   "dependencies": {
     "pg": "^8.23.1",

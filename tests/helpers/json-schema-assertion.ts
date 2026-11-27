@@ -11,6 +11,7 @@ export interface JsonSchemaNode {
   readonly required?: ReadonlyArray<string>;
   readonly additionalProperties?: boolean;
   readonly properties?: Readonly<Record<string, JsonSchemaNode>>;
+  readonly items?: JsonSchemaNode;
   readonly minLength?: number;
   readonly maxLength?: number;
   readonly pattern?: string;
@@ -153,6 +154,15 @@ export function validateAgainstJsonSchema(
         for (const err of sub.errors) {
           errors.push(`${key}: ${err}`);
         }
+      }
+    }
+  }
+
+  if (Array.isArray(candidate) && currentSchema.items !== undefined) {
+    for (let idx = 0; idx < candidate.length; idx++) {
+      const sub = validateAgainstJsonSchema(rootSchema, candidate[idx], currentSchema.items);
+      for (const err of sub.errors) {
+        errors.push(`[${idx}]: ${err}`);
       }
     }
   }

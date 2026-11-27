@@ -117,9 +117,9 @@ describe("CARBON Session 03 — Persistent Characters, Attributes, Progression &
       ],
     );
 
-    // Apply incremental 0004 & 0005 without touching or breaking legacy contribution!
+    // Apply incremental 0004+ without touching or breaking legacy contribution!
     const newlyApplied = await migrateUp(pgCtx.pool, MIGRATIONS_DIR);
-    assert.deepEqual(newlyApplied, [
+    assert.deepEqual(newlyApplied.slice(0, 2), [
       "0004_peoples_catalog_and_progression_rules",
       "0005_accounts_characters_attributes_and_progression",
     ]);
