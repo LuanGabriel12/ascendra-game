@@ -2,6 +2,7 @@ package ecosystem_test
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 
@@ -361,5 +362,244 @@ func TestCompleteReservationAndValidationEdgeCases(t *testing.T) {
 		CampaignID: "cmp-d", CampID: stDestroyed.Camps[0].CampID, Amount: 5, CreatedTick: 1, ExpiryTick: 20,
 	}, cfg); !errors.Is(err, ecosystem.ErrCampUnavailable) {
 		t.Fatalf("expected ErrCampUnavailable for destroyed camp, got %v", err)
+	}
+}
+
+func TestReservationReplayAfterRetirementLimit(t *testing.T) {
+	cfg := ecosystem.DefaultConfig()
+	st := ecosystem.NewDefaultEcosystemState("bounded-idempotency", 77)
+	req := ecosystem.ReservationRequest{CampaignID: "campaign", CampID: "camp-thornveil-warren", Amount: 1, CreatedTick: 1, ExpiryTick: 9}
+	for i := 0; i < cfg.MaxRetiredReservationKeys+1; i++ {
+		req.IdempotencyKey = fmt.Sprintf("key-%03d", i)
+		res, _, created, err := ecosystem.CreateReservation(&st, req, cfg)
+		if err != nil || !created {
+			t.Fatalf("create %d: %v", i, err)
+		}
+		if _, _, err = ecosystem.CancelReservation(&st, res.ReservationID, false); err != nil {
+			t.Fatal(err)
+		}
+		ecosystem.PruneClosedReservations(&st, 0, cfg.MaxRetiredReservationKeys)
+	}
+	beforeFree, beforeReserved, beforeMat := ecosystem.TotalPopulationLedger(st)
+	req.IdempotencyKey = "key-000"
+	if _, _, created, err := ecosystem.CreateReservation(&st, req, cfg); created || !errors.Is(err, ecosystem.ErrDuplicateReservation) {
+		t.Fatalf("old key replay accepted: created=%v err=%v", created, err)
+	}
+	afterFree, afterReserved, afterMat := ecosystem.TotalPopulationLedger(st)
+	if beforeFree != afterFree || beforeReserved != afterReserved || beforeMat != afterMat {
+		t.Fatal("replay mutated ledger")
+	}
+	req.IdempotencyKey = fmt.Sprintf("key-%03d", cfg.MaxRetiredReservationKeys)
+	req.ExpiryTick++
+	if _, _, _, err := ecosystem.CreateReservation(&st, req, cfg); !errors.Is(err, ecosystem.ErrReservationConflict) {
+		t.Fatalf("conflicting tick accepted: %v", err)
+	}
+	if len(st.RetiredReservationKeys) != cfg.MaxRetiredReservationKeys || len(st.Reservations) != 1 {
+		t.Fatal("closed key lost when ring filled")
+	}
+}
+
+func TestReservationStateRejectsForgedIdentities(t *testing.T) {
+	cfg := ecosystem.DefaultConfig()
+	st := ecosystem.NewDefaultEcosystemState("identity-check", 1)
+	req := ecosystem.ReservationRequest{IdempotencyKey: "unique", CampaignID: "campaign", CampID: "camp-thornveil-warren", Amount: 1, CreatedTick: 1, ExpiryTick: 10}
+	_, _, _, err := ecosystem.CreateReservation(&st, req, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := st.Clone()
+	forged.Reservations[0].ReservationID = "res:identity-check:999999"
+	if err := forged.Validate(cfg); err == nil {
+		t.Fatal("forged sequence accepted")
+	}
+	forged = st.Clone()
+	forged.RetiredReservationKeys = []string{"unique"}
+	if err := forged.Validate(cfg); err == nil {
+		t.Fatal("active and retired key collision accepted")
+	}
+}
+
+func TestRecoveryReproducesClosedReservationCapacityExhaustion(t *testing.T) {
+	cfg := ecosystem.DefaultConfig()
+	cfg.MaxRetiredReservationKeys = 2
+	cfg.MaxReservations = 2
+	st := ecosystem.NewDefaultEcosystemState("recovery-repro", 1)
+	initialFree, initialReserved, initialMaterialized := ecosystem.TotalPopulationLedger(st)
+	for i := 0; i < 4; i++ {
+		req := ecosystem.ReservationRequest{IdempotencyKey: fmt.Sprintf("recovery-%d", i), CampaignID: fmt.Sprintf("campaign-%d", i), CampID: "camp-thornveil-warren", Amount: 1, CreatedTick: uint64(i + 1), ExpiryTick: uint64(i + 10)}
+		res, _, created, err := ecosystem.CreateReservation(&st, req, cfg)
+		if err != nil || !created {
+			t.Fatalf("reserve %d: %v", i, err)
+		}
+		if _, _, err = ecosystem.CancelReservation(&st, res.ReservationID, false); err != nil {
+			t.Fatal(err)
+		}
+		ecosystem.PruneClosedReservations(&st, 0, cfg.MaxRetiredReservationKeys)
+	}
+	next := ecosystem.ReservationRequest{IdempotencyKey: "new-valid", CampaignID: "new-campaign", CampID: "camp-thornveil-warren", Amount: 1, CreatedTick: 9, ExpiryTick: 19}
+	for i := 0; i < 2; i++ {
+		_, _, _, err := ecosystem.CreateReservation(&st, next, cfg)
+		if !errors.Is(err, ecosystem.ErrCapacityExceeded) {
+			t.Fatalf("expected capacity exhaustion, got %v", err)
+		}
+		ecosystem.PruneClosedReservations(&st, 0, cfg.MaxRetiredReservationKeys)
+	}
+	free, reserved, materialized := ecosystem.TotalPopulationLedger(st)
+	if free != initialFree || reserved != initialReserved || materialized != initialMaterialized {
+		t.Fatal("reproduction changed population")
+	}
+}
+
+func TestSequencedReservationsRemainBoundedAfterTwoThousandCycles(t *testing.T) {
+	cfg := ecosystem.DefaultConfig()
+	cfg.MaxReservations = 2
+	cfg.MaxRetiredReservationKeys = 2
+	st := ecosystem.NewDefaultEcosystemState("sequenced-recovery", 1)
+	initialFree, initialReserved, initialMaterialized := ecosystem.TotalPopulationLedger(st)
+	var first ecosystem.ReservationRequest
+	for i := uint64(1); i <= 2000; i++ {
+		req := ecosystem.ReservationRequest{CampaignID: fmt.Sprintf("c-%d", i), CampID: "camp-thornveil-warren", Amount: 6, CreatedTick: i, ExpiryTick: i + 1}
+		if i == 1 {
+			first = req
+		}
+		res, _, created, err := ecosystem.CreateSequencedReservation(&st, req, i, cfg)
+		if err != nil || !created {
+			t.Fatalf("create %d: %v", i, err)
+		}
+		_, _, err = ecosystem.MaterializeFromReservation(&st, res.ReservationID, "materialize", "goblin-raider-pack", 1, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = ecosystem.ReconcileReservationContingent(&st, res.ReservationID, "return", 6, 400, 400, false, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = ecosystem.CompleteReservation(&st, res.ReservationID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ecosystem.PruneClosedReservations(&st, 0, cfg.MaxRetiredReservationKeys)
+		free, reserved, materialized := ecosystem.TotalPopulationLedger(st)
+		if free != initialFree || reserved != initialReserved || materialized != initialMaterialized || len(st.Reservations) != 0 {
+			t.Fatalf("ledger or retention failed at %d", i)
+		}
+	}
+	if _, _, created, err := ecosystem.CreateSequencedReservation(&st, first, 1, cfg); created || !errors.Is(err, ecosystem.ErrDuplicateReservation) {
+		t.Fatalf("old sequence replay: %v", err)
+	}
+	raw, err := st.MarshalSnapshot(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := ecosystem.UnmarshalSnapshot(raw, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, created, err := ecosystem.CreateSequencedReservation(&restored, first, 1, cfg); created || !errors.Is(err, ecosystem.ErrDuplicateReservation) {
+		t.Fatalf("replay after restore: %v", err)
+	}
+	req := ecosystem.ReservationRequest{CampaignID: "c-next", CampID: "camp-thornveil-warren", Amount: 1, CreatedTick: 2001, ExpiryTick: 2002}
+	if _, _, created, err := ecosystem.CreateSequencedReservation(&restored, req, 2001, cfg); !created || err != nil {
+		t.Fatalf("next valid operation: %v", err)
+	}
+}
+
+func TestSequencedReservationEnforcesContiguousOrderAndRetry(t *testing.T) {
+	cfg := ecosystem.DefaultConfig()
+	st := ecosystem.NewDefaultEcosystemState("sequenced-order", 1)
+	req := ecosystem.ReservationRequest{CampaignID: "campaign", CampID: "camp-thornveil-warren", Amount: 1, CreatedTick: 1, ExpiryTick: 10}
+	if _, _, _, err := ecosystem.CreateSequencedReservation(&st, req, 2, cfg); !errors.Is(err, ecosystem.ErrInvalidCommand) {
+		t.Fatalf("sequence gap: %v", err)
+	}
+	res, _, created, err := ecosystem.CreateSequencedReservation(&st, req, 1, cfg)
+	if err != nil || !created {
+		t.Fatal(err)
+	}
+	duplicate, _, created, err := ecosystem.CreateSequencedReservation(&st, req, 1, cfg)
+	if err != nil || created || duplicate.ReservationID != res.ReservationID {
+		t.Fatalf("retry: %v", err)
+	}
+	altered := req
+	altered.Amount = 2
+	if _, _, _, err = ecosystem.CreateSequencedReservation(&st, altered, 1, cfg); !errors.Is(err, ecosystem.ErrReservationConflict) {
+		t.Fatalf("conflicting retry: %v", err)
+	}
+	forged := req
+	forged.IdempotencyKey = "ordered-reservation:2"
+	if _, _, _, err = ecosystem.CreateReservation(&st, forged, cfg); !errors.Is(err, ecosystem.ErrInvalidCommand) {
+		t.Fatalf("reserved namespace accepted: %v", err)
+	}
+}
+
+func TestSequencedReservationAtCounterLimit(t *testing.T) {
+	cfg := ecosystem.DefaultConfig()
+	st := ecosystem.NewDefaultEcosystemState("seq-limit", 1)
+	st.ReservationSeq = math.MaxUint64
+	beforeFree, beforeReserved, beforeMat := ecosystem.TotalPopulationLedger(st)
+	req := ecosystem.ReservationRequest{CampaignID: "c", CampID: "camp-thornveil-warren", Amount: 1, CreatedTick: 1, ExpiryTick: 2}
+	_, _, created, err := ecosystem.CreateSequencedReservation(&st, req, math.MaxUint64, cfg)
+	if created || !errors.Is(err, ecosystem.ErrDuplicateReservation) {
+		t.Fatalf("counter wrap: %v", err)
+	}
+	free, reserved, mat := ecosystem.TotalPopulationLedger(st)
+	if free != beforeFree || reserved != beforeReserved || mat != beforeMat {
+		t.Fatal("overflow mutated ledger")
+	}
+}
+
+func BenchmarkSequencedReservationRecovery(b *testing.B) {
+	cfg := ecosystem.DefaultConfig()
+	st := ecosystem.NewDefaultEcosystemState("bench-sequenced", 1)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		seq := st.ReservationSeq + 1
+		req := ecosystem.ReservationRequest{CampaignID: "campaign", CampID: "camp-thornveil-warren", Amount: 6, CreatedTick: seq, ExpiryTick: seq + 1}
+		reservation, _, _, err := ecosystem.CreateSequencedReservation(&st, req, seq, cfg)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, _, err = ecosystem.MaterializeFromReservation(&st, reservation.ReservationID, "materialize", "goblin-raider-pack", 1, cfg); err != nil {
+			b.Fatal(err)
+		}
+		if _, _, err = ecosystem.ReconcileReservationContingent(&st, reservation.ReservationID, "return", 6, 400, 400, false, cfg); err != nil {
+			b.Fatal(err)
+		}
+		if _, _, err = ecosystem.CompleteReservation(&st, reservation.ReservationID); err != nil {
+			b.Fatal(err)
+		}
+		ecosystem.PruneClosedReservations(&st, 0, cfg.MaxRetiredReservationKeys)
+	}
+}
+
+func TestSequencedPruningProgressWithUnprunableLegacyReservation(t *testing.T) {
+	cfg := ecosystem.DefaultConfig()
+	cfg.MaxReservations = 2
+	cfg.MaxRetiredReservationKeys = 1
+	st := ecosystem.NewDefaultEcosystemState("mixed-sequence", 1)
+	for i := 0; i < 2; i++ {
+		req := ecosystem.ReservationRequest{IdempotencyKey: fmt.Sprintf("legacy-%d", i), CampaignID: fmt.Sprintf("legacy-c-%d", i), CampID: "camp-thornveil-warren", Amount: 1, CreatedTick: uint64(i + 1), ExpiryTick: 10}
+		res, _, _, err := ecosystem.CreateReservation(&st, req, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := ecosystem.CancelReservation(&st, res.ReservationID, false); err != nil {
+			t.Fatal(err)
+		}
+		ecosystem.PruneClosedReservations(&st, 0, cfg.MaxRetiredReservationKeys)
+	}
+	for i := 0; i < 10; i++ {
+		seq := st.ReservationSeq + 1
+		req := ecosystem.ReservationRequest{CampaignID: fmt.Sprintf("new-%d", i), CampID: "camp-thornveil-warren", Amount: 1, CreatedTick: seq, ExpiryTick: seq + 1}
+		res, _, created, err := ecosystem.CreateSequencedReservation(&st, req, seq, cfg)
+		if err != nil || !created {
+			t.Fatalf("create %d: %v", i, err)
+		}
+		if _, _, err := ecosystem.CancelReservation(&st, res.ReservationID, false); err != nil {
+			t.Fatal(err)
+		}
+		ecosystem.PruneClosedReservations(&st, 0, cfg.MaxRetiredReservationKeys)
+		if len(st.Reservations) != 1 {
+			t.Fatalf("prune retained %d reservations", len(st.Reservations))
+		}
 	}
 }

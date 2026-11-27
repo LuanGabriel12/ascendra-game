@@ -120,21 +120,21 @@ func TestSnapshotRoundTripBoundsAndTamperRejection(t *testing.T) {
 	}
 
 	// Tampered payload with original checksum must fail checksum verification.
-	tampered := []byte(`{"schema_version":4,"checksum":"` + sum + `","payload":{"tick":50,"hp":999,"active":true,"flags":7,"name":"valewatch"}}`)
+	tampered := []byte(`{"schema_version":5,"checksum":"` + sum + `","payload":{"tick":50,"hp":999,"active":true,"flags":7,"name":"valewatch"}}`)
 	_, err = simulation.DecodeSnapshot(tampered, checksumSample)
 	if !errors.Is(err, simulation.ErrSnapshotChecksumMismatch) {
 		t.Fatalf("expected ErrSnapshotChecksumMismatch, got %v", err)
 	}
 
 	// Missing checksum rejected.
-	noSum := []byte(`{"schema_version":4,"checksum":"","payload":{"tick":50,"hp":900,"active":true,"flags":7,"name":"valewatch"}}`)
+	noSum := []byte(`{"schema_version":5,"checksum":"","payload":{"tick":50,"hp":900,"active":true,"flags":7,"name":"valewatch"}}`)
 	_, err = simulation.DecodeSnapshot(noSum, checksumSample)
 	if !errors.Is(err, simulation.ErrInvalidSnapshot) {
 		t.Fatalf("expected ErrInvalidSnapshot for missing checksum, got %v", err)
 	}
 
 	// Older v1/v2/v3 and future v99 schema versions must fail explicitly.
-	for _, ver := range []string{"1", "2", "3", "99"} {
+	for _, ver := range []string{"1", "2", "3", "4", "99"} {
 		badVer := []byte(`{"schema_version":` + ver + `,"checksum":"` + sum + `","payload":{"tick":50,"hp":900,"active":true,"flags":7,"name":"valewatch"}}`)
 		_, err = simulation.DecodeSnapshot(badVer, checksumSample)
 		if !errors.Is(err, simulation.ErrUnsupportedSnapshotVersion) {
@@ -143,7 +143,7 @@ func TestSnapshotRoundTripBoundsAndTamperRejection(t *testing.T) {
 	}
 
 	// Unknown JSON fields rejected.
-	unknown := []byte(`{"schema_version":4,"checksum":"` + sum + `","extra":1,"payload":{"tick":50,"hp":900,"active":true,"flags":7,"name":"valewatch"}}`)
+	unknown := []byte(`{"schema_version":5,"checksum":"` + sum + `","extra":1,"payload":{"tick":50,"hp":900,"active":true,"flags":7,"name":"valewatch"}}`)
 	_, err = simulation.DecodeSnapshot(unknown, checksumSample)
 	if !errors.Is(err, simulation.ErrInvalidSnapshot) {
 		t.Fatalf("expected ErrInvalidSnapshot for unknown field, got %v", err)
@@ -164,7 +164,7 @@ func FuzzSnapshotDecode(f *testing.F) {
 
 	f.Add(validRaw)
 	f.Add([]byte(`{}`))
-	f.Add([]byte(`{"schema_version":4,"checksum":"abc","payload":{"tick":1,"hp":-1,"name":"x"}}`))
+	f.Add([]byte(`{"schema_version":5,"checksum":"abc","payload":{"tick":1,"hp":-1,"name":"x"}}`))
 	f.Add([]byte(`not-json`))
 
 	f.Fuzz(func(t *testing.T, data []byte) {

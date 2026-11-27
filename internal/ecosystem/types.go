@@ -295,27 +295,27 @@ type Region struct {
 // Population models an abstract regional creature population.
 // Total living population = FreePopulation + MaterializedPopulation.
 type Population struct {
-	PopulationID          string    `json:"population_id"`
-	RegionID              string    `json:"region_id"`
-	SpeciesID             string    `json:"species_id"`
-	FamilyID              ai.Family `json:"family_id"`
-	FactionID             string    `json:"faction_id"`
+	PopulationID           string    `json:"population_id"`
+	RegionID               string    `json:"region_id"`
+	SpeciesID              string    `json:"species_id"`
+	FamilyID               ai.Family `json:"family_id"`
+	FactionID              string    `json:"faction_id"`
 	FreePopulation         int64     `json:"free_population"`
 	ReservedPopulation     int64     `json:"reserved_population,omitempty"`
 	MaterializedPopulation int64     `json:"materialized_population"`
 	CarryingCapacity       int64     `json:"carrying_capacity"`
-	GrowthRateBP          int64     `json:"growth_rate_bp"`
-	MortalityRateBP       int64     `json:"mortality_rate_bp"`
-	GrowthResidualBP      int64     `json:"growth_residual_bp"`
-	MortalityResidualBP   int64     `json:"mortality_residual_bp"`
-	FoodPerCapitaMilli    int64     `json:"food_per_capita_milli"`
-	WoodPerCapitaMilli    int64     `json:"wood_per_capita_milli"`
-	OrePerCapitaMilli     int64     `json:"ore_per_capita_milli"`
-	WaterPerCapitaMilli   int64     `json:"water_per_capita_milli"`
-	StrengthPerIndividual int64     `json:"strength_per_individual"`
-	ScarcityBP            int64     `json:"scarcity_bp"`
-	MigrationPressureBP   int64     `json:"migration_pressure_bp"`
-	ActiveCampCount       int       `json:"active_camp_count"`
+	GrowthRateBP           int64     `json:"growth_rate_bp"`
+	MortalityRateBP        int64     `json:"mortality_rate_bp"`
+	GrowthResidualBP       int64     `json:"growth_residual_bp"`
+	MortalityResidualBP    int64     `json:"mortality_residual_bp"`
+	FoodPerCapitaMilli     int64     `json:"food_per_capita_milli"`
+	WoodPerCapitaMilli     int64     `json:"wood_per_capita_milli"`
+	OrePerCapitaMilli      int64     `json:"ore_per_capita_milli"`
+	WaterPerCapitaMilli    int64     `json:"water_per_capita_milli"`
+	StrengthPerIndividual  int64     `json:"strength_per_individual"`
+	ScarcityBP             int64     `json:"scarcity_bp"`
+	MigrationPressureBP    int64     `json:"migration_pressure_bp"`
+	ActiveCampCount        int       `json:"active_camp_count"`
 }
 
 // TotalSize returns FreePopulation + ReservedPopulation + MaterializedPopulation safely.
@@ -485,8 +485,8 @@ func (c Config) Validate() error {
 
 // CampCooldownRecord tracks cooldown after a camp is destroyed before recreating in the same region/faction.
 type CampCooldownRecord struct {
-	Key              string `json:"key"` // "<region_id>|<faction_id>"
-	ReadyAtEpoch     uint64 `json:"ready_at_epoch"`
+	Key          string `json:"key"` // "<region_id>|<faction_id>"
+	ReadyAtEpoch uint64 `json:"ready_at_epoch"`
 }
 
 // EcosystemState is the complete, deterministic, serializable macro ecological state.
@@ -734,6 +734,17 @@ func (s EcosystemState) Validate(cfg Config) error {
 	// Validate population reservations and cross-check ReservedPopulation ledger strictly.
 	expectedReserved := make(map[string]int64, len(s.Populations))
 	expectedResMat := make(map[string]int64, len(s.Populations))
+	seenReservationSeq := make(map[uint64]struct{}, len(s.Reservations))
+	seenReservationKeys := make(map[string]struct{}, len(s.Reservations)+len(s.RetiredReservationKeys))
+	for _, key := range s.RetiredReservationKeys {
+		if strings.TrimSpace(key) == "" || len(key) > cfg.MaxIdentifierLength {
+			return fmt.Errorf("%w: invalid retired reservation key", ErrInvalidState)
+		}
+		if _, exists := seenReservationKeys[key]; exists {
+			return fmt.Errorf("%w: duplicate retired reservation key", ErrInvalidState)
+		}
+		seenReservationKeys[key] = struct{}{}
+	}
 	for i, r := range s.Reservations {
 		if err := r.Validate(cfg.MaxIdentifierLength); err != nil {
 			return err
@@ -743,6 +754,19 @@ func (s EcosystemState) Validate(cfg Config) error {
 		}
 		if r.Seq > s.ReservationSeq {
 			return fmt.Errorf("%w: reservation %q seq %d exceeds ReservationSeq %d", ErrInvalidState, r.ReservationID, r.Seq, s.ReservationSeq)
+		}
+		if _, exists := seenReservationSeq[r.Seq]; exists {
+			return fmt.Errorf("%w: duplicate reservation sequence %d", ErrInvalidState, r.Seq)
+		}
+		seenReservationSeq[r.Seq] = struct{}{}
+		if r.ReservationID != fmt.Sprintf("res:%s:%06d", s.SimulationID, r.Seq) {
+			return fmt.Errorf("%w: reservation identity does not match sequence", ErrInvalidState)
+		}
+		if r.IdempotencyKey != "" {
+			if _, exists := seenReservationKeys[r.IdempotencyKey]; exists {
+				return fmt.Errorf("%w: duplicate reservation key", ErrInvalidState)
+			}
+			seenReservationKeys[r.IdempotencyKey] = struct{}{}
 		}
 		if len(r.AppliedOps) > cfg.MaxOpsPerReservation {
 			return fmt.Errorf("%w: reservation %q applied ops exceed limit", ErrCapacityExceeded, r.ReservationID)
@@ -952,17 +976,17 @@ func UnmarshalSnapshot(data []byte, cfg Config) (EcosystemState, error) {
 type EventType string
 
 const (
-	EventPopulationGrew             EventType = "PopulationGrew"
-	EventPopulationDeclined         EventType = "PopulationDeclined"
-	EventResourceDepleted           EventType = "ResourceDepleted"
-	EventResourceRegenerated        EventType = "ResourceRegenerated"
-	EventCampEstablished            EventType = "CampEstablished"
-	EventCampExpanded               EventType = "CampExpanded"
-	EventCampAbandoned              EventType = "CampAbandoned"
-	EventCampDestroyed              EventType = "CampDestroyed"
-	EventPopulationMigrated         EventType = "PopulationMigrated"
+	EventPopulationGrew              EventType = "PopulationGrew"
+	EventPopulationDeclined          EventType = "PopulationDeclined"
+	EventResourceDepleted            EventType = "ResourceDepleted"
+	EventResourceRegenerated         EventType = "ResourceRegenerated"
+	EventCampEstablished             EventType = "CampEstablished"
+	EventCampExpanded                EventType = "CampExpanded"
+	EventCampAbandoned               EventType = "CampAbandoned"
+	EventCampDestroyed               EventType = "CampDestroyed"
+	EventPopulationMigrated          EventType = "PopulationMigrated"
 	EventTerritorialInfluenceChanged EventType = "TerritorialInfluenceChanged"
-	EventRegionalThreatChanged      EventType = "RegionalThreatChanged"
+	EventRegionalThreatChanged       EventType = "RegionalThreatChanged"
 	EventCreatureGroupMaterialized   EventType = "CreatureGroupMaterialized"
 	EventCreatureGroupDematerialized EventType = "CreatureGroupDematerialized"
 	EventPopulationReserved          EventType = "PopulationReserved"
@@ -971,14 +995,14 @@ const (
 
 // EcologicalEvent represents an immutable deterministic event emitted during an epoch or handoff.
 type EcologicalEvent struct {
-	EventID    string    `json:"event_id"`
-	Type       EventType `json:"type"`
-	RegionID   string    `json:"region_id"`
-	Epoch      uint64    `json:"epoch"`
-	EntityID   string    `json:"entity_id"`
-	TargetID   string    `json:"target_id,omitempty"`
-	Detail     string    `json:"detail,omitempty"`
-	Amount     int64     `json:"amount,omitempty"`
+	EventID  string    `json:"event_id"`
+	Type     EventType `json:"type"`
+	RegionID string    `json:"region_id"`
+	Epoch    uint64    `json:"epoch"`
+	EntityID string    `json:"entity_id"`
+	TargetID string    `json:"target_id,omitempty"`
+	Detail   string    `json:"detail,omitempty"`
+	Amount   int64     `json:"amount,omitempty"`
 }
 
 // CommandKind enumerates explicit ecological epoch commands.

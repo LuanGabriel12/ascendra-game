@@ -121,6 +121,9 @@ func (r PopulationReservation) Validate(maxIDLen int) error {
 	if r.IdempotencyKey != "" && len(r.IdempotencyKey) > maxIDLen {
 		return fmt.Errorf("%w: reservation %q idempotency_key too long", ErrInvalidState, r.ReservationID)
 	}
+	if strings.HasPrefix(r.IdempotencyKey, "ordered-reservation:") && r.IdempotencyKey != fmt.Sprintf("ordered-reservation:%d", r.Seq) {
+		return fmt.Errorf("%w: ordered reservation key does not match sequence", ErrInvalidState)
+	}
 	if r.ExpiryTick < r.CreatedTick {
 		return fmt.Errorf("%w: reservation %q expiry_tick < created_tick", ErrInvalidState, r.ReservationID)
 	}
@@ -164,6 +167,23 @@ func CreateReservation(
 	req ReservationRequest,
 	cfg Config,
 ) (PopulationReservation, EcologicalEvent, bool, error) {
+	if strings.HasPrefix(req.IdempotencyKey, "ordered-reservation:") {
+		return PopulationReservation{}, EcologicalEvent{}, false, fmt.Errorf("%w: reserved idempotency key namespace", ErrInvalidCommand)
+	}
+	return createReservation(state, req, cfg, 0)
+}
+
+// CreateSequencedReservation accepts the next contiguous, engine-assigned operation
+// sequence. A retry must use its original sequence. Older pruned sequences fail closed.
+func CreateSequencedReservation(state *EcosystemState, req ReservationRequest, sequence uint64, cfg Config) (PopulationReservation, EcologicalEvent, bool, error) {
+	if sequence == 0 || req.IdempotencyKey != "" {
+		return PopulationReservation{}, EcologicalEvent{}, false, fmt.Errorf("%w: sequence and empty external key required", ErrInvalidCommand)
+	}
+	req.IdempotencyKey = fmt.Sprintf("ordered-reservation:%d", sequence)
+	return createReservation(state, req, cfg, sequence)
+}
+
+func createReservation(state *EcosystemState, req ReservationRequest, cfg Config, sequence uint64) (PopulationReservation, EcologicalEvent, bool, error) {
 	if state == nil {
 		return PopulationReservation{}, EcologicalEvent{}, false, fmt.Errorf("%w: nil ecosystem state", ErrInvalidState)
 	}
@@ -187,7 +207,7 @@ func CreateReservation(
 	if req.IdempotencyKey != "" {
 		for _, existing := range state.Reservations {
 			if existing.IdempotencyKey == req.IdempotencyKey {
-				if existing.CampaignID == req.CampaignID && existing.CampID == req.CampID && existing.ReservedAmount == req.Amount {
+				if existing.CampaignID == req.CampaignID && existing.CampID == req.CampID && existing.ReservedAmount == req.Amount && existing.CreatedTick == req.CreatedTick && existing.ExpiryTick == req.ExpiryTick {
 					return existing, EcologicalEvent{}, false, nil
 				}
 				return PopulationReservation{}, EcologicalEvent{}, false, fmt.Errorf("%w: key %q", ErrReservationConflict, req.IdempotencyKey)
@@ -195,6 +215,14 @@ func CreateReservation(
 		}
 		if slices.Contains(state.RetiredReservationKeys, req.IdempotencyKey) {
 			return PopulationReservation{}, EcologicalEvent{}, false, fmt.Errorf("%w: retired key %q", ErrDuplicateReservation, req.IdempotencyKey)
+		}
+	}
+	if sequence != 0 {
+		if sequence <= state.ReservationSeq {
+			return PopulationReservation{}, EcologicalEvent{}, false, ErrDuplicateReservation
+		}
+		if state.ReservationSeq == math.MaxUint64 || sequence != state.ReservationSeq+1 {
+			return PopulationReservation{}, EcologicalEvent{}, false, fmt.Errorf("%w: reservation sequence must be contiguous", ErrInvalidCommand)
 		}
 	}
 
@@ -607,9 +635,16 @@ func CompleteReservation(state *EcosystemState, reservationID string) (int64, Ec
 // while retaining bounded retired idempotency keys and keeping ReservationSeq strictly monotonic.
 // Any stale ReservationID pruned from state.Reservations can never be reapplied.
 func PruneClosedReservations(state *EcosystemState, maxRetainedClosed int, maxRetiredKeys int) {
+	PruneClosedReservationsExcept(state, maxRetainedClosed, maxRetiredKeys, nil)
+}
+
+// PruneClosedReservationsExcept preserves reservations still referenced by
+// live campaigns, even when they are already closed.
+func PruneClosedReservationsExcept(state *EcosystemState, maxRetainedClosed int, maxRetiredKeys int, protectedIDs []string) {
 	if state == nil || len(state.Reservations) == 0 {
 		return
 	}
+	maxRetainedClosed = max(0, maxRetainedClosed)
 	closedIndices := make([]int, 0)
 	for i, r := range state.Reservations {
 		if r.IsClosed() {
@@ -621,17 +656,26 @@ func PruneClosedReservations(state *EcosystemState, maxRetainedClosed int, maxRe
 	}
 	toRemove := len(closedIndices) - maxRetainedClosed
 	removeSet := make(map[int]struct{}, toRemove)
-	for i := 0; i < toRemove; i++ {
-		idx := closedIndices[i]
-		removeSet[idx] = struct{}{}
-		if key := state.Reservations[idx].IdempotencyKey; key != "" && maxRetiredKeys > 0 {
-			if !slices.Contains(state.RetiredReservationKeys, key) {
-				state.RetiredReservationKeys = append(state.RetiredReservationKeys, key)
-				if len(state.RetiredReservationKeys) > maxRetiredKeys {
-					state.RetiredReservationKeys = append([]string(nil), state.RetiredReservationKeys[len(state.RetiredReservationKeys)-maxRetiredKeys:]...)
-				}
-			}
+	for _, idx := range closedIndices {
+		if len(removeSet) >= toRemove {
+			break
 		}
+		if slices.Contains(protectedIDs, state.Reservations[idx].ReservationID) {
+			continue
+		}
+		if key := state.Reservations[idx].IdempotencyKey; strings.HasPrefix(key, "ordered-reservation:") && key == fmt.Sprintf("ordered-reservation:%d", state.Reservations[idx].Seq) {
+			// ReservationSeq prevents an older sequence being accepted again.
+		} else if key != "" && maxRetiredKeys > 0 {
+			if !slices.Contains(state.RetiredReservationKeys, key) {
+				if len(state.RetiredReservationKeys) >= maxRetiredKeys {
+					continue
+				}
+				state.RetiredReservationKeys = append(state.RetiredReservationKeys, key)
+			}
+		} else if key != "" {
+			continue
+		}
+		removeSet[idx] = struct{}{}
 	}
 	kept := make([]PopulationReservation, 0, len(state.Reservations)-toRemove)
 	for i, r := range state.Reservations {

@@ -68,6 +68,7 @@ func FuzzEcosystemSnapshotDecode(f *testing.F) {
 	f.Add(valid)
 	f.Add([]byte(`{}`))
 	f.Add([]byte(`{"schema_version":4,"checksum":"deadbeef","payload":{}}`))
+	f.Add([]byte(`{"schema_version":5,"checksum":"deadbeef","payload":{}}`))
 	f.Add([]byte(`corrupt`))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
