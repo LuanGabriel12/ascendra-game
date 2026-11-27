@@ -61,9 +61,15 @@ func runAllScenarios(out io.Writer) error {
 		return err
 	}
 
-	// 3. Run Cycle 04 World Event Director Scenarios A-I.
+	// 3. Run Cycle 04 World Event Director Scenarios A-I & Consumer Harness J-N.
 	if err := runWorldEventScenarios(logger, reader); err != nil {
 		logger.Error("world_event_scenario_failed", slog.String("error", err.Error()))
+		return err
+	}
+
+	// 4. Run Cycle 05 Invasion, Siege & Settlement Battle Scenarios A-J.
+	if err := runSiegeScenarios(logger, reader); err != nil {
+		logger.Error("siege_scenario_failed", slog.String("error", err.Error()))
 		return err
 	}
 	return nil
@@ -425,6 +431,73 @@ func runWorldEventScenarios(logger *slog.Logger, reader *memory.SettlementReader
 			slog.Int("contributions_acked", sum.ContributionsAcked),
 			slog.Int("backpressure_pauses", sum.BackpressurePauses),
 			slog.Int("redeliveries_deduped", sum.RedeliveriesDeduped),
+			slog.Int64("free_population", sum.FreePopulationTotal),
+			slog.Int64("reserved_population", sum.ReservedPopTotal),
+			slog.Int64("materialized_population", sum.MaterializedPopTotal),
+			slog.Int("snapshot_bytes", sum.SnapshotBytes),
+			slog.Bool("snapshot_verified", sum.SnapshotVerified),
+			slog.String("checksum", sum.FinalChecksum),
+			slog.Duration("duration", time.Since(start)),
+		)
+	}
+	return nil
+}
+
+func runSiegeScenarios(logger *slog.Logger, reader *memory.SettlementReader) error {
+	ctx := context.Background()
+	runners := []func(context.Context, *memory.SettlementReader) (worldevents.SiegeScenarioSummary, worldevents.RunResult, error){
+		func(c context.Context, r *memory.SettlementReader) (worldevents.SiegeScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunSiegeScenarioA(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.SiegeScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunSiegeScenarioB(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.SiegeScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunSiegeScenarioC(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.SiegeScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunSiegeScenarioD(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.SiegeScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunSiegeScenarioE(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.SiegeScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunSiegeScenarioF(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.SiegeScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunSiegeScenarioG(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.SiegeScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunSiegeScenarioH(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.SiegeScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunSiegeScenarioI(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.SiegeScenarioSummary, worldevents.RunResult, error) {
+			return worldevents.RunSiegeScenarioJ(c, r)
+		},
+	}
+	for _, fn := range runners {
+		start := time.Now()
+		sum, _, err := fn(ctx, reader)
+		if err != nil {
+			return err
+		}
+		logger.Info("siege_scenario_completed",
+			slog.String("event", "siege_scenario_completed"),
+			slog.String("scenario", sum.Name),
+			slog.String("simulation_id", sum.SimulationID),
+			slog.Uint64("tick", sum.FinalTick),
+			slog.String("outcome", string(sum.Outcome)),
+			slog.String("siege_phase", string(sum.SiegePhase)),
+			slog.Int("structures_destroyed", sum.StructuresDestroyed),
+			slog.Int("districts_captured", sum.DistrictsCaptured),
+			slog.Int("waves_mobilized", sum.WavesMobilized),
+			slog.Bool("commander_fallen", sum.CommanderFallen),
+			slog.Int("repairs_applied", sum.RepairsApplied),
+			slog.Int64("supplies_spent", sum.SuppliesSpent),
+			slog.Int("backpressure_pauses", sum.BackpressurePauses),
+			slog.Bool("occupation_recorded", sum.OccupationRecorded),
 			slog.Int64("free_population", sum.FreePopulationTotal),
 			slog.Int64("reserved_population", sum.ReservedPopTotal),
 			slog.Int64("materialized_population", sum.MaterializedPopTotal),
