@@ -746,6 +746,16 @@ export class PgInventoryTransactionScope {
     return res.rows.map(mapStackRow);
   }
 
+  public async listContainerStacks(containerId: string): Promise<ReadonlyArray<InventoryStack>> {
+    const res = await this.client.query<StackRow>(
+      `SELECT * FROM inventory_stacks
+       WHERE container_id = $1
+       ORDER BY container_slot_index ASC`,
+      [containerId],
+    );
+    return res.rows.map(mapStackRow);
+  }
+
   public async insertStack(stack: InventoryStack): Promise<void> {
     await this.client.query(
       `INSERT INTO inventory_stacks (
@@ -1203,7 +1213,12 @@ export class PostgresInventoryRepository {
     return res.rows.map(mapStackRow);
   }
 
-  public async listCharacterLedger(characterId: string): Promise<ReadonlyArray<ItemLedgerRecord>> {
+  public async listCharacterLedger(
+    characterId: string,
+    options?: { readonly limit?: number | undefined },
+  ): Promise<ReadonlyArray<ItemLedgerRecord>> {
+    const rawLimit = options?.limit ?? 1000;
+    const safeLimit = Math.max(1, Math.min(5000, Math.trunc(rawLimit)));
     const res = await this.pool.query<{
       id: string;
       ledger_seq: string;
@@ -1225,8 +1240,9 @@ export class PostgresInventoryRepository {
     }>(
       `SELECT * FROM item_operation_ledger
        WHERE character_id = $1 OR counterparty_character_id = $1
-       ORDER BY ledger_seq ASC`,
-      [characterId],
+       ORDER BY ledger_seq ASC
+       LIMIT $2`,
+      [characterId, safeLimit],
     );
     return res.rows.map((r) => ({
       id: r.id,

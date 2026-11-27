@@ -7,10 +7,13 @@ import {
 import type { Logger } from "../../../shared/observability/logger.js";
 import type { CompetitiveNormalizationProfile } from "../../peoples/domain/character-snapshot-proposal.js";
 import {
+  assertAccountActive,
   assertNotGenesisContext,
   type AuthorityPrincipal,
+  type Character,
 } from "../../characters/domain/character.js";
 import {
+  AccountNotFoundError,
   CharacterBuildConflictError,
   CharacterCompetitiveLockedError,
   CharacterNotFoundError,
@@ -202,6 +205,20 @@ export interface InventoryEngineDependencies {
     | undefined;
 }
 
+async function assertAuthorizedActiveCharacterAndAccount(
+  charScope: PgCharacterTransactionScope,
+  character: Character,
+  principal: AuthorityPrincipal,
+): Promise<void> {
+  character.assertOwnedByOrSystem(principal);
+  character.assertActiveStatus();
+  const account = await charScope.lockAccountById(character.accountId);
+  if (!account) {
+    throw new AccountNotFoundError(character.accountId);
+  }
+  assertAccountActive(account);
+}
+
 export class InventoryEngineService {
   private readonly pool: PgPool;
   private readonly unitOfWork: PostgresInventoryUnitOfWork;
@@ -249,6 +266,7 @@ export class InventoryEngineService {
       rarity_code: cmd.rarityCode,
       origin_type: cmd.originType,
       origin_reference: cmd.originReference.trim(),
+      server_seed: serverSeed,
     });
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
@@ -517,14 +535,11 @@ export class InventoryEngineService {
       );
 
       if (claim.status === "duplicate_verified") {
-        const currentStacks = await scope.client.query(
-          "SELECT * FROM inventory_stacks WHERE container_id = $1 ORDER BY container_slot_index ASC",
-          [bag.id],
-        );
+        const currentStacks = await scope.listContainerStacks(bag.id);
         return {
           status: "duplicate_idempotent",
           duplicate: true,
-          data: currentStacks.rows as unknown as ReadonlyArray<InventoryStack>,
+          data: currentStacks,
         };
       }
 
@@ -610,30 +625,43 @@ export class InventoryEngineService {
         }
       }
 
-      await scope.client.query(
-        `INSERT INTO item_grants (
-           id, processed_event_id, external_grant_id, source_event_id,
-           recipient_character_id, reward_slot_index, grant_kind,
-           stack_id, definition_code, definition_version,
-           quantity, origin_type, origin_reference, payload_fingerprint
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, 'material_stack', $7, $8, $9, $10, $11, $12, $13)`,
-        [
-          randomUUID(),
-          claim.eventUuid,
-          grantKey,
-          sourceEventId,
-          recipient.id,
-          rewardSlotIndex,
-          touchedStacks[0]?.id ?? null,
-          def.definitionCode,
-          def.definitionVersion,
-          cmd.quantity,
-          cmd.originType,
-          cmd.originReference.trim(),
-          fingerprint,
-        ],
-      );
+      try {
+        await scope.client.query(
+          `INSERT INTO item_grants (
+             id, processed_event_id, external_grant_id, source_event_id,
+             recipient_character_id, reward_slot_index, grant_kind,
+             stack_id, definition_code, definition_version,
+             quantity, origin_type, origin_reference, payload_fingerprint
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, 'material_stack', $7, $8, $9, $10, $11, $12, $13)`,
+          [
+            randomUUID(),
+            claim.eventUuid,
+            grantKey,
+            sourceEventId,
+            recipient.id,
+            rewardSlotIndex,
+            touchedStacks[0]?.id ?? null,
+            def.definitionCode,
+            def.definitionVersion,
+            cmd.quantity,
+            cmd.originType,
+            cmd.originReference.trim(),
+            fingerprint,
+          ],
+        );
+      } catch (err) {
+        if (
+          err instanceof pg.DatabaseError &&
+          err.code === "23505" &&
+          err.constraint === "uq_item_grants_boss_reward_slot"
+        ) {
+          throw new ItemGenerationInvalidError(
+            `Duplicate reward slot (${sourceEventId}, ${recipient.id}, ${rewardSlotIndex}) rejected.`,
+          );
+        }
+        throw err;
+      }
 
       await scope.appendLedger({
         operationId: grantKey,
@@ -702,6 +730,12 @@ export class InventoryEngineService {
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      await assertAuthorizedActiveCharacterAndAccount(charScope, character, cmd.principal);
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -716,12 +750,6 @@ export class InventoryEngineService {
         payloadFingerprint: fingerprint,
         canonicalPayload: canonicalJson,
       });
-
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
-      character.assertOwnedByOrSystem(cmd.principal);
 
       const lockedMap = await scope.lockStacksInCanonicalOrder([cmd.sourceStackId, newStackId]);
       if (claim.status === "duplicate_verified") {
@@ -847,6 +875,12 @@ export class InventoryEngineService {
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      await assertAuthorizedActiveCharacterAndAccount(charScope, character, cmd.principal);
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -861,12 +895,6 @@ export class InventoryEngineService {
         payloadFingerprint: fingerprint,
         canonicalPayload: canonicalJson,
       });
-
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
-      character.assertOwnedByOrSystem(cmd.principal);
 
       const locked = await scope.lockStacksInCanonicalOrder([
         cmd.sourceStackId,
@@ -988,6 +1016,12 @@ export class InventoryEngineService {
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      await assertAuthorizedActiveCharacterAndAccount(charScope, character, cmd.principal);
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -1002,12 +1036,6 @@ export class InventoryEngineService {
         payloadFingerprint: fingerprint,
         canonicalPayload: canonicalJson,
       });
-
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
-      character.assertOwnedByOrSystem(cmd.principal);
 
       if (claim.status === "duplicate_verified") {
         return {
@@ -1139,6 +1167,12 @@ export class InventoryEngineService {
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      await assertAuthorizedActiveCharacterAndAccount(charScope, character, cmd.principal);
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -1153,12 +1187,6 @@ export class InventoryEngineService {
         payloadFingerprint: fingerprint,
         canonicalPayload: canonicalJson,
       });
-
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
-      character.assertOwnedByOrSystem(cmd.principal);
 
       const rules = (await scope.loadGenerationRules(1))!;
       const { bag, activeLoadout } = await scope.ensureAndLockPrimaryContainers(
@@ -1397,6 +1425,12 @@ export class InventoryEngineService {
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      await assertAuthorizedActiveCharacterAndAccount(charScope, character, cmd.principal);
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -1411,12 +1445,6 @@ export class InventoryEngineService {
         payloadFingerprint: fingerprint,
         canonicalPayload: canonicalJson,
       });
-
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
-      character.assertOwnedByOrSystem(cmd.principal);
 
       const rules = (await scope.loadGenerationRules(1))!;
       const { bag, activeLoadout } = await scope.ensureAndLockPrimaryContainers(
@@ -1546,6 +1574,12 @@ export class InventoryEngineService {
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      await assertAuthorizedActiveCharacterAndAccount(charScope, character, cmd.principal);
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -1560,12 +1594,6 @@ export class InventoryEngineService {
         payloadFingerprint: fingerprint,
         canonicalPayload: canonicalJson,
       });
-
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
-      character.assertOwnedByOrSystem(cmd.principal);
 
       const rules = (await scope.loadGenerationRules(1))!;
       await scope.ensureAndLockPrimaryContainers(character.id, rules.defaultInventoryCapacity);
@@ -1584,6 +1612,38 @@ export class InventoryEngineService {
             slots,
           },
         };
+      }
+
+      if (character.competitiveLockState === "in_ranked_series") {
+        throw new CharacterCompetitiveLockedError(character.id);
+      }
+
+      // Guard against overwriting ANY currently active loadout (including 'Principal' or a previously activated preset)
+      const conflictingLoadoutsRes = await scope.client.query<{
+        id: string;
+        name: string;
+        is_active: boolean;
+        version: number;
+      }>(
+        `SELECT id, name, is_active, version
+         FROM equipment_loadouts
+         WHERE character_id = $1::uuid
+           AND (id = $2::uuid OR name = $3)
+         FOR UPDATE`,
+        [character.id, loadoutId, loadoutName],
+      );
+
+      for (const row of conflictingLoadoutsRes.rows) {
+        if (row.is_active) {
+          throw new LoadoutInvalidError(
+            `Cannot overwrite currently active loadout '${row.name}' via saveInactiveLoadout; use equipItem/unequipItem or activate another loadout first.`,
+          );
+        }
+        if (row.id !== loadoutId && row.name === loadoutName) {
+          throw new LoadoutInvalidError(
+            `Loadout name '${loadoutName}' is already in use on character '${character.id}'.`,
+          );
+        }
       }
 
       const existingCountRes = await scope.client.query<{ total: string }>(
@@ -1686,6 +1746,12 @@ export class InventoryEngineService {
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      await assertAuthorizedActiveCharacterAndAccount(charScope, character, cmd.principal);
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -1700,12 +1766,6 @@ export class InventoryEngineService {
         payloadFingerprint: fingerprint,
         canonicalPayload: canonicalJson,
       });
-
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
-      character.assertOwnedByOrSystem(cmd.principal);
 
       const rules = (await scope.loadGenerationRules(1))!;
       const { bag, activeLoadout } = await scope.ensureAndLockPrimaryContainers(
@@ -2150,22 +2210,8 @@ export class InventoryEngineService {
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
-      const claim = await scope.claimOrVerifyEvent({
-        eventUuid,
-        externalEventId: commandKey,
-        idempotencyKey: commandKey,
-        eventType: "ItemTransferred",
-        eventVersion: 1,
-        source: "carbon.inventory",
-        correlationUuid: eventUuid,
-        aggregateUuid: cmd.itemInstanceId,
-        occurredAt: now,
-        receivedAt: now,
-        payloadFingerprint: fingerprint,
-        canonicalPayload: canonicalJson,
-      });
 
-      // Canonical ascending UUID lock order across both characters to prevent deadlocks!
+      // Canonical ascending UUID lock order across both characters BEFORE inbox claim!
       const orderedCharIds = [cmd.fromCharacterId, cmd.toCharacterId].sort();
       const char1 = await charScope.lockCharacterById(orderedCharIds[0]!);
       const char2 =
@@ -2182,7 +2228,37 @@ export class InventoryEngineService {
       if (!toChar) {
         throw new CharacterNotFoundError(cmd.toCharacterId);
       }
+
       fromChar.assertOwnedByOrSystem(cmd.principal);
+      fromChar.assertActiveStatus();
+      toChar.assertActiveStatus();
+
+      // Lock involved accounts in canonical ascending UUID order to prevent deadlocks
+      const orderedAccountIds = Array.from(
+        new Set([fromChar.accountId, toChar.accountId]),
+      ).sort();
+      for (const accId of orderedAccountIds) {
+        const acc = await charScope.lockAccountById(accId);
+        if (!acc) {
+          throw new AccountNotFoundError(accId);
+        }
+        assertAccountActive(acc);
+      }
+
+      const claim = await scope.claimOrVerifyEvent({
+        eventUuid,
+        externalEventId: commandKey,
+        idempotencyKey: commandKey,
+        eventType: "ItemTransferred",
+        eventVersion: 1,
+        source: "carbon.inventory",
+        correlationUuid: eventUuid,
+        aggregateUuid: cmd.itemInstanceId,
+        occurredAt: now,
+        receivedAt: now,
+        payloadFingerprint: fingerprint,
+        canonicalPayload: canonicalJson,
+      });
 
       const inst = await scope.lockItemInstanceById(cmd.itemInstanceId);
       if (!inst) {
@@ -2191,6 +2267,13 @@ export class InventoryEngineService {
 
       if (claim.status === "duplicate_verified") {
         return { status: "duplicate_idempotent", duplicate: true, data: inst };
+      }
+
+      if (fromChar.competitiveLockState === "in_ranked_series") {
+        throw new CharacterCompetitiveLockedError(fromChar.id);
+      }
+      if (toChar.competitiveLockState === "in_ranked_series") {
+        throw new CharacterCompetitiveLockedError(toChar.id);
       }
 
       if (inst.ownerCharacterId !== fromChar.id) {
@@ -2297,6 +2380,12 @@ export class InventoryEngineService {
 
     return this.unitOfWork.executeInTransaction(async (scope) => {
       const charScope = new PgCharacterTransactionScope(this.pool, scope.client);
+      const character = await charScope.lockCharacterById(cmd.characterId);
+      if (!character) {
+        throw new CharacterNotFoundError(cmd.characterId);
+      }
+      await assertAuthorizedActiveCharacterAndAccount(charScope, character, cmd.principal);
+
       const claim = await scope.claimOrVerifyEvent({
         eventUuid,
         externalEventId: commandKey,
@@ -2312,18 +2401,15 @@ export class InventoryEngineService {
         canonicalPayload: canonicalJson,
       });
 
-      const character = await charScope.lockCharacterById(cmd.characterId);
-      if (!character) {
-        throw new CharacterNotFoundError(cmd.characterId);
-      }
-      character.assertOwnedByOrSystem(cmd.principal);
-
       const inst = await scope.lockItemInstanceById(cmd.itemInstanceId);
       if (!inst) {
         throw new ItemInstanceNotFoundError(cmd.itemInstanceId);
       }
       if (claim.status === "duplicate_verified") {
         return { status: "duplicate_idempotent", duplicate: true, data: inst };
+      }
+      if (character.competitiveLockState === "in_ranked_series") {
+        throw new CharacterCompetitiveLockedError(character.id);
       }
       if (inst.ownerCharacterId !== character.id) {
         throw new ItemOwnershipForbiddenError("Item does not belong to character.");
