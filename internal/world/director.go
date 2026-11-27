@@ -8,6 +8,7 @@ import (
 
 	"ascendra-game/internal/ai"
 	"ascendra-game/internal/ports"
+	"ascendra-game/internal/siege"
 	"ascendra-game/internal/simulation"
 )
 
@@ -106,6 +107,21 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 				return WorldState{}, nil, err
 			}
 
+		case CmdMoveDefenderZone:
+			if err := applyMoveDefenderZone(&next, cmd, cfg); err != nil {
+				return WorldState{}, nil, err
+			}
+
+		case CmdConfigureSiege, CmdDirectorConfigureSiege:
+			if err := applyConfigureSiege(&next, cmd, cfg, &events); err != nil {
+				return WorldState{}, nil, err
+			}
+
+		case CmdDirectorScheduleSiegeWave:
+			if err := applyScheduleSiegeWave(&next, cmd, cfg, &events); err != nil {
+				return WorldState{}, nil, err
+			}
+
 		case CmdIncreaseThreat:
 			if cmd.Delta <= 0 {
 				return WorldState{}, nil, fmt.Errorf("%w: threat delta must be > 0, got %d", ErrInvalidCommand, cmd.Delta)
@@ -144,7 +160,16 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 			}
 
 		case CmdPlayerSupportDefense:
-			if err := applyPlayerSupportDefense(&next, cmd, cfg); err != nil {
+			if next.Siege != nil {
+				if err := applySiegeSupportDefense(&next, cmd, cfg, &events); err != nil {
+					return WorldState{}, nil, err
+				}
+			} else if err := applyPlayerSupportDefense(&next, cmd, cfg); err != nil {
+				return WorldState{}, nil, err
+			}
+
+		case CmdPlayerRepairStructure:
+			if err := applyPlayerRepairStructure(&next, cmd, cfg, &events); err != nil {
 				return WorldState{}, nil, err
 			}
 
@@ -198,10 +223,20 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 		}
 	}
 
-	// 3. Creature AI Engine: perception, O(G log G) collective coordination, morale,
-	// territoriality, typed target selection, target memory, and bounded reinforcement requests.
+	// 3. Tactical combat execution:
+	//    - When WorldState.Siege is configured and the invasion is UnderAttack, the integrated
+	//      Siege Engine executes zone-graph combat, structure damage/breaches, tower fire,
+	//      NPC defenders, district capture, authoritative objectives, and single tactical resolution.
+	//    - Otherwise (Siege == nil or peaceful territoriality), run the Cycle 01-04 Creature AI loop.
 	invasionActive := next.Invasion.State == InvasionUnderAttack
-	if len(next.Groups) > 0 {
+	siegeResolved := false
+	if next.Siege != nil && invasionActive {
+		var err error
+		siegeResolved, err = stepSiegeTactics(&next, cfg, &events, &fallenCommanders)
+		if err != nil {
+			return WorldState{}, nil, err
+		}
+	} else if len(next.Groups) > 0 {
 		perceivedTargets := buildPerceivedTargets(&next)
 		snapshots := make([]ai.GroupSnapshot, len(next.Groups))
 		profiles := make([]ai.Profile, len(next.Groups))
@@ -465,7 +500,8 @@ func Step(state WorldState, commands []Command, cfg Config) (WorldState, []Domai
 	}
 
 	// 5. Authoritative invasion resolution check (Defended or Captured).
-	if next.Invasion.State == InvasionUnderAttack {
+	// When Siege is active, stepSiegeTactics is the sole resolver so there are never two authorities.
+	if next.Invasion.State == InvasionUnderAttack && next.Siege == nil && !siegeResolved {
 		if next.SettlementDefenseHP == 0 {
 			if err := resolveInvasion(&next, ports.InvasionOutcomeCaptured, cfg, &events); err != nil {
 				return WorldState{}, nil, err
@@ -732,12 +768,36 @@ func applyDeployDefender(next *WorldState, cmd Command, cfg Config) error {
 	if cmd.Position < 0 || cmd.Position > cfg.MaxBattlefieldDistance {
 		return fmt.Errorf("%w: defender position %d out of [0, %d]", ErrInvalidCommand, cmd.Position, cfg.MaxBattlefieldDistance)
 	}
+	zoneID := ""
+	pos := cmd.Position
+	if next.Siege != nil {
+		if cmd.ZoneID != "" {
+			if next.Siege.FindZoneIndex(cmd.ZoneID) < 0 {
+				return fmt.Errorf("%w: unknown siege zone %q", ErrUnknownEntity, cmd.ZoneID)
+			}
+			zoneID = cmd.ZoneID
+			if p, ok := siege.PositionForZone(*next.Siege, zoneID); ok {
+				pos = p
+			}
+		} else {
+			zoneID = siege.ZoneForPosition(*next.Siege, pos)
+		}
+	}
 	idx := findDefenderIndex(next.Defenders, cmd.PlayerID)
 	if idx >= 0 {
+		if next.Defenders[idx].IsNPC {
+			return fmt.Errorf("%w: gameplay command cannot redeploy NPC defender %q", ErrUnauthorizedCommand, cmd.PlayerID)
+		}
 		if next.Defenders[idx].HP == 0 {
 			return fmt.Errorf("%w: defender %q is defeated and cannot reposition", ErrDeadEntity, cmd.PlayerID)
 		}
-		next.Defenders[idx].Position = cmd.Position
+		if next.Siege != nil && zoneID != "" && next.Defenders[idx].ZoneID != "" && next.Defenders[idx].ZoneID != zoneID {
+			if !siege.CanTraverse(*next.Siege, next.Defenders[idx].ZoneID, zoneID, false) {
+				return fmt.Errorf("%w: cannot teleport defender from %q to %q", siege.ErrZoneBlocked, next.Defenders[idx].ZoneID, zoneID)
+			}
+			next.Defenders[idx].ZoneID = zoneID
+		}
+		next.Defenders[idx].Position = pos
 		return nil
 	}
 	if len(next.Defenders) >= cfg.MaxDefenders {
@@ -750,8 +810,11 @@ func applyDeployDefender(next *WorldState, cmd Command, cfg Config) error {
 		PlayerID:    cmd.PlayerID,
 		HP:          cfg.DefenderBaseHP,
 		MaxHP:       cfg.DefenderBaseHP,
-		Position:    cmd.Position,
+		Position:    pos,
 		ThreatScore: 0,
+		Role:        siege.RolePlayer,
+		ZoneID:      zoneID,
+		IsNPC:       false,
 	})
 	return nil
 }
@@ -798,6 +861,23 @@ func applySpawnHostileGroup(next *WorldState, cmd Command, cfg Config, events *[
 		}
 		spawnPos = cmd.Position
 	}
+	groupZoneID := ""
+	if next.Siege != nil {
+		if cmd.ZoneID != "" {
+			if next.Siege.FindZoneIndex(cmd.ZoneID) < 0 {
+				return fmt.Errorf("%w: unknown spawn zone %q", ErrUnknownEntity, cmd.ZoneID)
+			}
+			groupZoneID = cmd.ZoneID
+			if p, ok := siege.PositionForZone(*next.Siege, groupZoneID); ok {
+				spawnPos = p
+				if cmd.HomePosition == 0 {
+					homePos = p
+				}
+			}
+		} else {
+			groupZoneID = siege.ZoneForPosition(*next.Siege, spawnPos)
+		}
+	}
 
 	group := CreatureGroup{
 		GroupID:                cmd.GroupID,
@@ -816,6 +896,7 @@ func applySpawnHostileGroup(next *WorldState, cmd Command, cfg Config, events *[
 		MaxReinforcementCalls:  prof.MaxReinforcementCalls,
 		RecentDamageTaken:      0,
 		Routed:                 false,
+		ZoneID:                 groupZoneID,
 	}
 	next.Groups = insertGroupSorted(next.Groups, group)
 	next.Invasion.TotalGroupsSpawned++
@@ -830,8 +911,16 @@ func applyPlayerDefendStrike(next *WorldState, cmd Command, cfg Config, events *
 	if strings.TrimSpace(cmd.PlayerID) == "" || strings.TrimSpace(cmd.TargetGroupID) == "" {
 		return fmt.Errorf("%w: player_id and target_group_id are required", ErrInvalidCommand)
 	}
-	if defIdx := findDefenderIndex(next.Defenders, cmd.PlayerID); defIdx >= 0 && next.Defenders[defIdx].HP == 0 {
-		return fmt.Errorf("%w: defender %q is defeated", ErrDeadEntity, cmd.PlayerID)
+	defIdx := findDefenderIndex(next.Defenders, cmd.PlayerID)
+	if defIdx >= 0 {
+		if next.Defenders[defIdx].IsNPC {
+			return fmt.Errorf("%w: gameplay command cannot act as NPC defender %q", ErrUnauthorizedCommand, cmd.PlayerID)
+		}
+		if next.Defenders[defIdx].HP == 0 {
+			return fmt.Errorf("%w: defender %q is defeated", ErrDeadEntity, cmd.PlayerID)
+		}
+	} else if next.Siege != nil {
+		return fmt.Errorf("%w: player %q must be deployed into a siege zone before striking", ErrUnknownEntity, cmd.PlayerID)
 	}
 	if err := checkAndSetPlayerCooldown(next, cmd.PlayerID, cfg.PlayerAttackCooldown, cfg.MaxPlayerCooldowns); err != nil {
 		return err
@@ -844,6 +933,9 @@ func applyPlayerDefendStrike(next *WorldState, cmd Command, cfg Config, events *
 	target := &next.Groups[idx]
 	if target.HP == 0 || target.State == ai.StateDead || target.Routed {
 		return fmt.Errorf("%w: group %q cannot be targeted", ErrDeadEntity, target.GroupID)
+	}
+	if next.Siege != nil && defIdx >= 0 && !siege.AreAdjacent(*next.Siege, next.Defenders[defIdx].ZoneID, target.ZoneID) {
+		return fmt.Errorf("%w: defender in %q out of strike reach of %q in %q", siege.ErrZoneBlocked, next.Defenders[defIdx].ZoneID, target.GroupID, target.ZoneID)
 	}
 
 	dmg := cfg.PlayerStrikeBaseDamage
@@ -865,23 +957,10 @@ func applyPlayerDefendStrike(next *WorldState, cmd Command, cfg Config, events *
 		return err
 	}
 	if target.HP == 0 {
-		target.State = ai.StateDead
-		target.MoraleBP = 0
-		target.TerminalTick = next.Tick
-		target.CurrentTarget = ai.TargetRef{}
-		target.CurrentTargetID = ""
-		target.TargetMemoryTicks = 0
-		if target.PopulationWeight == 0 {
-			target.Accounted = true
-		}
-		*events = append(*events, next.newEvent(EventCreaturePopulationChanged, target.GroupID, "Defeated", -1, nil))
-		if target.Role == ai.RoleCommander {
-			*fallen = append(*fallen, fallenCommander{family: target.Family, pos: target.DistanceToSettlement})
-			*events = append(*events, next.newEvent(EventCommanderFallen, target.GroupID, string(target.Family), 0, nil))
-		}
+		markGroupDefeatedInSiege(next, idx, cmd.PlayerID, fallen, events)
 	}
 
-	if defIdx := findDefenderIndex(next.Defenders, cmd.PlayerID); defIdx >= 0 && next.Defenders[defIdx].HP > 0 {
+	if defIdx >= 0 && next.Defenders[defIdx].HP > 0 {
 		nextThreat, err := safeAddInt64(next.Defenders[defIdx].ThreatScore, cfg.DefenderStrikeThreatGain)
 		if err != nil {
 			return err
@@ -940,8 +1019,30 @@ func applyCompleteObjective(next *WorldState, cmd Command, cfg Config) error {
 	if strings.TrimSpace(cmd.PlayerID) == "" || strings.TrimSpace(cmd.ObjectiveID) == "" {
 		return fmt.Errorf("%w: player_id and objective_id are required", ErrInvalidCommand)
 	}
-	if idx := findDefenderIndex(next.Defenders, cmd.PlayerID); idx >= 0 && next.Defenders[idx].HP == 0 {
-		return fmt.Errorf("%w: defender %q is defeated", ErrDeadEntity, cmd.PlayerID)
+	defIdx := findDefenderIndex(next.Defenders, cmd.PlayerID)
+	if defIdx >= 0 {
+		if next.Defenders[defIdx].IsNPC {
+			return fmt.Errorf("%w: gameplay command cannot act as NPC defender %q", ErrUnauthorizedCommand, cmd.PlayerID)
+		}
+		if next.Defenders[defIdx].HP == 0 {
+			return fmt.Errorf("%w: defender %q is defeated", ErrDeadEntity, cmd.PlayerID)
+		}
+	}
+	if next.Siege != nil {
+		if defIdx < 0 {
+			return fmt.Errorf("%w: player %q must be deployed in a siege zone to complete strategic objectives", ErrUnknownEntity, cmd.PlayerID)
+		}
+		if err := siege.ValidateAndCompletePlayerObjective(
+			next.Siege,
+			cmd.ObjectiveID,
+			cmd.PlayerID,
+			next.Defenders[defIdx].ZoneID,
+			siege.EntityRepairTotal(*next.Siege, cmd.PlayerID),
+			buildSiegeCombatants(next),
+			next.Tick,
+		); err != nil {
+			return err
+		}
 	}
 	idx, found := slices.BinarySearch(next.Invasion.ObjectivesCompleted, cmd.ObjectiveID)
 	if found {
@@ -1152,6 +1253,7 @@ func applyDirectorResetResolvedInvasion(next *WorldState, cfg Config) error {
 			return fmt.Errorf("%w: un-accounted group %q still present before invasion reset", ErrInvalidState, g.GroupID)
 		}
 	}
+	wasCaptured := next.Invasion.Outcome == ports.InvasionOutcomeCaptured
 	next.InvasionSeq++
 	next.Invasion = InvasionRecord{
 		InvasionID:          fmt.Sprintf("%s-inv-%d", next.SimulationID, next.InvasionSeq),
@@ -1162,8 +1264,11 @@ func applyDirectorResetResolvedInvasion(next *WorldState, cfg Config) error {
 	}
 	// Restore settlement defense HP to at least MinDefense or MaxDefense for the next campaign cycle
 	// only if it was defended or prepared for a fresh scenario; captured settlements keep 0 HP until reconstructed.
-	if next.SettlementDefenseHP > 0 {
+	next.Siege = nil
+	if !wasCaptured && next.SettlementDefenseHP > 0 {
 		next.SettlementDefenseHP = next.SettlementMaxDefenseHP
+	} else if wasCaptured {
+		next.SettlementDefenseHP = 0
 	}
 	next.Defenders = []DefenderEntity{}
 	next.Contributions = []PlayerContribution{}
@@ -1183,6 +1288,7 @@ func applyDirectorAbortPreparedInvasion(next *WorldState, cmd Command, cfg Confi
 	if err := transitionInvasion(next, InvasionPeace, cfg, events); err != nil {
 		return err
 	}
+	next.Siege = nil
 	next.Invasion.CampaignID = ""
 	next.Invasion.InvadingFactionID = ""
 	return nil

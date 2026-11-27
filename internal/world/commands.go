@@ -3,6 +3,9 @@ package world
 import (
 	"errors"
 	"fmt"
+
+	"ascendra-game/internal/ai"
+	"ascendra-game/internal/siege"
 )
 
 // ErrUnauthorizedCommand is returned when a caller submits a command outside its authorized scope
@@ -22,11 +25,13 @@ const (
 // ScopeOf returns the authoritative scope required to execute a CommandKind.
 func ScopeOf(kind CommandKind) CommandScope {
 	switch kind {
-	case CmdDeployDefender, CmdPlayerDefendStrike, CmdPlayerSupportDefense, CmdCompleteObjective:
+	case CmdDeployDefender, CmdMoveDefenderZone, CmdPlayerDefendStrike, CmdPlayerSupportDefense, CmdPlayerRepairStructure, CmdCompleteObjective:
 		return ScopeGameplay
-	case CmdDirectorPrepareInvasion, CmdDirectorStartInvasion, CmdDirectorSpawnCampaignGroup, CmdDirectorResetResolvedInvasion, CmdDirectorAbortPreparedInvasion:
+	case CmdDirectorPrepareInvasion, CmdDirectorStartInvasion, CmdDirectorSpawnCampaignGroup,
+		CmdDirectorResetResolvedInvasion, CmdDirectorAbortPreparedInvasion,
+		CmdDirectorConfigureSiege, CmdDirectorScheduleSiegeWave:
 		return ScopeDirector
-	case CmdIncreaseThreat, CmdSpawnHostileGroup, CmdForceInvasionTransition:
+	case CmdIncreaseThreat, CmdSpawnHostileGroup, CmdForceInvasionTransition, CmdConfigureSiege:
 		return ScopeAdmin
 	default:
 		return ""
@@ -36,12 +41,15 @@ func ScopeOf(kind CommandKind) CommandScope {
 // GameplayCommand restricts external player/client input strictly to player gameplay intentions.
 // It can NEVER be coerced into administrative or director authority.
 type GameplayCommand struct {
-	Kind          CommandKind `json:"kind"`
-	Tick          uint64      `json:"tick"`
-	PlayerID      string      `json:"player_id"`
-	TargetGroupID string      `json:"target_group_id,omitempty"`
-	Position      int64       `json:"position,omitempty"`
-	ObjectiveID   string      `json:"objective_id,omitempty"`
+	Kind              CommandKind `json:"kind"`
+	Tick              uint64      `json:"tick"`
+	PlayerID          string      `json:"player_id"`
+	TargetGroupID     string      `json:"target_group_id,omitempty"`
+	TargetStructureID string      `json:"target_structure_id,omitempty"`
+	ZoneID            string      `json:"zone_id,omitempty"`
+	TargetZoneID      string      `json:"target_zone_id,omitempty"`
+	Position          int64       `json:"position,omitempty"`
+	ObjectiveID       string      `json:"objective_id,omitempty"`
 }
 
 // ToCommand validates that the GameplayCommand belongs exclusively to ScopeGameplay.
@@ -50,32 +58,42 @@ func (g GameplayCommand) ToCommand() (Command, error) {
 		return Command{}, fmt.Errorf("%w: %q is not a gameplay command", ErrUnauthorizedCommand, g.Kind)
 	}
 	return Command{
-		Kind:          g.Kind,
-		Tick:          g.Tick,
-		PlayerID:      g.PlayerID,
-		TargetGroupID: g.TargetGroupID,
-		Position:      g.Position,
-		ObjectiveID:   g.ObjectiveID,
+		Kind:              g.Kind,
+		Tick:              g.Tick,
+		PlayerID:          g.PlayerID,
+		TargetGroupID:     g.TargetGroupID,
+		TargetStructureID: g.TargetStructureID,
+		ZoneID:            g.ZoneID,
+		TargetZoneID:      g.TargetZoneID,
+		Position:          g.Position,
+		ObjectiveID:       g.ObjectiveID,
 	}, nil
 }
 
 // DirectorCommand represents authoritative orchestration directives issued solely by
 // the World Event Director (internal/worldevents) into the Tactical World Engine.
 type DirectorCommand struct {
-	Kind               CommandKind `json:"kind"`
-	Tick               uint64      `json:"tick"`
-	CampaignID         string      `json:"campaign_id,omitempty"`
-	InvadingFactionID  string      `json:"invading_faction_id,omitempty"`
-	GroupID            string      `json:"group_id,omitempty"`
-	Archetype          string      `json:"archetype,omitempty"`
-	Count              int64       `json:"count,omitempty"`
-	Position           int64       `json:"position,omitempty"`
-	HomePosition       int64       `json:"home_position,omitempty"`
-	ReservationID      string      `json:"reservation_id,omitempty"`
-	SourcePopulationID string      `json:"source_population_id,omitempty"`
-	SourceCampID       string      `json:"source_camp_id,omitempty"`
-	SourceRegionID     string      `json:"source_region_id,omitempty"`
-	PopulationWeight   int64       `json:"population_weight,omitempty"`
+	Kind               CommandKind             `json:"kind"`
+	Tick               uint64                  `json:"tick"`
+	CampaignID         string                  `json:"campaign_id,omitempty"`
+	InvadingFactionID  string                  `json:"invading_faction_id,omitempty"`
+	InvadingFamily     ai.Family               `json:"invading_family,omitempty"`
+	IsReconquest       bool                    `json:"is_reconquest,omitempty"`
+	SpawnNPCDefenders  bool                    `json:"spawn_npc_defenders,omitempty"`
+	GroupID            string                  `json:"group_id,omitempty"`
+	Archetype          string                  `json:"archetype,omitempty"`
+	Count              int64                   `json:"count,omitempty"`
+	Position           int64                   `json:"position,omitempty"`
+	HomePosition       int64                   `json:"home_position,omitempty"`
+	ZoneID             string                  `json:"zone_id,omitempty"`
+	ReservationID      string                  `json:"reservation_id,omitempty"`
+	SourcePopulationID string                  `json:"source_population_id,omitempty"`
+	SourceCampID       string                  `json:"source_camp_id,omitempty"`
+	SourceRegionID     string                  `json:"source_region_id,omitempty"`
+	PopulationWeight   int64                   `json:"population_weight,omitempty"`
+	SiegeLayout        *siege.SettlementLayout `json:"siege_layout,omitempty"`
+	SiegeConfig        *siege.Config           `json:"siege_config,omitempty"`
+	Wave               *siege.SiegeWave        `json:"wave,omitempty"`
 }
 
 // ToCommand validates that the DirectorCommand belongs exclusively to ScopeDirector.
@@ -88,31 +106,44 @@ func (d DirectorCommand) ToCommand() (Command, error) {
 		Tick:               d.Tick,
 		CampaignID:         d.CampaignID,
 		InvadingFactionID:  d.InvadingFactionID,
+		InvadingFamily:     d.InvadingFamily,
+		IsReconquest:       d.IsReconquest,
+		SpawnNPCDefenders:  d.SpawnNPCDefenders,
 		GroupID:            d.GroupID,
 		Archetype:          d.Archetype,
 		Count:              d.Count,
 		Position:           d.Position,
 		HomePosition:       d.HomePosition,
+		ZoneID:             d.ZoneID,
 		ReservationID:      d.ReservationID,
 		SourcePopulationID: d.SourcePopulationID,
 		SourceCampID:       d.SourceCampID,
 		SourceRegionID:     d.SourceRegionID,
 		PopulationWeight:   d.PopulationWeight,
+		SiegeLayout:        d.SiegeLayout,
+		SiegeConfig:        d.SiegeConfig,
+		Wave:               d.Wave,
 	}, nil
 }
 
 // AdminCommand represents privileged harness/fixture commands for tests and dev tooling.
 type AdminCommand struct {
-	Kind         CommandKind   `json:"kind"`
-	Tick         uint64        `json:"tick"`
-	GroupID      string        `json:"group_id,omitempty"`
-	Archetype    string        `json:"archetype,omitempty"`
-	Count        int64         `json:"count,omitempty"`
-	Position     int64         `json:"position,omitempty"`
-	HomePosition int64         `json:"home_position,omitempty"`
-	Delta        int64         `json:"delta,omitempty"`
-	Source       string        `json:"source,omitempty"`
-	TargetState  InvasionState `json:"target_state,omitempty"`
+	Kind              CommandKind             `json:"kind"`
+	Tick              uint64                  `json:"tick"`
+	GroupID           string                  `json:"group_id,omitempty"`
+	Archetype         string                  `json:"archetype,omitempty"`
+	Count             int64                   `json:"count,omitempty"`
+	Position          int64                   `json:"position,omitempty"`
+	HomePosition      int64                   `json:"home_position,omitempty"`
+	ZoneID            string                  `json:"zone_id,omitempty"`
+	Delta             int64                   `json:"delta,omitempty"`
+	Source            string                  `json:"source,omitempty"`
+	TargetState       InvasionState           `json:"target_state,omitempty"`
+	InvadingFamily    ai.Family               `json:"invading_family,omitempty"`
+	InvadingFactionID string                  `json:"invading_faction_id,omitempty"`
+	SpawnNPCDefenders bool                    `json:"spawn_npc_defenders,omitempty"`
+	SiegeLayout       *siege.SettlementLayout `json:"siege_layout,omitempty"`
+	SiegeConfig       *siege.Config           `json:"siege_config,omitempty"`
 }
 
 // ToCommand validates that the AdminCommand belongs exclusively to ScopeAdmin.
@@ -121,16 +152,22 @@ func (a AdminCommand) ToCommand() (Command, error) {
 		return Command{}, fmt.Errorf("%w: %q is not an administrative command", ErrUnauthorizedCommand, a.Kind)
 	}
 	return Command{
-		Kind:         a.Kind,
-		Tick:         a.Tick,
-		GroupID:      a.GroupID,
-		Archetype:    a.Archetype,
-		Count:        a.Count,
-		Position:     a.Position,
-		HomePosition: a.HomePosition,
-		Delta:        a.Delta,
-		Source:       a.Source,
-		TargetState:  a.TargetState,
+		Kind:              a.Kind,
+		Tick:              a.Tick,
+		GroupID:           a.GroupID,
+		Archetype:         a.Archetype,
+		Count:             a.Count,
+		Position:          a.Position,
+		HomePosition:      a.HomePosition,
+		ZoneID:            a.ZoneID,
+		Delta:             a.Delta,
+		Source:            a.Source,
+		TargetState:       a.TargetState,
+		InvadingFamily:    a.InvadingFamily,
+		InvadingFactionID: a.InvadingFactionID,
+		SpawnNPCDefenders: a.SpawnNPCDefenders,
+		SiegeLayout:       a.SiegeLayout,
+		SiegeConfig:       a.SiegeConfig,
 	}, nil
 }
 

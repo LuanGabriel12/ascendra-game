@@ -9,6 +9,7 @@ import (
 
 	"ascendra-game/internal/ai"
 	"ascendra-game/internal/ports"
+	"ascendra-game/internal/siege"
 	"ascendra-game/internal/simulation"
 )
 
@@ -273,15 +274,22 @@ type CreatureGroup struct {
 	ReservationID          string          `json:"reservation_id,omitempty"`
 	CampaignID             string          `json:"campaign_id,omitempty"`
 	PopulationWeight       int64           `json:"population_weight,omitempty"`
+	ZoneID                 string          `json:"zone_id,omitempty"`
 }
 
-// DefenderEntity models a deployed defender on the battlefield perceivable by Creature AI.
+// DefenderEntity models a deployed defender (player or representative NPC garrison unit)
+// on the battlefield perceivable by Creature AI and Siege Engine.
 type DefenderEntity struct {
-	PlayerID    string `json:"player_id"`
-	HP          int64  `json:"hp"`
-	MaxHP       int64  `json:"max_hp"`
-	Position    int64  `json:"position"`
-	ThreatScore int64  `json:"threat_score"`
+	PlayerID            string             `json:"player_id"`
+	HP                  int64              `json:"hp"`
+	MaxHP               int64              `json:"max_hp"`
+	Position            int64              `json:"position"`
+	ThreatScore         int64              `json:"threat_score"`
+	Role                siege.DefenderRole `json:"role,omitempty"`
+	ZoneID              string             `json:"zone_id,omitempty"`
+	ActionCooldownTicks uint64             `json:"action_cooldown_ticks,omitempty"`
+	RepairsPerformed    int                `json:"repairs_performed,omitempty"`
+	IsNPC               bool               `json:"is_npc,omitempty"`
 }
 
 // PlayerCooldown tracks authoritative action cooldowns in logical ticks.
@@ -312,6 +320,7 @@ type WorldState struct {
 	InitialDefenseState    ports.SettlementDefenseState `json:"initial_defense_state"`
 	RegionalThreat         int64                        `json:"regional_threat"`
 	Invasion               InvasionRecord               `json:"invasion"`
+	Siege                  *siege.SiegeState            `json:"siege,omitempty"`
 	Groups                 []CreatureGroup              `json:"groups"`
 	RetiredGroupIDs        []string                     `json:"retired_group_ids,omitempty"`
 	Defenders              []DefenderEntity             `json:"defenders"`
@@ -325,6 +334,7 @@ type WorldState struct {
 // Clone returns a deep copy of WorldState so failed ticks never mutate caller state.
 func (s WorldState) Clone() WorldState {
 	out := s
+	out.Siege = s.Siege.Clone()
 	out.Invasion.ObjectivesCompleted = slices.Clone(s.Invasion.ObjectivesCompleted)
 	if out.Invasion.ObjectivesCompleted == nil {
 		out.Invasion.ObjectivesCompleted = []string{}
@@ -458,6 +468,51 @@ func (s WorldState) Validate() error {
 		if d.MaxHP <= 0 || d.HP < 0 || d.HP > d.MaxHP || d.Position < 0 || d.ThreatScore < 0 {
 			return fmt.Errorf("%w: invalid defender %q stats", ErrInvalidState, d.PlayerID)
 		}
+		if !d.Role.Valid() || d.IsNPC != d.Role.IsNPC() || d.RepairsPerformed < 0 {
+			return fmt.Errorf("%w: invalid defender %q role/npc/repair state", ErrInvalidState, d.PlayerID)
+		}
+	}
+
+	// Single Tactical Authority & Single Source of Truth cross-checks when Siege is active.
+	if s.Siege != nil {
+		if err := s.Siege.Validate(); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidState, err)
+		}
+		if s.Siege.SettlementID != s.SettlementID || s.Siege.RegionID != s.RegionID {
+			return fmt.Errorf("%w: siege settlement/region mismatch", ErrInvalidState)
+		}
+		if s.SettlementMaxDefenseHP != s.Siege.TotalStructureMaxHP() || s.SettlementDefenseHP != s.Siege.TotalStructureHP() {
+			return fmt.Errorf("%w: settlement defense HP (%d/%d) diverged from siege structures (%d/%d)",
+				ErrInvalidState, s.SettlementDefenseHP, s.SettlementMaxDefenseHP, s.Siege.TotalStructureHP(), s.Siege.TotalStructureMaxHP())
+		}
+		if s.Siege.CampaignID != "" && s.Invasion.CampaignID != "" && s.Siege.CampaignID != s.Invasion.CampaignID {
+			return fmt.Errorf("%w: siege campaign %q != invasion campaign %q", ErrInvalidState, s.Siege.CampaignID, s.Invasion.CampaignID)
+		}
+		if s.Invasion.State == InvasionResolved {
+			if !s.Siege.Phase.IsTerminal() || s.Siege.Phase.ToInvasionOutcome() != s.Invasion.Outcome {
+				return fmt.Errorf("%w: resolved invasion outcome %q inconsistent with siege phase %q", ErrInvalidState, s.Invasion.Outcome, s.Siege.Phase)
+			}
+		} else if s.Siege.Phase.IsTerminal() {
+			return fmt.Errorf("%w: unresolved invasion state %q cannot have terminal siege phase %q", ErrInvalidState, s.Invasion.State, s.Siege.Phase)
+		}
+		for _, g := range s.Groups {
+			if g.ZoneID != "" && s.Siege.FindZoneIndex(g.ZoneID) < 0 {
+				return fmt.Errorf("%w: group %q references unknown siege zone %q", ErrInvalidState, g.GroupID, g.ZoneID)
+			}
+		}
+		for _, d := range s.Defenders {
+			if d.ZoneID != "" && s.Siege.FindZoneIndex(d.ZoneID) < 0 {
+				return fmt.Errorf("%w: defender %q references unknown siege zone %q", ErrInvalidState, d.PlayerID, d.ZoneID)
+			}
+		}
+		for _, cmdr := range s.Siege.Commanders {
+			if !s.Siege.Phase.IsTerminal() && cmdr.GroupID != "" && cmdr.Alive {
+				gIdx := findGroupIndex(s.Groups, cmdr.GroupID)
+				if gIdx < 0 || s.Groups[gIdx].HP == 0 || s.Groups[gIdx].State == ai.StateDead || s.Groups[gIdx].Routed {
+					return fmt.Errorf("%w: alive siege commander %q references missing, routed, or dead group %q", ErrInvalidState, cmdr.CommanderID, cmdr.GroupID)
+				}
+			}
+		}
 	}
 
 	for i, pc := range s.PlayerCooldowns {
@@ -509,12 +564,12 @@ func (s WorldState) ValidateWithConfig(cfg Config) error {
 	for _, g := range s.Groups {
 		if len(g.GroupID) > maxID || len(g.Archetype) > maxID || len(g.SourcePopulationID) > maxID ||
 			len(g.SourceCampID) > maxID || len(g.SourceRegionID) > maxID || len(g.FactionID) > maxID ||
-			len(g.ReservationID) > maxID || len(g.CampaignID) > maxID {
+			len(g.ReservationID) > maxID || len(g.CampaignID) > maxID || len(g.ZoneID) > maxID {
 			return fmt.Errorf("%w: group identifier exceeds max length %d", ErrInvalidState, maxID)
 		}
 	}
 	for _, d := range s.Defenders {
-		if len(d.PlayerID) > maxID {
+		if len(d.PlayerID) > maxID || len(d.ZoneID) > maxID {
 			return fmt.Errorf("%w: defender identifier exceeds max length %d", ErrInvalidState, maxID)
 		}
 	}
@@ -584,6 +639,7 @@ func (s WorldState) Checksum() (string, error) {
 		h.WriteString(g.ReservationID)
 		h.WriteString(g.CampaignID)
 		h.WriteInt64(g.PopulationWeight)
+		h.WriteString(g.ZoneID)
 	}
 
 	h.WriteUint64(uint64(len(s.RetiredGroupIDs)))
@@ -598,6 +654,16 @@ func (s WorldState) Checksum() (string, error) {
 		h.WriteInt64(d.MaxHP)
 		h.WriteInt64(d.Position)
 		h.WriteInt64(d.ThreatScore)
+		h.WriteUint8(d.Role.Code())
+		h.WriteString(d.ZoneID)
+		h.WriteUint64(d.ActionCooldownTicks)
+		h.WriteInt64(int64(d.RepairsPerformed))
+		h.WriteBool(d.IsNPC)
+	}
+
+	h.WriteBool(s.Siege != nil)
+	if s.Siege != nil {
+		s.Siege.WriteChecksum(h)
 	}
 
 	h.WriteUint64(uint64(len(s.PlayerCooldowns)))
@@ -664,39 +730,53 @@ const (
 	CmdSpawnHostileGroup             CommandKind = "SpawnHostileGroup"
 	CmdForceInvasionTransition       CommandKind = "ForceInvasionTransition"
 	CmdDeployDefender                CommandKind = "DeployDefender"
+	CmdMoveDefenderZone              CommandKind = "MoveDefenderZone"
 	CmdPlayerDefendStrike            CommandKind = "PlayerDefendStrike"
 	CmdPlayerSupportDefense          CommandKind = "PlayerSupportDefense"
+	CmdPlayerRepairStructure         CommandKind = "PlayerRepairStructure"
 	CmdCompleteObjective             CommandKind = "CompleteObjective"
+	CmdConfigureSiege                CommandKind = "ConfigureSiege"
 	CmdDirectorPrepareInvasion       CommandKind = "DirectorPrepareInvasion"
 	CmdDirectorStartInvasion         CommandKind = "DirectorStartInvasion"
 	CmdDirectorSpawnCampaignGroup    CommandKind = "DirectorSpawnCampaignGroup"
 	CmdDirectorResetResolvedInvasion CommandKind = "DirectorResetResolvedInvasion"
 	CmdDirectorAbortPreparedInvasion CommandKind = "DirectorAbortPreparedInvasion"
+	CmdDirectorConfigureSiege        CommandKind = "DirectorConfigureSiege"
+	CmdDirectorScheduleSiegeWave     CommandKind = "DirectorScheduleSiegeWave"
 )
 
 // Command carries an explicit intention targeting a single logical tick.
 // Players never specify damage, HP, threat, rewards, or cooldown values in commands.
 type Command struct {
-	Kind               CommandKind   `json:"kind"`
-	Tick               uint64        `json:"tick"`
-	PlayerID           string        `json:"player_id,omitempty"`
-	TargetGroupID      string        `json:"target_group_id,omitempty"`
-	GroupID            string        `json:"group_id,omitempty"`
-	Archetype          string        `json:"archetype,omitempty"`
-	Count              int64         `json:"count,omitempty"`
-	Position           int64         `json:"position,omitempty"`
-	HomePosition       int64         `json:"home_position,omitempty"`
-	Delta              int64         `json:"delta,omitempty"`
-	Source             string        `json:"source,omitempty"`
-	ObjectiveID        string        `json:"objective_id,omitempty"`
-	TargetState        InvasionState `json:"target_state,omitempty"`
-	CampaignID         string        `json:"campaign_id,omitempty"`
-	InvadingFactionID  string        `json:"invading_faction_id,omitempty"`
-	ReservationID      string        `json:"reservation_id,omitempty"`
-	SourcePopulationID string        `json:"source_population_id,omitempty"`
-	SourceCampID       string        `json:"source_camp_id,omitempty"`
-	SourceRegionID     string        `json:"source_region_id,omitempty"`
-	PopulationWeight   int64         `json:"population_weight,omitempty"`
+	Kind               CommandKind             `json:"kind"`
+	Tick               uint64                  `json:"tick"`
+	PlayerID           string                  `json:"player_id,omitempty"`
+	TargetGroupID      string                  `json:"target_group_id,omitempty"`
+	TargetStructureID  string                  `json:"target_structure_id,omitempty"`
+	ZoneID             string                  `json:"zone_id,omitempty"`
+	TargetZoneID       string                  `json:"target_zone_id,omitempty"`
+	GroupID            string                  `json:"group_id,omitempty"`
+	Archetype          string                  `json:"archetype,omitempty"`
+	Count              int64                   `json:"count,omitempty"`
+	Position           int64                   `json:"position,omitempty"`
+	HomePosition       int64                   `json:"home_position,omitempty"`
+	Delta              int64                   `json:"delta,omitempty"`
+	Source             string                  `json:"source,omitempty"`
+	ObjectiveID        string                  `json:"objective_id,omitempty"`
+	TargetState        InvasionState           `json:"target_state,omitempty"`
+	CampaignID         string                  `json:"campaign_id,omitempty"`
+	InvadingFactionID  string                  `json:"invading_faction_id,omitempty"`
+	InvadingFamily     ai.Family               `json:"invading_family,omitempty"`
+	IsReconquest       bool                    `json:"is_reconquest,omitempty"`
+	SpawnNPCDefenders  bool                    `json:"spawn_npc_defenders,omitempty"`
+	ReservationID      string                  `json:"reservation_id,omitempty"`
+	SourcePopulationID string                  `json:"source_population_id,omitempty"`
+	SourceCampID       string                  `json:"source_camp_id,omitempty"`
+	SourceRegionID     string                  `json:"source_region_id,omitempty"`
+	PopulationWeight   int64                   `json:"population_weight,omitempty"`
+	SiegeLayout        *siege.SettlementLayout `json:"siege_layout,omitempty"`
+	SiegeConfig        *siege.Config           `json:"siege_config,omitempty"`
+	Wave               *siege.SiegeWave        `json:"wave,omitempty"`
 }
 
 // CanonicalizeCommands returns a deterministically ordered copy of tick commands covering
@@ -715,20 +795,24 @@ func commandPriority(k CommandKind) int {
 	switch k {
 	case CmdDirectorResetResolvedInvasion, CmdDirectorAbortPreparedInvasion:
 		return 0
-	case CmdDeployDefender:
+	case CmdConfigureSiege, CmdDirectorConfigureSiege:
 		return 1
-	case CmdSpawnHostileGroup, CmdDirectorSpawnCampaignGroup:
+	case CmdDirectorScheduleSiegeWave:
 		return 2
-	case CmdIncreaseThreat:
+	case CmdDeployDefender, CmdMoveDefenderZone:
 		return 3
-	case CmdForceInvasionTransition, CmdDirectorPrepareInvasion, CmdDirectorStartInvasion:
+	case CmdSpawnHostileGroup, CmdDirectorSpawnCampaignGroup:
 		return 4
-	case CmdPlayerSupportDefense:
+	case CmdIncreaseThreat:
 		return 5
-	case CmdPlayerDefendStrike:
+	case CmdForceInvasionTransition, CmdDirectorPrepareInvasion, CmdDirectorStartInvasion:
 		return 6
-	case CmdCompleteObjective:
+	case CmdPlayerSupportDefense, CmdPlayerRepairStructure:
 		return 7
+	case CmdPlayerDefendStrike:
+		return 8
+	case CmdCompleteObjective:
+		return 9
 	default:
 		return 99
 	}
@@ -813,6 +897,20 @@ func compareCommands(a, b Command) int {
 		}
 		return 1
 	}
+	if c := strings.Compare(a.ZoneID, b.ZoneID); c != 0 {
+		return c
+	}
+	if c := strings.Compare(a.TargetZoneID, b.TargetZoneID); c != 0 {
+		return c
+	}
+	if c := strings.Compare(a.TargetStructureID, b.TargetStructureID); c != 0 {
+		return c
+	}
+	if a.Wave != nil && b.Wave != nil {
+		if c := strings.Compare(a.Wave.WaveID, b.Wave.WaveID); c != 0 {
+			return c
+		}
+	}
 	return 0
 }
 
@@ -835,6 +933,16 @@ const (
 	EventCommanderFallen           EventType = "CommanderFallen"
 	EventGroupRetired              EventType = "GroupRetired"
 	EventReinforcementRequested    EventType = "ReinforcementRequested"
+	EventSiegePhaseChanged         EventType = "SiegePhaseChanged"
+	EventStructureDamaged          EventType = "StructureDamaged"
+	EventStructureBreached         EventType = "StructureBreached"
+	EventStructureDestroyed        EventType = "StructureDestroyed"
+	EventStructureRepaired         EventType = "StructureRepaired"
+	EventDistrictStateChanged      EventType = "DistrictStateChanged"
+	EventObjectiveUpdated          EventType = "ObjectiveUpdated"
+	EventSiegeWaveScheduled        EventType = "SiegeWaveScheduled"
+	EventTowerFired                EventType = "TowerFired"
+	EventSupplyChanged             EventType = "SupplyChanged"
 )
 
 // DomainEvent represents a deterministic, immutable fact emitted during a tick.

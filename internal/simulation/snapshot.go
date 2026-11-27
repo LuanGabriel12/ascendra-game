@@ -10,9 +10,10 @@ import (
 )
 
 // SnapshotVersion identifies the current logical snapshot wire format.
-// v5 includes bounded delivery queues and acknowledgement cursors and rejects
-// older snapshots whose arbitrary reservation keys cannot be safely migrated.
-const SnapshotVersion uint32 = 5
+// v6 adds Cycle 05 settlement siege topology, defensive structures, objectives,
+// districts, commanders, waves, supplies, NPC defenders, and occupation state,
+// rejecting older v1-v5 snapshots explicitly without unsafe auto-migration.
+const SnapshotVersion uint32 = 6
 
 // DefaultMaxSnapshotBytes caps snapshot input size BEFORE allocating a JSON decoder.
 const DefaultMaxSnapshotBytes int = 2 * 1024 * 1024 // 2 MiB
