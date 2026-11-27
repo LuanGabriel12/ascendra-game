@@ -6,8 +6,129 @@ import (
 
 	"ascendra-game/internal/adapters/memory"
 	"ascendra-game/internal/ecosystem"
+	"ascendra-game/internal/ports"
 	"ascendra-game/internal/worldevents"
 )
+
+func BenchmarkAcknowledgeTerminalOutcome(b *testing.B) {
+	st, cfg := setupBenchState(b)
+	st.Director.OutcomeSeq = 1
+	st.Director.PendingOutcomes = []worldevents.TerminalSettlementOutcome{{Sequence: 1, EventID: "bench-outcome", SimulationID: st.Director.SimulationID, Outcome: ports.InvasionOutcomeDefended}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := worldevents.AcknowledgeTerminalOutcome(st, 1, cfg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDirectorEventPagination(b *testing.B) {
+	st, cfg := setupBenchState(b)
+	cfg.Director.MaxEventsPerUpdate = 4
+	events := make([]worldevents.DirectorEvent, 16)
+	for i := range events {
+		events[i] = worldevents.DirectorEvent{
+			EventID:      fmt.Sprintf("bench-dir-%02d", i),
+			SimulationID: st.Director.SimulationID,
+			Type:         worldevents.DirEventCampaignPhaseChanged,
+		}
+	}
+	st.Director.DirectorBatchSeq = 1
+	st.Director.PendingDirectorBatches = []worldevents.DirectorEventBatch{{Sequence: 1, Events: events}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for offset := 0; ; {
+			_, page, more, err := worldevents.PendingDirectorEventPage(st, offset, cfg)
+			if err != nil {
+				b.Fatal(err)
+			}
+			offset += len(page)
+			if !more {
+				break
+			}
+		}
+	}
+}
+
+func BenchmarkAcknowledgeDirectorBatch(b *testing.B) {
+	st, cfg := setupBenchState(b)
+	st.Director.DirectorBatchSeq = 1
+	st.Director.PendingDirectorBatches = []worldevents.DirectorEventBatch{{
+		Sequence: 1,
+		Events:   []worldevents.DirectorEvent{{EventID: "bench-dir-1", SimulationID: st.Director.SimulationID, Type: worldevents.DirEventCampaignPhaseChanged}},
+	}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := worldevents.AcknowledgeDirectorBatchVerified(st, 1, 1, cfg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkAcknowledgeContribution(b *testing.B) {
+	st, cfg := setupBenchState(b)
+	st.Director.ContributionSeq = 1
+	st.Director.PendingContributions = []worldevents.PendingContribution{{
+		Sequence: 1,
+		Result: ports.ContributionResult{
+			EventID: "bench-con-1", SimulationID: st.Director.SimulationID, InvasionID: "inv-1",
+			SettlementID: "settlement-valewatch", PlayerID: "player-1", Outcome: ports.InvasionOutcomeDefended,
+		},
+	}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := worldevents.AcknowledgeContributionVerified(st, 1, "bench-con-1", cfg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkBackpressureRecoveryCycle(b *testing.B) {
+	st, cfg := setupBenchState(b)
+	cfg.Director.MaxPendingDirectorBatches = 1
+	cfg.Director.MaxEventsPerUpdate = 1
+	// Advance until batch queue fills (tick 5 emits candidate + launch).
+	cur := st
+	for tick := uint64(1); tick <= 5; tick++ {
+		var err error
+		cur, _, err = worldevents.Step(cur, worldevents.StepInput{}, cfg)
+		if err != nil {
+			b.Fatalf("warmup tick %d: %v", tick, err)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Page through saturated batch -> verified ack -> resume next tick.
+		var seq uint64
+		count := 0
+		for offset := 0; ; {
+			var page []worldevents.DirectorEvent
+			var more bool
+			var err error
+			seq, page, more, err = worldevents.PendingDirectorEventPage(cur, offset, cfg)
+			if err != nil {
+				b.Fatal(err)
+			}
+			count += len(page)
+			offset += len(page)
+			if !more {
+				break
+			}
+		}
+		recovered, err := worldevents.AcknowledgeDirectorBatchVerified(cur, seq, count, cfg)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, _, err := worldevents.Step(recovered, worldevents.StepInput{}, cfg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
 
 func setupBenchState(b *testing.B) (worldevents.OrchestratedState, worldevents.OrchestratedConfig) {
 	b.Helper()

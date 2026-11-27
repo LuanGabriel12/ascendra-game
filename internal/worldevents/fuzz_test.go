@@ -1,10 +1,13 @@
 package worldevents_test
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
 	"ascendra-game/internal/adapters/memory"
 	"ascendra-game/internal/ecosystem"
+	"ascendra-game/internal/ports"
 	"ascendra-game/internal/world"
 	"ascendra-game/internal/worldevents"
 )
@@ -86,7 +89,179 @@ func FuzzCampaignSchedulerAndCommands(f *testing.F) {
 	})
 }
 
-// FuzzOrchestratedSnapshotDecode fuzzes Snapshot v4 decoding with pre-decode byte caps.
+// FuzzOutcomeAcknowledgements checks arbitrary duplicate, skipped, conflicting and ordered
+// acknowledgements across terminal outcomes, contributions, and director event batches
+// against independent cursor models.
+func FuzzOutcomeAcknowledgements(f *testing.F) {
+	f.Add([]byte{2, 1, 1, 3, 2, 3, 0, 7, 13, 14})
+	f.Add([]byte{0, 255, 3, 2, 1, 18, 19, 20})
+	reader, err := memory.NewSettlementReader(memory.DefaultSettlementFixtures()...)
+	if err != nil {
+		f.Fatal(err)
+	}
+	cfg := worldevents.DefaultOrchestratedConfig()
+	cfg.Director.MaxPendingOutcomes = 3
+	cfg.Director.MaxPendingDirectorBatches = 3
+	cfg.Director.MaxEventsPerUpdate = 1
+	base, err := worldevents.NewOrchestratedState("fuzz-acks", "settlement-valewatch", 7, reader, worldevents.NewHighThreatGoblinEco("fuzz-acks", 7))
+	if err != nil {
+		f.Fatal(err)
+	}
+	base.Director.OutcomeSeq = 3
+	base.Director.ContributionSeq = 3
+	base.Director.DirectorBatchSeq = 3
+	for seq := uint64(1); seq <= 3; seq++ {
+		base.Director.PendingOutcomes = append(base.Director.PendingOutcomes, worldevents.TerminalSettlementOutcome{
+			Sequence: seq, EventID: fmt.Sprintf("out-%d", seq), SimulationID: "fuzz-acks", Outcome: ports.InvasionOutcomeDefended,
+		})
+		base.Director.PendingContributions = append(base.Director.PendingContributions, worldevents.PendingContribution{
+			Sequence: seq,
+			Result: ports.ContributionResult{
+				EventID: fmt.Sprintf("con-%d", seq), SimulationID: "fuzz-acks", InvasionID: "inv-1",
+				SettlementID: "settlement-valewatch", PlayerID: fmt.Sprintf("p-%d", seq), Outcome: ports.InvasionOutcomeDefended,
+			},
+		})
+		base.Director.PendingDirectorBatches = append(base.Director.PendingDirectorBatches, worldevents.DirectorEventBatch{
+			Sequence: seq,
+			Events: []worldevents.DirectorEvent{
+				{EventID: fmt.Sprintf("dir-%d-a", seq), SimulationID: "fuzz-acks", Type: worldevents.DirEventCampaignPhaseChanged},
+				{EventID: fmt.Sprintf("dir-%d-b", seq), SimulationID: "fuzz-acks", Type: worldevents.DirEventSettlementWarning},
+			},
+		})
+	}
+	f.Fuzz(func(t *testing.T, ops []byte) {
+		if len(ops) > 64 {
+			ops = ops[:64]
+		}
+		state := base.Clone()
+		var outCursor, conCursor, dirCursor uint64
+		for _, op := range ops {
+			queue := (op >> 4) % 3
+			seq := uint64(op % 6)
+			conflict := (op & 0x08) != 0
+			before, err := state.Checksum(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch queue {
+			case 0: // Outcomes
+				var next worldevents.OrchestratedState
+				var ackErr error
+				if conflict {
+					next, ackErr = worldevents.AcknowledgeTerminalOutcomeVerified(state, seq, "wrong-id", cfg)
+				} else {
+					next, ackErr = worldevents.AcknowledgeTerminalOutcome(state, seq, cfg)
+				}
+				if !conflict && seq != 0 && (seq == outCursor || (outCursor < 3 && seq == outCursor+1)) {
+					if ackErr != nil {
+						t.Fatalf("valid outcome ack %d: %v", seq, ackErr)
+					}
+					if seq == outCursor+1 {
+						outCursor++
+					}
+					state = next
+				} else if conflict && seq != 0 && seq == outCursor {
+					// Idempotent retry against empty diagnostic history succeeds only when not conflicting.
+					if ackErr == nil {
+						state = next
+					}
+				} else {
+					if !errors.Is(ackErr, worldevents.ErrInvalidCommand) {
+						t.Fatalf("invalid outcome ack seq=%d conflict=%v: %v", seq, conflict, ackErr)
+					}
+					after, _ := state.Checksum(cfg)
+					if before != after {
+						t.Fatal("invalid outcome ack mutated state")
+					}
+				}
+			case 1: // Contributions
+				var next worldevents.OrchestratedState
+				var ackErr error
+				if conflict {
+					next, ackErr = worldevents.AcknowledgeContributionVerified(state, seq, "wrong-con", cfg)
+				} else {
+					next, ackErr = worldevents.AcknowledgeContribution(state, seq, cfg)
+				}
+				if !conflict && seq != 0 && (seq == conCursor || (conCursor < 3 && seq == conCursor+1)) {
+					if ackErr != nil {
+						t.Fatalf("valid contrib ack %d: %v", seq, ackErr)
+					}
+					if seq == conCursor+1 {
+						conCursor++
+					}
+					state = next
+				} else if conflict && seq != 0 && seq == conCursor {
+					if ackErr == nil {
+						state = next
+					}
+				} else {
+					if !errors.Is(ackErr, worldevents.ErrInvalidCommand) {
+						t.Fatalf("invalid contrib ack seq=%d conflict=%v: %v", seq, conflict, ackErr)
+					}
+					after, _ := state.Checksum(cfg)
+					if before != after {
+						t.Fatal("invalid contrib ack mutated state")
+					}
+				}
+			default: // Director batches
+				var next worldevents.OrchestratedState
+				var ackErr error
+				if conflict {
+					// Partial event count (1 != 2) must be rejected on pending batch!
+					next, ackErr = worldevents.AcknowledgeDirectorBatchVerified(state, seq, 1, cfg)
+				} else {
+					next, ackErr = worldevents.AcknowledgeDirectorBatchVerified(state, seq, 2, cfg)
+				}
+				if !conflict && seq != 0 && (seq == dirCursor || (dirCursor < 3 && seq == dirCursor+1)) {
+					if ackErr != nil {
+						t.Fatalf("valid batch ack %d: %v", seq, ackErr)
+					}
+					if seq == dirCursor+1 {
+						dirCursor++
+					}
+					state = next
+				} else if conflict && seq != 0 && seq == dirCursor {
+					if ackErr == nil {
+						state = next
+					}
+				} else {
+					if !errors.Is(ackErr, worldevents.ErrInvalidCommand) {
+						t.Fatalf("invalid batch ack seq=%d conflict=%v: %v", seq, conflict, ackErr)
+					}
+					after, _ := state.Checksum(cfg)
+					if before != after {
+						t.Fatal("invalid batch ack mutated state")
+					}
+				}
+			}
+
+			pendingOut, err := worldevents.PendingTerminalOutcomes(state, cfg)
+			if err != nil || len(pendingOut) != int(3-outCursor) {
+				t.Fatalf("unexpected pending outcomes: %v %v", pendingOut, err)
+			}
+			for i, fact := range pendingOut {
+				if fact.Sequence != outCursor+uint64(i)+1 {
+					t.Fatal("outcome lost, duplicated, or reordered")
+				}
+			}
+			pendingCon, err := worldevents.PendingContributionResults(state, cfg)
+			if err != nil || len(pendingCon) != int(3-conCursor) {
+				t.Fatalf("unexpected pending contributions: %v %v", pendingCon, err)
+			}
+			for i, item := range pendingCon {
+				if item.Sequence != conCursor+uint64(i)+1 {
+					t.Fatal("contribution lost, duplicated, or reordered")
+				}
+			}
+			stats, err := worldevents.PendingQueueStats(state, cfg)
+			if err != nil || stats.PendingDirectorBatches != int(3-dirCursor) {
+				t.Fatalf("unexpected pending batches: %+v %v", stats, err)
+			}
+		}
+	})
+}
+
+// FuzzOrchestratedSnapshotDecode fuzzes Snapshot v5 decoding with pre-decode byte caps.
 func FuzzOrchestratedSnapshotDecode(f *testing.F) {
 	reader, err := memory.NewSettlementReader(memory.DefaultSettlementFixtures()...)
 	if err != nil {
@@ -110,6 +285,7 @@ func FuzzOrchestratedSnapshotDecode(f *testing.F) {
 	f.Add([]byte(`{}`))
 	f.Add([]byte(`{"schema_version":3,"checksum":"deadbeef","payload":{}}`))
 	f.Add([]byte(`{"schema_version":4,"checksum":"deadbeef","payload":{}}`))
+	f.Add([]byte(`{"schema_version":5,"checksum":"deadbeef","payload":{}}`))
 	f.Add([]byte(`corrupt-json`))
 
 	f.Fuzz(func(t *testing.T, data []byte) {

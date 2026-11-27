@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 
 	"ascendra-game/internal/adapters/memory"
@@ -760,7 +762,7 @@ func TestMidCampaignSnapshotRestoreAndVersionRejection(t *testing.T) {
 		t.Fatalf("expected verified mid-campaign snapshot, got %+v", sumG)
 	}
 
-	// Verify v4 snapshot encodes schema_version == 4 and explicitly rejects v1, v2, v3, and oversized payloads.
+	// Verify v5 snapshot encodes schema_version == 5 and explicitly rejects v1, v2, v3, v4, and oversized payloads.
 	raw, err := resG.FinalState.MarshalSnapshot(cfg)
 	if err != nil {
 		t.Fatalf("MarshalSnapshot: %v", err)
@@ -769,10 +771,10 @@ func TestMidCampaignSnapshotRestoreAndVersionRejection(t *testing.T) {
 	if err := json.Unmarshal(raw, &env); err != nil {
 		t.Fatalf("json.Unmarshal envelope: %v", err)
 	}
-	if v, ok := env["schema_version"].(float64); !ok || uint32(v) != 4 {
-		t.Fatalf("expected schema_version=4, got %v", env["schema_version"])
+	if v, ok := env["schema_version"].(float64); !ok || uint32(v) != 5 {
+		t.Fatalf("expected schema_version=5, got %v", env["schema_version"])
 	}
-	for _, legacyVer := range []uint32{1, 2, 3} {
+	for _, legacyVer := range []uint32{1, 2, 3, 4} {
 		env["schema_version"] = legacyVer
 		badRaw, _ := json.Marshal(env)
 		if _, err := worldevents.UnmarshalOrchestratedSnapshot(badRaw, cfg); !errors.Is(err, simulation.ErrUnsupportedSnapshotVersion) {
@@ -939,6 +941,72 @@ func TestLongDurationMultiSeedStabilityAndBoundedMemory(t *testing.T) {
 				t.Fatalf("seed %d tick %d failed: %v", seed, tick, err)
 			}
 			totalCampaignsResolved += len(out.TerminalOutcomes)
+			if len(out.DirectorEvents) != 0 {
+				seq, page, more, err := worldevents.PendingDirectorEventPage(cur, 0, cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				collected := append([]worldevents.DirectorEvent(nil), page...)
+				for more {
+					_, page, more, err = worldevents.PendingDirectorEventPage(cur, len(collected), cfg)
+					if err != nil {
+						t.Fatal(err)
+					}
+					collected = append(collected, page...)
+				}
+				if len(collected) != len(out.DirectorEvents) {
+					t.Fatal("director delivery count mismatch")
+				}
+				for i := range collected {
+					if collected[i].EventID != out.DirectorEvents[i].EventID {
+						t.Fatal("director delivery mismatch")
+					}
+				}
+				cur, err = worldevents.AcknowledgeDirectorBatch(cur, seq, cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The long-running consumer explicitly confirms delivered facts. Compare
+			// the outbox to this tick's output before acknowledging it.
+			pendingContributions, err := worldevents.PendingContributionResults(cur, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var emittedContributions []ports.ContributionResult
+			for _, event := range out.WorldEvents {
+				if event.Type == world.EventContributionRecorded && event.Contribution != nil {
+					emittedContributions = append(emittedContributions, *event.Contribution)
+				}
+			}
+			if len(pendingContributions) != len(emittedContributions) {
+				t.Fatalf("contribution delivery count mismatch: %d != %d", len(pendingContributions), len(emittedContributions))
+			}
+			for i, pending := range pendingContributions {
+				if pending.Result != emittedContributions[i] {
+					t.Fatal("contribution outbox differs from emitted fact")
+				}
+				cur, err = worldevents.AcknowledgeContribution(cur, pending.Sequence, cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			pendingOutcomes, err := worldevents.PendingTerminalOutcomes(cur, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(pendingOutcomes) != len(out.TerminalOutcomes) {
+				t.Fatal("terminal delivery count mismatch")
+			}
+			for i, pending := range pendingOutcomes {
+				if pending != out.TerminalOutcomes[i] {
+					t.Fatal("terminal outbox differs from emitted fact")
+				}
+				cur, err = worldevents.AcknowledgeTerminalOutcome(cur, pending.Sequence, cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
 
 			// Verify bounded collections every 500 ticks.
 			if tick%500 == 0 {
@@ -1525,5 +1593,1363 @@ func TestDirectorStateValidationAndDispatchEdgeCases(t *testing.T) {
 	}
 	if err := badGlobal.Validate(dirCfg); !errors.Is(err, worldevents.ErrCapacityExceeded) {
 		t.Fatalf("expected ErrCapacityExceeded for 4 global campaigns (>3), got %v", err)
+	}
+}
+
+func TestDirectorEventLimitFailsAtomicallyWithoutTruncation(t *testing.T) {
+	cfg := worldevents.DefaultOrchestratedConfig()
+	cfg.Director.MaxEventsPerUpdate = 1
+	cfg.Director.MaxPendingDirectorBatches = 1
+	eco := worldevents.NewHighThreatGoblinEco("limited-events", 101)
+	st, err := worldevents.NewOrchestratedState("limited-events", "settlement-valewatch", 101, mustReader(t), eco)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenMultiEventTick := false
+	var expected []worldevents.DirectorEvent
+	for i := 0; i < 200; i++ {
+		before, err := st.Checksum(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		next, out, err := worldevents.Step(st, worldevents.StepInput{}, cfg)
+		if errors.Is(err, worldevents.ErrDirectorBackpressure) {
+			after, checkErr := st.Checksum(cfg)
+			if checkErr != nil || before != after {
+				t.Fatal("backpressure mutated state")
+			}
+			raw, err := st.MarshalSnapshot(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restored, err := worldevents.UnmarshalOrchestratedSnapshot(raw, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var collected []worldevents.DirectorEvent
+			var seq uint64
+			for offset := 0; ; {
+				var page []worldevents.DirectorEvent
+				var more bool
+				seq, page, more, err = worldevents.PendingDirectorEventPage(restored, offset, cfg)
+				if err != nil || len(page) != 1 {
+					t.Fatalf("page: %+v %v", page, err)
+				}
+				collected = append(collected, page...)
+				offset += len(page)
+				if !more {
+					break
+				}
+			}
+			if len(collected) > 1 {
+				seenMultiEventTick = true
+			}
+			if !reflect.DeepEqual(collected, expected) {
+				t.Fatalf("pending facts differ from committed tick: got %+v, want %+v", collected, expected)
+			}
+			if _, err := worldevents.AcknowledgeDirectorBatch(restored, seq+1, cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+				t.Fatalf("invalid ack: %v", err)
+			}
+			recovered, err := worldevents.AcknowledgeDirectorBatch(restored, seq, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dup, err := worldevents.AcknowledgeDirectorBatch(recovered, seq, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a, _ := recovered.Checksum(cfg)
+			b, _ := dup.Checksum(cfg)
+			if a != b {
+				t.Fatal("duplicate ack changed state")
+			}
+			advanced, resumedOut, err := worldevents.Step(recovered, worldevents.StepInput{}, cfg)
+			if err != nil || advanced.Director.Tick != st.Director.Tick+1 {
+				t.Fatalf("tick did not advance: %v", err)
+			}
+			if err := advanced.Validate(cfg); err != nil {
+				t.Fatal(err)
+			}
+			st = advanced
+			expected = resumedOut.DirectorEvents
+			if seenMultiEventTick {
+				return
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(out.DirectorEvents) > 1 {
+			seenMultiEventTick = true
+		}
+		if len(out.DirectorEvents) > 0 {
+			expected = out.DirectorEvents
+		}
+		st = next
+	}
+	t.Fatal("scenario did not exercise saturation and multi-page events")
+}
+
+func TestRunnerReturnsRecoverableStateOnBackpressure(t *testing.T) {
+	cfg := worldevents.DefaultOrchestratedConfig()
+	cfg.Director.MaxPendingDirectorBatches = 1
+	st, err := worldevents.NewOrchestratedState("runner-backpressure", "settlement-valewatch", 101, mustReader(t), worldevents.NewHighThreatGoblinEco("runner-backpressure", 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := worldevents.RunOrchestrated(context.Background(), st, nil, 200, cfg, 1)
+	if !errors.Is(err, worldevents.ErrCapacityExceeded) {
+		t.Fatalf("expected bounded consumer capacity: %v", err)
+	}
+	if result.FinalChecksum == "" {
+		t.Fatal("last committed state was not returned")
+	}
+	next, _, err := worldevents.Step(result.FinalState, worldevents.StepInput{}, cfg)
+	if err != nil || next.Director.Tick != result.FinalState.Director.Tick+1 {
+		t.Fatalf("runner state could not resume: %v", err)
+	}
+}
+
+func TestCancellationReasonLimitFailsAtomically(t *testing.T) {
+	cfg := worldevents.DefaultOrchestratedConfig()
+	st, err := worldevents.NewOrchestratedState("reason-limit", "settlement-valewatch", 1, mustReader(t), worldevents.NewHighThreatGoblinEco("reason-limit", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := st.Checksum(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = worldevents.Step(st, worldevents.StepInput{DirectorCommands: []worldevents.DirectorCommand{{Kind: worldevents.DirCmdCancelCampaign, Tick: 1, CampaignID: "x", Reason: strings.Repeat("x", cfg.Director.MaxIdentifierLength+1)}}}, cfg)
+	if !errors.Is(err, worldevents.ErrInvalidCommand) {
+		t.Fatalf("oversized reason: %v", err)
+	}
+	after, err := st.Checksum(cfg)
+	if err != nil || before != after {
+		t.Fatal("rejected cancellation mutated state")
+	}
+}
+
+func TestOneReservationSlotCanBeReusedByCampaigns(t *testing.T) {
+	cfg := worldevents.DefaultOrchestratedConfig()
+	cfg.Ecosystem.MaxReservations = 1
+	cfg.World.HostileBaseDamage = 1
+	cfg.World.HostileDamageVariance = 0
+	cfg.World.PlayerStrikeBaseDamage = 1000
+	st, err := worldevents.NewOrchestratedState("one-reservation", "settlement-valewatch", 10001, mustReader(t), worldevents.NewDualHostileConflictEco("one-reservation", 10001))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5000 && st.Ecosystem.ReservationSeq < 3; i++ {
+		var input worldevents.StepInput
+		if st.World.Invasion.State == world.InvasionUnderAttack {
+			tick := st.World.Tick + 1
+			if len(st.World.Defenders) == 0 {
+				input.GameplayCommands = []world.GameplayCommand{{Kind: world.CmdDeployDefender, Tick: tick, PlayerID: "defender", Position: 3000}}
+			} else if tick%9 == 0 && st.World.Defenders[0].HP > 0 {
+				for _, group := range st.World.Groups {
+					if group.HP > 0 && group.State != ai.StateDead && !group.Routed {
+						input.GameplayCommands = []world.GameplayCommand{{Kind: world.CmdPlayerDefendStrike, Tick: tick, PlayerID: "defender", TargetGroupID: group.GroupID}}
+						break
+					}
+				}
+			}
+		}
+		next, _, err := worldevents.Step(st, input, cfg)
+		if err != nil {
+			t.Fatalf("tick %d: %v", st.Director.Tick+1, err)
+		}
+		st = next
+		for len(st.Director.PendingDirectorBatches) > 0 {
+			st, err = worldevents.AcknowledgeDirectorBatch(st, st.Director.PendingDirectorBatches[0].Sequence, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		for len(st.Director.PendingOutcomes) > 0 {
+			st, err = worldevents.AcknowledgeTerminalOutcome(st, st.Director.PendingOutcomes[0].Sequence, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		for len(st.Director.PendingContributions) > 0 {
+			st, err = worldevents.AcknowledgeContribution(st, st.Director.PendingContributions[0].Sequence, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := st.Validate(cfg); err != nil {
+			t.Fatalf("population/campaign invariant: %v", err)
+		}
+	}
+	if st.Ecosystem.ReservationSeq < 3 {
+		t.Fatalf("reservation slot was not reused: seq=%d tick=%d invasion=%s hp=%d reservations=%d campaigns=%d history=%d", st.Ecosystem.ReservationSeq, st.Director.Tick, st.World.Invasion.State, st.World.SettlementDefenseHP, len(st.Ecosystem.Reservations), len(st.Director.Campaigns), len(st.Director.CompletedHistory))
+	}
+}
+
+func TestDirectorPartialAcknowledgementSurvivesRestore(t *testing.T) {
+	cfg := worldevents.DefaultOrchestratedConfig()
+	cfg.Director.MaxEventsPerUpdate = 1
+	cfg.Director.MaxPendingDirectorBatches = 2
+	st, err := worldevents.NewOrchestratedState("partial-ack", "settlement-valewatch", 7, mustReader(t), worldevents.NewHighThreatGoblinEco("partial-ack", 7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Director.DirectorBatchSeq = 2
+	st.Director.PendingDirectorBatches = []worldevents.DirectorEventBatch{
+		{Sequence: 1, Events: []worldevents.DirectorEvent{{EventID: "a", SimulationID: "partial-ack"}, {EventID: "b", SimulationID: "partial-ack"}}},
+		{Sequence: 2, Events: []worldevents.DirectorEvent{{EventID: "c", SimulationID: "partial-ack"}}},
+	}
+	if _, err := worldevents.AcknowledgeDirectorBatch(st, 2, cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+		t.Fatalf("skipped batch: %v", err)
+	}
+	seq, first, more, err := worldevents.PendingDirectorEventPage(st, 0, cfg)
+	if err != nil || seq != 1 || len(first) != 1 || !more {
+		t.Fatalf("first page: %v %v", first, err)
+	}
+	first[0].EventID = "mutated"
+	_, again, _, _ := worldevents.PendingDirectorEventPage(st, 0, cfg)
+	if again[0].EventID != "a" {
+		t.Fatal("query modified pending fact")
+	}
+	_, second, more, err := worldevents.PendingDirectorEventPage(st, 1, cfg)
+	if err != nil || len(second) != 1 || second[0].EventID != "b" || more {
+		t.Fatalf("second page: %v %v", second, err)
+	}
+	st, err = worldevents.AcknowledgeDirectorBatch(st, 1, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := st.MarshalSnapshot(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := worldevents.UnmarshalOrchestratedSnapshot(raw, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq, page, _, err := worldevents.PendingDirectorEventPage(restored, 0, cfg)
+	if err != nil || seq != 2 || len(page) != 1 || page[0].EventID != "c" {
+		t.Fatalf("restored page: %v %v", page, err)
+	}
+	dup, err := worldevents.AcknowledgeDirectorBatch(restored, 1, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dup.Director.PendingDirectorBatches) != 1 {
+		t.Fatal("duplicate ack lost a batch")
+	}
+}
+
+func TestCampaignAdmissionKeepsFollowupSlot(t *testing.T) {
+	cfg := worldevents.DefaultOrchestratedConfig()
+	cfg.Director.MaxPendingEvents = 2
+	cfg.Director.CandidateEvalIntervalTicks = 100
+	st, err := worldevents.NewOrchestratedState("reserved-slot", "settlement-valewatch", 101, mustReader(t), worldevents.NewHighThreatGoblinEco("reserved-slot", 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = worldevents.EnqueueScheduledEvent(&st.Director, worldevents.ScheduledEvent{Kind: worldevents.EventRecoveryFollowup, Category: worldevents.CategoryCreature, RegionID: ecosystem.RegionThornveilForest, ScheduledTick: 100, DeadlineTick: 150}, cfg.Director)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := st.Checksum(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := worldevents.DirectorCommand{Kind: worldevents.DirCmdScheduleCampaign, Tick: 1, TemplateID: worldevents.TemplateGoblinRaid, RegionID: ecosystem.RegionThornveilForest, SourcePopulationID: "pop-thornveil-goblins", SourceCampID: "camp-thornveil-warren"}
+	if _, _, err := worldevents.Step(st, worldevents.StepInput{DirectorCommands: []worldevents.DirectorCommand{cmd}}, cfg); !errors.Is(err, worldevents.ErrCapacityExceeded) {
+		t.Fatalf("expected admission capacity error: %v", err)
+	}
+	after, err := st.Checksum(cfg)
+	if err != nil || before != after {
+		t.Fatal("rejected admission changed state")
+	}
+	next, _, err := worldevents.Step(st, worldevents.StepInput{}, cfg)
+	if err != nil || next.Director.Tick != 1 {
+		t.Fatalf("normal tick after denied admission: %v", err)
+	}
+}
+
+func TestInFlightCampaignRetainsItsFollowupSlot(t *testing.T) {
+	cfg := worldevents.DefaultOrchestratedConfig()
+	cfg.Director.MaxPendingEvents = 2
+	st, err := worldevents.NewOrchestratedState("followup-slot", "settlement-valewatch", 10001, mustReader(t), worldevents.NewHighThreatGoblinEco("followup-slot", 10001))
+	if err != nil {
+		t.Fatal(err)
+	}
+	filled := false
+	for i := 0; i < 1000; i++ {
+		if !filled && len(st.Director.Campaigns) > 0 && st.Director.Campaigns[0].State.IsInFlight() && len(st.Director.PendingEvents) == 0 {
+			future := worldevents.ScheduledEvent{Kind: worldevents.EventRecoveryFollowup, Category: worldevents.CategoryCreature, RegionID: ecosystem.RegionThornveilForest, ScheduledTick: 10000, DeadlineTick: 10050}
+			if _, err := worldevents.EnqueueScheduledEvent(&st.Director, future, cfg.Director); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := worldevents.EnqueueScheduledEvent(&st.Director, future, cfg.Director); !errors.Is(err, worldevents.ErrCapacityExceeded) {
+				t.Fatalf("reserved slot was consumed: %v", err)
+			}
+			filled = true
+		}
+		next, out, err := worldevents.Step(st, worldevents.StepInput{}, cfg)
+		if err != nil {
+			t.Fatalf("tick %d: %v", st.Director.Tick+1, err)
+		}
+		st = next
+		for len(st.Director.PendingDirectorBatches) > 0 {
+			st, err = worldevents.AcknowledgeDirectorBatch(st, st.Director.PendingDirectorBatches[0].Sequence, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		for len(st.Director.PendingOutcomes) > 0 {
+			st, err = worldevents.AcknowledgeTerminalOutcome(st, st.Director.PendingOutcomes[0].Sequence, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, ev := range out.DirectorEvents {
+			if ev.Type == worldevents.DirEventChainedEventScheduled {
+				if !filled || len(st.Director.PendingEvents) != 2 {
+					t.Fatalf("mandatory followup missing: %+v", st.Director.PendingEvents)
+				}
+				return
+			}
+		}
+	}
+	t.Fatal("campaign did not reach mandatory follow-up")
+}
+
+func TestContributionPressureDefersQueuedCampaignUntilAcknowledged(t *testing.T) {
+	cfg := worldevents.DefaultOrchestratedConfig()
+	// Tight budget: MaxPendingContributions == World.MaxContributions so 1 unacked
+	// contribution leaves < MaxContributions free slots and must pause optional admission.
+	cfg.Director.MaxPendingContributions = cfg.World.MaxContributions
+	const sim = "admission-pressure"
+	st, err := worldevents.NewOrchestratedState(sim, "settlement-valewatch", 11, mustReader(t), worldevents.NewHighThreatGoblinEco(sim, 11))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Director.ContributionSeq = 1
+	st.Director.PendingContributions = []worldevents.PendingContribution{{Sequence: 1, Result: ports.ContributionResult{EventID: "old-contribution", SimulationID: sim, InvasionID: "old-invasion", SettlementID: "settlement-valewatch", PlayerID: "player", Outcome: ports.InvasionOutcomeDefended}}}
+	_, err = worldevents.EnqueueScheduledEvent(&st.Director, worldevents.ScheduledEvent{TemplateID: worldevents.TemplateGoblinRaid, Kind: worldevents.EventGoblinRaidCampaign, Category: worldevents.CategoryCreature, RegionID: ecosystem.RegionThornveilForest, SettlementID: "settlement-valewatch", FactionID: ecosystem.FactionThornGoblins, SourcePopulationID: "pop-thornveil-goblins", SourceCampID: "camp-thornveil-warren", ScheduledTick: 1, DeadlineTick: 100}, cfg.Director)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, _, err := worldevents.Step(st, worldevents.StepInput{}, cfg)
+	if err != nil || len(next.Director.PendingEvents) != 1 || len(next.Director.Campaigns) != 0 {
+		t.Fatalf("campaign not deferred: %v", err)
+	}
+	next, err = worldevents.AcknowledgeContribution(next, 1, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, _, err := worldevents.Step(next, worldevents.StepInput{}, cfg)
+	if err != nil || len(resumed.Director.Campaigns) != 1 {
+		t.Fatalf("campaign did not resume after confirmation: %v", err)
+	}
+}
+
+func TestReleaseCancelledScheduledEventsWithoutTick(t *testing.T) {
+	cfg := worldevents.DefaultConfig()
+	cfg.MaxPendingEvents = 2
+	st := worldevents.NewDirectorState("cancelled-recovery", 1)
+	for i := 0; i < 2; i++ {
+		_, err := worldevents.EnqueueScheduledEvent(&st, worldevents.ScheduledEvent{Kind: worldevents.EventRecoveryFollowup, Category: worldevents.CategoryCreature, RegionID: ecosystem.RegionThornveilForest, ScheduledTick: 10, DeadlineTick: 20}, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.PendingEvents[0].Cancelled = true
+	original, _ := st.Checksum(cfg)
+	recovered, removed, err := worldevents.ReleaseCancelledEvents(st, cfg)
+	if err != nil || removed != 1 || len(recovered.PendingEvents) != 1 || recovered.Tick != st.Tick || recovered.PendingEvents[0].EventID != st.PendingEvents[1].EventID {
+		t.Fatalf("unexpected recovery: %d %v", removed, err)
+	}
+	after, _ := st.Checksum(cfg)
+	if original != after || len(st.PendingEvents) != 2 {
+		t.Fatal("recovery mutated original")
+	}
+	if _, err := worldevents.EnqueueScheduledEvent(&recovered, worldevents.ScheduledEvent{Kind: worldevents.EventRecoveryFollowup, Category: worldevents.CategoryCreature, RegionID: ecosystem.RegionThornveilForest, ScheduledTick: 10, DeadlineTick: 20}, cfg); err != nil {
+		t.Fatalf("capacity not recovered: %v", err)
+	}
+}
+
+func TestFollowupCapacityConfiguration(t *testing.T) {
+	cfg := worldevents.DefaultConfig()
+	cfg.MaxPendingEvents = 1
+	if err := cfg.Validate(); !errors.Is(err, worldevents.ErrInvalidConfig) {
+		t.Fatalf("expected incompatible capacity to fail: %v", err)
+	}
+	cfg.MaxChainDepth = 0
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("single slot without followups: %v", err)
+	}
+}
+
+func TestTerminalOutcomeBackpressureRestoreAndAcknowledge(t *testing.T) {
+	cfg := worldevents.DefaultOrchestratedConfig()
+	cfg.Director.MaxPendingOutcomes = 1
+	st, err := worldevents.NewOrchestratedState("outcome-backpressure", "settlement-valewatch", 4004, mustReader(t), worldevents.NewHighThreatOrcEco("outcome-backpressure", 4004))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 1000; i++ {
+		if st.World.Invasion.State == world.InvasionUnderAttack && st.Director.OutcomeSeq == 0 {
+			st.Director.OutcomeSeq = 1
+			st.Director.PendingOutcomes = []worldevents.TerminalSettlementOutcome{{Sequence: 1, EventID: "existing", SimulationID: "outcome-backpressure", Outcome: ports.InvasionOutcomeDefended}}
+		}
+		before, err := st.Checksum(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		next, _, stepErr := worldevents.Step(st, worldevents.StepInput{}, cfg)
+		if errors.Is(stepErr, worldevents.ErrOutcomeBackpressure) {
+			after, _ := st.Checksum(cfg)
+			if before != after {
+				t.Fatal("blocked step mutated state")
+			}
+			raw, err := st.MarshalSnapshot(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restored, err := worldevents.UnmarshalOrchestratedSnapshot(raw, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pending, err := worldevents.PendingTerminalOutcomes(restored, cfg)
+			if err != nil || len(pending) != 1 || pending[0].Sequence != 1 {
+				t.Fatalf("pending: %+v %v", pending, err)
+			}
+			if _, err := worldevents.AcknowledgeTerminalOutcome(restored, 2, cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+				t.Fatalf("out of order acknowledgement: %v", err)
+			}
+			recovered, err := worldevents.AcknowledgeTerminalOutcome(restored, 1, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			duplicate, err := worldevents.AcknowledgeTerminalOutcome(recovered, 1, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			recoveredSum, _ := recovered.Checksum(cfg)
+			duplicateSum, _ := duplicate.Checksum(cfg)
+			if recoveredSum != duplicateSum {
+				t.Fatal("duplicate acknowledgement changed state")
+			}
+			advanced, out, err := worldevents.Step(recovered, worldevents.StepInput{}, cfg)
+			if err != nil || advanced.Director.Tick != st.Director.Tick+1 || len(out.TerminalOutcomes) != 1 || out.TerminalOutcomes[0].Sequence != 2 {
+				t.Fatalf("recovery failed: %+v %v", out.TerminalOutcomes, err)
+			}
+			pending, err = worldevents.PendingTerminalOutcomes(advanced, cfg)
+			if err != nil || len(pending) != 1 || pending[0].Sequence != 2 {
+				t.Fatalf("next outcome missing: %+v %v", pending, err)
+			}
+			return
+		}
+		if stepErr != nil {
+			t.Fatal(stepErr)
+		}
+		st = next
+	}
+	t.Fatal("scenario did not reach backpressure")
+}
+
+func TestOutcomeAcknowledgementsRequireContiguousOrder(t *testing.T) {
+	cfg := worldevents.DefaultOrchestratedConfig()
+	cfg.Director.MaxPendingOutcomes = 2
+	st, err := worldevents.NewOrchestratedState("ack-order", "settlement-valewatch", 1, mustReader(t), worldevents.NewHighThreatGoblinEco("ack-order", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Director.OutcomeSeq = 2
+	st.Director.PendingOutcomes = []worldevents.TerminalSettlementOutcome{{Sequence: 1, EventID: "o1", SimulationID: "ack-order", Outcome: ports.InvasionOutcomeDefended}, {Sequence: 2, EventID: "o2", SimulationID: "ack-order", Outcome: ports.InvasionOutcomeCaptured}}
+	before, err := st.Checksum(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = worldevents.AcknowledgeTerminalOutcome(st, 2, cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+		t.Fatalf("out of order: %v", err)
+	}
+	after, err := st.Checksum(cfg)
+	if err != nil || before != after {
+		t.Fatal("invalid ack changed input")
+	}
+	one, err := worldevents.AcknowledgeTerminalOutcome(st, 1, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyPending, err := worldevents.PendingTerminalOutcomes(one, cfg)
+	if err != nil || len(copyPending) != 1 {
+		t.Fatal("missing pending fact")
+	}
+	copyPending[0].EventID = "mutated"
+	again, err := worldevents.PendingTerminalOutcomes(one, cfg)
+	if err != nil || again[0].EventID != "o2" {
+		t.Fatal("query exposed mutable state")
+	}
+	two, err := worldevents.AcknowledgeTerminalOutcome(one, 2, cfg)
+	if err != nil || len(two.Director.PendingOutcomes) != 0 {
+		t.Fatalf("second ack: %v", err)
+	}
+	if _, err = worldevents.AcknowledgeTerminalOutcome(two, 1, cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+		t.Fatalf("stale ack accepted: %v", err)
+	}
+}
+
+func TestContributionBackpressureRestoresAndRecoversWithoutTick(t *testing.T) {
+	cfg := worldevents.DefaultOrchestratedConfig()
+	cfg.World.MaxContributions = 1
+	cfg.Director.MaxPendingContributions = 1
+	const sim = "contribution-backpressure"
+	st, err := worldevents.NewOrchestratedState(sim, "settlement-valewatch", 4004, mustReader(t), worldevents.NewHighThreatOrcEco(sim, 4004))
+	if err != nil {
+		t.Fatal(err)
+	}
+	filled := false
+	for i := 0; i < 1000; i++ {
+		if !filled && st.World.Invasion.State == world.InvasionUnderAttack {
+			st.Director.ContributionSeq = 1
+			st.Director.PendingContributions = []worldevents.PendingContribution{{Sequence: 1, Result: ports.ContributionResult{EventID: "prior", SimulationID: sim, InvasionID: "prior-invasion", SettlementID: "settlement-valewatch", PlayerID: "prior-player", Outcome: ports.InvasionOutcomeDefended}}}
+			filled = true
+		}
+		var input worldevents.StepInput
+		if st.World.Invasion.State == world.InvasionUnderAttack && len(st.World.Defenders) == 0 {
+			input.GameplayCommands = []world.GameplayCommand{{Kind: world.CmdDeployDefender, Tick: st.World.Tick + 1, PlayerID: "defender", Position: 3000}}
+		} else if st.World.Invasion.State == world.InvasionUnderAttack && len(st.World.Defenders) > 0 && st.World.Defenders[0].HP > 0 && (st.World.Tick+1)%9 == 0 {
+			for _, group := range st.World.Groups {
+				if group.HP > 0 && group.State != ai.StateDead && !group.Routed {
+					input.GameplayCommands = []world.GameplayCommand{{Kind: world.CmdPlayerDefendStrike, Tick: st.World.Tick + 1, PlayerID: "defender", TargetGroupID: group.GroupID}}
+					break
+				}
+			}
+		}
+		before, err := st.Checksum(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		next, _, stepErr := worldevents.Step(st, input, cfg)
+		if errors.Is(stepErr, worldevents.ErrContributionBackpressure) {
+			after, _ := st.Checksum(cfg)
+			if before != after {
+				t.Fatal("blocked tick mutated state")
+			}
+			raw, err := st.MarshalSnapshot(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restored, err := worldevents.UnmarshalOrchestratedSnapshot(raw, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pending, err := worldevents.PendingContributionResults(restored, cfg)
+			if err != nil || len(pending) != 1 || pending[0].Result.EventID != "prior" {
+				t.Fatalf("pending: %+v %v", pending, err)
+			}
+			if _, err := worldevents.AcknowledgeContribution(restored, 2, cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+				t.Fatalf("invalid ack: %v", err)
+			}
+			recovered, err := worldevents.AcknowledgeContribution(restored, 1, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			duplicate, err := worldevents.AcknowledgeContribution(recovered, 1, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a, _ := recovered.Checksum(cfg)
+			b, _ := duplicate.Checksum(cfg)
+			if a != b {
+				t.Fatal("duplicate acknowledgement changed state")
+			}
+			advanced, out, err := worldevents.Step(recovered, input, cfg)
+			if err != nil || advanced.World.Tick != st.World.Tick+1 {
+				t.Fatalf("tick did not advance: %v", err)
+			}
+			pending, err = worldevents.PendingContributionResults(advanced, cfg)
+			if err != nil || len(pending) != 1 || pending[0].Sequence != 2 {
+				t.Fatalf("new contribution missing: %+v %v", pending, err)
+			}
+			found := false
+			for _, ev := range out.WorldEvents {
+				if ev.Contribution != nil && *ev.Contribution == pending[0].Result {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatal("outbox fact differs from tick output")
+			}
+			if err := advanced.Validate(cfg); err != nil {
+				t.Fatalf("population conservation: %v", err)
+			}
+			return
+		}
+		if stepErr != nil {
+			t.Fatal(stepErr)
+		}
+		st = next
+	}
+	t.Fatal("scenario did not reach contribution backpressure")
+}
+
+func TestOrchestratedV5RejectsLegacyReservationState(t *testing.T) {
+	cfg := worldevents.DefaultOrchestratedConfig()
+	st, err := worldevents.NewOrchestratedState("legacy-reservation", "settlement-valewatch", 1, mustReader(t), worldevents.NewHighThreatGoblinEco("legacy-reservation", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, created, err := ecosystem.CreateReservation(&st.Ecosystem, ecosystem.ReservationRequest{IdempotencyKey: "legacy", CampaignID: "c", CampID: "camp-thornveil-warren", Amount: 1, CreatedTick: 1, ExpiryTick: 2}, cfg.Ecosystem)
+	if err != nil || !created {
+		t.Fatalf("setup legacy: %v", err)
+	}
+	if err = st.Validate(cfg); !errors.Is(err, worldevents.ErrInvalidState) {
+		t.Fatalf("legacy state accepted: %v", err)
+	}
+}
+
+func TestBatchAndTotalDirectorEventLimits(t *testing.T) {
+	// 1. Incompatible config: MaxPendingDirectorEvents < MaxEventsPerBatch must fail upfront.
+	badCfg := worldevents.DefaultConfig()
+	badCfg.MaxEventsPerBatch = 16
+	badCfg.MaxPendingDirectorEvents = 8
+	if err := badCfg.Validate(); !errors.Is(err, worldevents.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for MaxPendingDirectorEvents < MaxEventsPerBatch, got %v", err)
+	}
+
+	// 2. Single-tick excess above MaxEventsPerBatch returns ErrTickEventCapacity atomically
+	// (NOT silent truncation and NOT retriable without config fix).
+	cfg := worldevents.DefaultOrchestratedConfig()
+	cfg.Director.MaxEventsPerUpdate = 1
+	cfg.Director.MaxEventsPerBatch = 1
+	cfg.Director.MaxPendingDirectorEvents = 4
+	st, err := worldevents.NewOrchestratedState("batch-cap", "settlement-valewatch", 101, mustReader(t), worldevents.NewHighThreatGoblinEco("batch-cap", 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur := st
+	hitSingleTickCap := false
+	for tick := uint64(1); tick <= 15; tick++ {
+		before, _ := cur.Checksum(cfg)
+		next, _, err := worldevents.Step(cur, worldevents.StepInput{}, cfg)
+		if errors.Is(err, worldevents.ErrTickEventCapacity) {
+			after, _ := cur.Checksum(cfg)
+			if before != after {
+				t.Fatal("ErrTickEventCapacity mutated state")
+			}
+			hitSingleTickCap = true
+			break
+		}
+		if err != nil {
+			t.Fatalf("tick %d unexpected err: %v", tick, err)
+		}
+		cur = next
+	}
+	if !hitSingleTickCap {
+		t.Fatal("expected single tick producing >1 event to trigger ErrTickEventCapacity")
+	}
+
+	// 3. Accumulated total events exceeding MaxPendingDirectorEvents returns recoverable ErrDirectorBackpressure.
+	cfg2 := worldevents.DefaultOrchestratedConfig()
+	cfg2.Director.MaxEventsPerUpdate = 1
+	cfg2.Director.MaxEventsPerBatch = 8
+	cfg2.Director.MaxPendingDirectorBatches = 10
+	cfg2.Director.MaxPendingDirectorEvents = 8 // holds 1 batch of ~3-4 events, blocks when total would exceed 8
+	cur2, err := worldevents.NewOrchestratedState("total-dir-cap", "settlement-valewatch", 101, mustReader(t), worldevents.NewHighThreatGoblinEco("total-dir-cap", 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := false
+	for tick := 0; tick < 80; tick++ {
+		next, _, err := worldevents.Step(cur2, worldevents.StepInput{}, cfg2)
+		if errors.Is(err, worldevents.ErrDirectorBackpressure) {
+			stats, sErr := worldevents.PendingQueueStats(cur2, cfg2)
+			if sErr != nil || stats.PendingDirectorEvents == 0 {
+				t.Fatalf("expected non-empty pending events on backpressure: %+v %v", stats, sErr)
+			}
+			// Drain oldest batch via paging -> verified ack -> resume tick!
+			var seq uint64
+			count := 0
+			for offset := 0; ; {
+				var page []worldevents.DirectorEvent
+				var more bool
+				seq, page, more, err = worldevents.PendingDirectorEventPage(cur2, offset, cfg2)
+				if err != nil {
+					t.Fatal(err)
+				}
+				count += len(page)
+				offset += len(page)
+				if !more {
+					break
+				}
+			}
+			cur2, err = worldevents.AcknowledgeDirectorBatchVerified(cur2, seq, count, cfg2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resumed, _, err := worldevents.Step(cur2, worldevents.StepInput{}, cfg2)
+			if err != nil || resumed.Director.Tick != cur2.Director.Tick+1 {
+				t.Fatalf("failed to resume after total event recovery: %v", err)
+			}
+			recovered = true
+			break
+		}
+		if err != nil {
+			t.Fatalf("step %d: %v", tick, err)
+		}
+		cur2 = next
+	}
+	if !recovered {
+		t.Fatal("expected accumulated total director events backpressure and recovery")
+	}
+}
+
+func TestSlowConsumerAllowsIndependentCampaignWithinSafeBudget(t *testing.T) {
+	cfg := worldevents.DefaultOrchestratedConfig()
+	// Default: World.MaxContributions=128, Director.MaxPendingContributions=256 (2x).
+	// 5 unconfirmed contributions leave 251 >= 128 slots -> independent campaign MUST NOT be blocked!
+	const sim = "slow-safe-budget"
+	st, err := worldevents.NewOrchestratedState(sim, "settlement-valewatch", 12, mustReader(t), worldevents.NewHighThreatGoblinEco(sim, 12))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for seq := uint64(1); seq <= 5; seq++ {
+		st.Director.ContributionSeq = seq
+		st.Director.PendingContributions = append(st.Director.PendingContributions, worldevents.PendingContribution{
+			Sequence: seq,
+			Result: ports.ContributionResult{
+				EventID: fmt.Sprintf("old-c-%d", seq), SimulationID: sim, InvasionID: "old-inv",
+				SettlementID: "settlement-valewatch", PlayerID: fmt.Sprintf("p-%d", seq), Outcome: ports.InvasionOutcomeDefended,
+			},
+		})
+	}
+	_, err = worldevents.EnqueueScheduledEvent(&st.Director, worldevents.ScheduledEvent{
+		TemplateID: worldevents.TemplateGoblinRaid, Kind: worldevents.EventGoblinRaidCampaign,
+		Category: worldevents.CategoryCreature, RegionID: ecosystem.RegionThornveilForest,
+		SettlementID: "settlement-valewatch", FactionID: ecosystem.FactionThornGoblins,
+		SourcePopulationID: "pop-thornveil-goblins", SourceCampID: "camp-thornveil-warren",
+		ScheduledTick: 1, DeadlineTick: 100,
+	}, cfg.Director)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, _, err := worldevents.Step(st, worldevents.StepInput{}, cfg)
+	if err != nil || len(next.Director.Campaigns) != 1 {
+		t.Fatalf("expected independent campaign admitted within safe contribution budget (251>=128), got camps=%d err=%v", len(next.Director.Campaigns), err)
+	}
+
+	// Now fill pending contributions to 129 (leaving 127 < 128): admission MUST pause, and partial recovery
+	// acknowledging ONLY 1 contribution (to 128 pending, leaving 128 free) MUST unblock immediately!
+	st2, err := worldevents.NewOrchestratedState(sim, "settlement-valewatch", 12, mustReader(t), worldevents.NewHighThreatGoblinEco(sim, 12))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for seq := uint64(1); seq <= 129; seq++ {
+		st2.Director.ContributionSeq = seq
+		st2.Director.PendingContributions = append(st2.Director.PendingContributions, worldevents.PendingContribution{
+			Sequence: seq,
+			Result: ports.ContributionResult{
+				EventID: fmt.Sprintf("c-%03d", seq), SimulationID: sim, InvasionID: "old-inv",
+				SettlementID: "settlement-valewatch", PlayerID: fmt.Sprintf("p-%03d", seq), Outcome: ports.InvasionOutcomeDefended,
+			},
+		})
+	}
+	_, err = worldevents.EnqueueScheduledEvent(&st2.Director, worldevents.ScheduledEvent{
+		TemplateID: worldevents.TemplateGoblinRaid, Kind: worldevents.EventGoblinRaidCampaign,
+		Category: worldevents.CategoryCreature, RegionID: ecosystem.RegionThornveilForest,
+		SettlementID: "settlement-valewatch", FactionID: ecosystem.FactionThornGoblins,
+		SourcePopulationID: "pop-thornveil-goblins", SourceCampID: "camp-thornveil-warren",
+		ScheduledTick: 1, DeadlineTick: 100,
+	}, cfg.Director)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paused, _, err := worldevents.Step(st2, worldevents.StepInput{}, cfg)
+	if err != nil || len(paused.Director.Campaigns) != 0 {
+		t.Fatalf("expected campaign paused when free contribution slots (127) < MaxContributions (128), camps=%d err=%v", len(paused.Director.Campaigns), err)
+	}
+	// Partial recovery: ack just 1 contribution -> 128 remaining pending, 128 free >= 128 -> unblocked!
+	partialRecovered, err := worldevents.AcknowledgeContributionVerified(paused, 1, "c-001", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unblocked, _, err := worldevents.Step(partialRecovered, worldevents.StepInput{}, cfg)
+	if err != nil || len(unblocked.Director.Campaigns) != 1 {
+		t.Fatalf("expected partial recovery to unblock admission immediately, camps=%d err=%v", len(unblocked.Director.Campaigns), err)
+	}
+}
+
+func TestVerifiedAcknowledgementsRejectConflictsAndPartialBatch(t *testing.T) {
+	cfg := worldevents.DefaultOrchestratedConfig()
+	const sim = "verified-acks"
+	st, err := worldevents.NewOrchestratedState(sim, "settlement-valewatch", 7, mustReader(t), worldevents.NewHighThreatGoblinEco(sim, 7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Director.DirectorBatchSeq = 1
+	st.Director.PendingDirectorBatches = []worldevents.DirectorEventBatch{{
+		Sequence: 1,
+		Events: []worldevents.DirectorEvent{
+			{EventID: "ev-1", SimulationID: sim, Type: worldevents.DirEventCandidateScheduled},
+			{EventID: "ev-2", SimulationID: sim, Type: worldevents.DirEventCampaignPhaseChanged},
+		},
+	}}
+	st.Director.OutcomeSeq = 1
+	st.Director.PendingOutcomes = []worldevents.TerminalSettlementOutcome{{
+		Sequence: 1, EventID: "out-1", SimulationID: sim, Outcome: ports.InvasionOutcomeDefended,
+	}}
+	st.Director.TerminalOutcomes = []worldevents.TerminalSettlementOutcome{{
+		Sequence: 1, EventID: "out-1", SimulationID: sim, Outcome: ports.InvasionOutcomeDefended,
+	}}
+	st.Director.ContributionSeq = 1
+	st.Director.PendingContributions = []worldevents.PendingContribution{{
+		Sequence: 1,
+		Result: ports.ContributionResult{
+			EventID: "con-1", SimulationID: sim, InvasionID: "inv-1",
+			SettlementID: "settlement-valewatch", PlayerID: "p-1", Outcome: ports.InvasionOutcomeDefended,
+		},
+	}}
+
+	before, _ := st.Checksum(cfg)
+	// Partial-batch count rejected.
+	if _, err := worldevents.AcknowledgeDirectorBatchVerified(st, 1, 1, cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+		t.Fatalf("expected partial-batch rejection, got %v", err)
+	}
+	if _, err := worldevents.AcknowledgeDirectorBatchVerified(st, 1, 0, cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+		t.Fatalf("expected zero-count rejection, got %v", err)
+	}
+	// Conflicting EventID rejected for outcome & contribution.
+	if _, err := worldevents.AcknowledgeTerminalOutcomeVerified(st, 1, "wrong-out", cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+		t.Fatalf("expected conflicting outcome EventID rejection, got %v", err)
+	}
+	if _, err := worldevents.AcknowledgeContributionVerified(st, 1, "wrong-con", cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+		t.Fatalf("expected conflicting contribution EventID rejection, got %v", err)
+	}
+	after, _ := st.Checksum(cfg)
+	if before != after {
+		t.Fatal("rejected verified acks mutated state")
+	}
+
+	// Valid verified acks succeed; conflicting retry on outcome history rejected.
+	st, err = worldevents.AcknowledgeDirectorBatchVerified(st, 1, 2, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err = worldevents.AcknowledgeTerminalOutcomeVerified(st, 1, "out-1", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worldevents.AcknowledgeTerminalOutcomeVerified(st, 1, "forged-out", cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+		t.Fatalf("expected conflicting retry on outcome history rejected, got %v", err)
+	}
+	st, err = worldevents.AcknowledgeContributionVerified(st, 1, "con-1", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err := worldevents.PendingQueueStats(st, cfg)
+	if err != nil || stats.PendingDirectorBatches != 0 || stats.PendingOutcomes != 0 || stats.PendingContributions != 0 {
+		t.Fatalf("expected drained queues, got %+v %v", stats, err)
+	}
+
+	// Empty-queue & invalid-offset edge cases on pagination and verified acks.
+	if _, _, _, err := worldevents.PendingDirectorEventPage(st, 1, cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+		t.Fatalf("expected error for non-zero offset on empty batch queue, got %v", err)
+	}
+	if _, _, _, err := worldevents.PendingDirectorEventPage(st, 0, cfg); err != nil {
+		t.Fatalf("expected clean empty read at offset 0, got %v", err)
+	}
+	if _, err := worldevents.AcknowledgeDirectorBatchVerified(st, 2, 1, cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+		t.Fatalf("expected future batch ack rejected on empty queue, got %v", err)
+	}
+	if _, err := worldevents.AcknowledgeTerminalOutcomeVerified(st, 1, "", cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+		t.Fatalf("expected empty event_id rejected for outcome, got %v", err)
+	}
+	if _, err := worldevents.AcknowledgeTerminalOutcomeVerified(st, 2, "x", cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+		t.Fatalf("expected future outcome ack rejected on empty queue, got %v", err)
+	}
+	if _, err := worldevents.AcknowledgeContributionVerified(st, 1, "", cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+		t.Fatalf("expected empty event_id rejected for contribution, got %v", err)
+	}
+	if _, err := worldevents.AcknowledgeContributionVerified(st, 2, "x", cfg); !errors.Is(err, worldevents.ErrInvalidCommand) {
+		t.Fatalf("expected future contribution ack rejected on empty queue, got %v", err)
+	}
+	// Idempotent repeat of last acknowledged sequence on all 3 verified endpoints.
+	if _, err := worldevents.AcknowledgeDirectorBatchVerified(st, 1, 2, cfg); err != nil {
+		t.Fatalf("idempotent verified batch ack failed: %v", err)
+	}
+	if _, err := worldevents.AcknowledgeTerminalOutcomeVerified(st, 1, "out-1", cfg); err != nil {
+		t.Fatalf("idempotent verified outcome ack failed: %v", err)
+	}
+	if _, err := worldevents.AcknowledgeContributionVerified(st, 1, "con-1", cfg); err != nil {
+		t.Fatalf("idempotent verified contribution ack failed: %v", err)
+	}
+	// Invalid state rejected cleanly by query & ack entrypoints.
+	badSt := st.Clone()
+	badSt.Director.Tick = 999
+	if _, err := worldevents.PendingQueueStats(badSt, cfg); err == nil {
+		t.Fatal("expected PendingQueueStats error on invalid state")
+	}
+	if _, _, _, err := worldevents.PendingDirectorEventPage(badSt, 0, cfg); err == nil {
+		t.Fatal("expected PendingDirectorEventPage error on invalid state")
+	}
+	if _, err := worldevents.PendingTerminalOutcomes(badSt, cfg); err == nil {
+		t.Fatal("expected PendingTerminalOutcomes error on invalid state")
+	}
+	if _, err := worldevents.PendingContributionResults(badSt, cfg); err == nil {
+		t.Fatal("expected PendingContributionResults error on invalid state")
+	}
+	if _, err := worldevents.AcknowledgeDirectorBatchVerified(badSt, 1, 1, cfg); err == nil {
+		t.Fatal("expected AcknowledgeDirectorBatchVerified error on invalid state")
+	}
+	if _, err := worldevents.AcknowledgeTerminalOutcomeVerified(badSt, 1, "out-1", cfg); err == nil {
+		t.Fatal("expected AcknowledgeTerminalOutcomeVerified error on invalid state")
+	}
+	if _, err := worldevents.AcknowledgeContributionVerified(badSt, 1, "con-1", cfg); err == nil {
+		t.Fatal("expected AcknowledgeContributionVerified error on invalid state")
+	}
+	// Snapshot budget check when single tick exceeds tiny MaxSnapshotBytes.
+	tinySnapCfg := cfg
+	tinySnapCfg.Director.CandidateEvalIntervalTicks = 1
+	tinySnapCfg.Director.MaxSnapshotBytes = 256
+	if _, _, err := worldevents.Step(st, worldevents.StepInput{}, tinySnapCfg); !errors.Is(err, worldevents.ErrTickEventCapacity) {
+		t.Fatalf("expected ErrTickEventCapacity for impossible snapshot budget, got %v", err)
+	}
+}
+
+func TestSemanticallyInvalidSnapshotsWithRecalculatedChecksumRejected(t *testing.T) {
+	cfg := worldevents.DefaultOrchestratedConfig()
+	st, err := worldevents.NewOrchestratedState("forged-snap", "settlement-valewatch", 99, mustReader(t), worldevents.NewHighThreatGoblinEco("forged-snap", 99))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodeForged := func(tampered worldevents.OrchestratedState) []byte {
+		// Recompute a syntactically valid envelope with a matching SHA-256 checksum
+		// bypassing Validate() via raw simulation.EncodeSnapshot!
+		rawPayload, _ := json.Marshal(tampered)
+		h := simulation.NewCanonicalHasher()
+		h.WriteString(string(rawPayload))
+		raw, _ := simulation.EncodeSnapshot(tampered, h.SumHex())
+		return raw
+	}
+
+	assertSemanticReject := func(label string, tampered worldevents.OrchestratedState) {
+		t.Helper()
+		_, err := worldevents.UnmarshalOrchestratedSnapshot(encodeForged(tampered), cfg)
+		if err == nil {
+			t.Fatalf("%s: expected rejection, got nil", label)
+		}
+		if errors.Is(err, simulation.ErrSnapshotChecksumMismatch) {
+			t.Fatalf("%s: rejected by checksum instead of semantic validation: %v", label, err)
+		}
+	}
+
+	// Case 1: Forged cursor DirectorBatchAckSeq > DirectorBatchSeq.
+	f1 := st.Clone()
+	f1.Director.DirectorBatchAckSeq = 5
+	assertSemanticReject("forged ack cursor", f1)
+
+	// Case 2: Future CompletedTick in PendingOutcomes.
+	f2 := st.Clone()
+	f2.Director.OutcomeSeq = 1
+	f2.Director.PendingOutcomes = []worldevents.TerminalSettlementOutcome{{
+		Sequence: 1, EventID: "out-future", SimulationID: "forged-snap", Outcome: ports.InvasionOutcomeDefended, CompletedTick: 999,
+	}}
+	assertSemanticReject("future CompletedTick outcome", f2)
+
+	// Case 3: Active campaign while World.Invasion.State == Peace.
+	f3 := st.Clone()
+	f3.Director.Campaigns = []worldevents.Campaign{{
+		CampaignID: "cmp-ghost", TemplateID: worldevents.TemplateGoblinRaid, EventKind: worldevents.EventGoblinRaidCampaign,
+		RegionID: ecosystem.RegionThornveilForest, SettlementID: "settlement-valewatch", FactionID: ecosystem.FactionThornGoblins,
+		FamilyID: ai.FamilyGoblin, State: worldevents.CampaignActive, TerminalOutcome: ports.InvasionOutcomeNone,
+		CreatedTick: 0, DeadlineTick: 50,
+	}}
+	assertSemanticReject("CampaignActive mismatch with Peace invasion", f3)
+
+	// Case 4: Invalid DirectorEventType inside PendingDirectorBatches.
+	f4 := st.Clone()
+	f4.Director.DirectorBatchSeq = 1
+	f4.Director.PendingDirectorBatches = []worldevents.DirectorEventBatch{{
+		Sequence: 1, Events: []worldevents.DirectorEvent{{EventID: "bad-ev", SimulationID: "forged-snap", Type: worldevents.DirectorEventType("ForgedType")}},
+	}}
+	assertSemanticReject("invalid DirectorEventType", f4)
+
+	// Case 5: Legacy arbitrary-key reservation embedded in v5 snapshot.
+	f5 := st.Clone()
+	if _, _, _, err := ecosystem.CreateReservation(&f5.Ecosystem, ecosystem.ReservationRequest{
+		IdempotencyKey: "legacy-key", CampaignID: "c1", CampID: "camp-thornveil-warren", Amount: 2, CreatedTick: 0, ExpiryTick: 10,
+	}, cfg.Ecosystem); err != nil {
+		t.Fatal(err)
+	}
+	assertSemanticReject("legacy arbitrary-key reservation in v5 snapshot", f5)
+}
+
+func TestIndependentPopulationConservationEquationAndAckIsolation(t *testing.T) {
+	// Independent verifier (does NOT rely on Validate()):
+	// Checks Total == Free + Reserved + Materialized AND
+	// P_final == P_initial + births - deaths + immigration - emigration across every tick,
+	// AND verifies acknowledgements and failed steps NEVER alter any population bucket.
+	cfg := worldevents.DefaultOrchestratedConfig()
+	cfg.Director.MaxPendingDirectorBatches = 2
+	st, err := worldevents.NewOrchestratedState("indep-conservation", "settlement-valewatch", 4020, mustReader(t), worldevents.NewHighThreatGoblinEco("indep-conservation", 4020))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sumTotal := func(eco ecosystem.EcosystemState) (free, reserved, mat, total int64) {
+		for _, p := range eco.Populations {
+			if p.FreePopulation < 0 || p.ReservedPopulation < 0 || p.MaterializedPopulation < 0 {
+				t.Fatalf("negative bucket: %+v", p)
+			}
+			free += p.FreePopulation
+			reserved += p.ReservedPopulation
+			mat += p.MaterializedPopulation
+		}
+		return free, reserved, mat, free + reserved + mat
+	}
+
+	_, _, _, initialTotal := sumTotal(st.Ecosystem)
+	var cumulativeBirths, cumulativeDeaths int64
+	var cumulativeImmig, cumulativeEmig int64
+
+	cur := st
+	for step := 0; step < 200 && cur.Director.Tick < 130; step++ {
+		fBefore, rBefore, mBefore, totBefore := sumTotal(cur.Ecosystem)
+		var in worldevents.StepInput
+		if cur.World.Invasion.State == world.InvasionUnderAttack {
+			if len(cur.World.Defenders) == 0 {
+				in.GameplayCommands = []world.GameplayCommand{
+					{Kind: world.CmdDeployDefender, Tick: cur.World.Tick + 1, PlayerID: "p-a", Position: 3000},
+					{Kind: world.CmdDeployDefender, Tick: cur.World.Tick + 1, PlayerID: "p-b", Position: 2200},
+				}
+			} else if (cur.World.Tick+1)%9 == 0 {
+				for _, g := range cur.World.Groups {
+					if g.HP > 0 && g.State != ai.StateDead && !g.Routed {
+						in.GameplayCommands = []world.GameplayCommand{{Kind: world.CmdPlayerDefendStrike, Tick: cur.World.Tick + 1, PlayerID: "p-a", TargetGroupID: g.GroupID}}
+						break
+					}
+				}
+			}
+		}
+		next, out, err := worldevents.Step(cur, in, cfg)
+		if errors.Is(err, worldevents.ErrDirectorBackpressure) {
+			// Failed/blocked Step MUST leave every population bucket completely untouched.
+			fFail, rFail, mFail, totFail := sumTotal(cur.Ecosystem)
+			if fFail != fBefore || rFail != rBefore || mFail != mBefore || totFail != totBefore {
+				t.Fatal("blocked Step mutated population")
+			}
+			// Acknowledge MUST NEVER modify any population bucket.
+			stats, _ := worldevents.PendingQueueStats(cur, cfg)
+			if stats.PendingDirectorBatches > 0 {
+				seq, _, _, _ := worldevents.PendingDirectorEventPage(cur, 0, cfg)
+				cur, err = worldevents.AcknowledgeDirectorBatch(cur, seq, cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fAck, rAck, mAck, totAck := sumTotal(cur.Ecosystem)
+				if fAck != fBefore || rAck != rBefore || mAck != mBefore || totAck != totBefore {
+					t.Fatal("AcknowledgeDirectorBatch mutated population")
+				}
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("step %d: %v", step, err)
+		}
+
+		// Reconcile independent ecological accounting equation from emitted events!
+		for _, ev := range out.EcosystemEvents {
+			switch ev.Type {
+			case ecosystem.EventPopulationGrew:
+				cumulativeBirths += ev.Amount
+			case ecosystem.EventPopulationDeclined:
+				cumulativeDeaths += ev.Amount
+			case ecosystem.EventPopulationMigrated:
+				// Inter-region conserved transfer: outflow == inflow.
+				cumulativeEmig += ev.Amount
+				cumulativeImmig += ev.Amount
+			case ecosystem.EventCreatureGroupDematerialized:
+				// Parse casualties from detail "res=... survivors=X losses=Y".
+				var surv, losses int64
+				if idx := strings.Index(ev.Detail, "survivors="); idx >= 0 {
+					_, _ = fmt.Sscanf(ev.Detail[idx:], "survivors=%d losses=%d", &surv, &losses)
+					cumulativeDeaths += losses
+				}
+			}
+		}
+
+		_, _, _, totAfter := sumTotal(next.Ecosystem)
+		expectedTotal := initialTotal + cumulativeBirths - cumulativeDeaths + cumulativeImmig - cumulativeEmig
+		if totAfter != expectedTotal {
+			t.Fatalf("tick %d independent conservation broken: got=%d want=%d (init=%d births=%d deaths=%d immig=%d emig=%d)",
+				next.Director.Tick, totAfter, expectedTotal, initialTotal, cumulativeBirths, cumulativeDeaths, cumulativeImmig, cumulativeEmig)
+		}
+
+		// Confirm any outcomes/contributions and verify zero population change on ack.
+		pendingOut, _ := worldevents.PendingTerminalOutcomes(next, cfg)
+		for _, o := range pendingOut {
+			f0, r0, m0, t0 := sumTotal(next.Ecosystem)
+			next, err = worldevents.AcknowledgeTerminalOutcomeVerified(next, o.Sequence, o.EventID, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f1, r1, m1, t1 := sumTotal(next.Ecosystem)
+			if f0 != f1 || r0 != r1 || m0 != m1 || t0 != t1 {
+				t.Fatal("AcknowledgeTerminalOutcome mutated population")
+			}
+		}
+		pendingCon, _ := worldevents.PendingContributionResults(next, cfg)
+		for _, c := range pendingCon {
+			f0, r0, m0, t0 := sumTotal(next.Ecosystem)
+			next, err = worldevents.AcknowledgeContributionVerified(next, c.Sequence, c.Result.EventID, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f1, r1, m1, t1 := sumTotal(next.Ecosystem)
+			if f0 != f1 || r0 != r1 || m0 != m1 || t0 != t1 {
+				t.Fatal("AcknowledgeContribution mutated population")
+			}
+		}
+		cur = next
+	}
+	if cur.Director.Tick != 130 {
+		t.Fatalf("expected tick 130, reached %d", cur.Director.Tick)
+	}
+}
+
+func TestAllFiveHeadlessConsumerScenariosJtoN(t *testing.T) {
+	reader := mustReader(t)
+	ctx := context.Background()
+
+	sumJ, err := worldevents.RunScenarioJImmediateConsumer(ctx, reader)
+	if err != nil || sumJ.CampaignsCompleted < 1 || sumJ.OutcomesAcked < 1 || sumJ.DirectorPagesRead <= sumJ.DirectorBatchesAcked {
+		t.Fatalf("Scenario J failed: %+v err=%v", sumJ, err)
+	}
+	sumK, err := worldevents.RunScenarioKSlowConsumer(ctx, reader)
+	if err != nil || sumK.CampaignsCompleted < 1 || sumK.OutcomesAcked < 1 || sumK.BackpressurePauses < 1 {
+		t.Fatalf("Scenario K failed: %+v err=%v", sumK, err)
+	}
+	sumL, err := worldevents.RunScenarioLPartiallyUnavailableConsumer(ctx, reader)
+	if err != nil || sumL.CampaignsCompleted < 1 || sumL.BackpressurePauses < 1 || !sumL.SnapshotVerified {
+		t.Fatalf("Scenario L failed: %+v err=%v", sumL, err)
+	}
+	sumM, err := worldevents.RunScenarioMRecoveredConsumer(ctx, reader)
+	if err != nil || sumM.CampaignsCompleted < 1 || sumM.BackpressurePauses < 1 || !sumM.SnapshotVerified || sumM.DirectorPagesRead <= sumM.DirectorBatchesAcked {
+		t.Fatalf("Scenario M failed: %+v err=%v", sumM, err)
+	}
+	sumN, err := worldevents.RunScenarioNDuplicateDeliveryConsumer(ctx, reader)
+	if err != nil || sumN.CampaignsCompleted < 1 || sumN.RedeliveriesDeduped < 1 || !sumN.SnapshotVerified {
+		t.Fatalf("Scenario N failed: %+v err=%v", sumN, err)
+	}
+}
+
+// TestLongDurationSlowConsumerWithSmallCapacities executes a prolonged multi-seed simulation
+// with intentionally tiny capacities and a slow/stalling consumer + mid-run snapshot restore,
+// verifying recovery progress, zero lost facts, zero duplicates, conservation, and bounded heap.
+func TestLongDurationSlowConsumerWithSmallCapacities(t *testing.T) {
+	reader := mustReader(t)
+	seeds := []uint64{10001, 20002, 30003}
+	const targetTicks = uint64(800) // 3 seeds * 800 = 2,400 ticks under slow consumer & tiny queues
+
+	cfg := worldevents.DefaultOrchestratedConfig()
+	cfg.Ecosystem.TicksPerEpoch = 4
+	cfg.Ecosystem.MaxReservations = 2
+	cfg.World.MaxContributions = 6
+	cfg.Director.MaxPendingContributions = 12
+	cfg.Director.MaxPendingOutcomes = 1
+	cfg.Director.MaxPendingDirectorBatches = 2
+	cfg.Director.MaxEventsPerUpdate = 2
+	cfg.Director.MaxEventsPerBatch = 32
+	cfg.Director.MaxPendingDirectorEvents = 64
+
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	baselineHeap := m.HeapAlloc
+	var peakHeap uint64
+
+	totalOutcomes := 0
+	totalPauses := 0
+	totalContribs := 0
+	totalBatches := 0
+
+	for _, seed := range seeds {
+		simID := fmt.Sprintf("slow-long-%d", seed)
+		st, err := worldevents.NewOrchestratedState(simID, "settlement-valewatch", seed, reader, worldevents.NewDualHostileConflictEco(simID, seed))
+		if err != nil {
+			t.Fatal(err)
+		}
+		seenDir := make(map[string]struct{})
+		seenOut := make(map[string]struct{})
+		seenCon := make(map[string]struct{})
+		restoredOnce := false
+
+		drainStep := func(cur worldevents.OrchestratedState, batchLimit, outLimit, conLimit int) (worldevents.OrchestratedState, error) {
+			for b := 0; b < batchLimit; b++ {
+				stats, err := worldevents.PendingQueueStats(cur, cfg)
+				if err != nil || stats.PendingDirectorBatches == 0 {
+					break
+				}
+				var seq uint64
+				var evs []worldevents.DirectorEvent
+				for offset := 0; ; {
+					var page []worldevents.DirectorEvent
+					var more bool
+					seq, page, more, err = worldevents.PendingDirectorEventPage(cur, offset, cfg)
+					if err != nil {
+						return worldevents.OrchestratedState{}, err
+					}
+					evs = append(evs, page...)
+					offset += len(page)
+					if !more {
+						break
+					}
+				}
+				for _, ev := range evs {
+					if _, dup := seenDir[ev.EventID]; dup {
+						t.Fatalf("duplicate director event delivered: %s", ev.EventID)
+					}
+					seenDir[ev.EventID] = struct{}{}
+				}
+				cur, err = worldevents.AcknowledgeDirectorBatchVerified(cur, seq, len(evs), cfg)
+				if err != nil {
+					return worldevents.OrchestratedState{}, err
+				}
+				totalBatches++
+			}
+			outs, err := worldevents.PendingTerminalOutcomes(cur, cfg)
+			if err != nil {
+				return worldevents.OrchestratedState{}, err
+			}
+			for i := 0; i < len(outs) && i < outLimit; i++ {
+				if _, dup := seenOut[outs[i].EventID]; dup {
+					t.Fatalf("duplicate terminal outcome delivered: %s", outs[i].EventID)
+				}
+				seenOut[outs[i].EventID] = struct{}{}
+				cur, err = worldevents.AcknowledgeTerminalOutcomeVerified(cur, outs[i].Sequence, outs[i].EventID, cfg)
+				if err != nil {
+					return worldevents.OrchestratedState{}, err
+				}
+				totalOutcomes++
+			}
+			cons, err := worldevents.PendingContributionResults(cur, cfg)
+			if err != nil {
+				return worldevents.OrchestratedState{}, err
+			}
+			for i := 0; i < len(cons) && i < conLimit; i++ {
+				if _, dup := seenCon[cons[i].Result.EventID]; dup {
+					t.Fatalf("duplicate contribution delivered: %s", cons[i].Result.EventID)
+				}
+				seenCon[cons[i].Result.EventID] = struct{}{}
+				cur, err = worldevents.AcknowledgeContributionVerified(cur, cons[i].Sequence, cons[i].Result.EventID, cfg)
+				if err != nil {
+					return worldevents.OrchestratedState{}, err
+				}
+				totalContribs++
+			}
+			return cur, nil
+		}
+
+		for iter := 0; iter < 5000 && st.Director.Tick < targetTicks; iter++ {
+			var in worldevents.StepInput
+			if st.World.Invasion.State == world.InvasionUnderAttack {
+				tick := st.World.Tick + 1
+				if len(st.World.Defenders) == 0 {
+					in.GameplayCommands = []world.GameplayCommand{
+						{Kind: world.CmdDeployDefender, Tick: tick, PlayerID: "g-1", Position: 3000},
+						{Kind: world.CmdDeployDefender, Tick: tick, PlayerID: "g-2", Position: 2200},
+						{Kind: world.CmdDeployDefender, Tick: tick, PlayerID: "g-3", Position: 1600},
+						{Kind: world.CmdDeployDefender, Tick: tick, PlayerID: "g-4", Position: 1000},
+					}
+				} else {
+					targetID := ""
+					for _, g := range st.World.Groups {
+						if g.HP > 0 && g.State != ai.StateDead && !g.Routed {
+							targetID = g.GroupID
+							break
+						}
+					}
+					if targetID != "" {
+						for idx, id := range []string{"g-1", "g-2", "g-3", "g-4"} {
+							if tick%9 == uint64(idx*2) {
+								alive := true
+								for _, d := range st.World.Defenders {
+									if d.PlayerID == id && d.HP == 0 {
+										alive = false
+										break
+									}
+								}
+								if alive {
+									in.GameplayCommands = append(in.GameplayCommands, world.GameplayCommand{
+										Kind: world.CmdPlayerDefendStrike, Tick: tick, PlayerID: id, TargetGroupID: targetID,
+									})
+								}
+							}
+						}
+					}
+				}
+			}
+
+			next, _, err := worldevents.Step(st, in, cfg)
+			if errors.Is(err, worldevents.ErrDirectorBackpressure) || errors.Is(err, worldevents.ErrOutcomeBackpressure) || errors.Is(err, worldevents.ErrContributionBackpressure) {
+				totalPauses++
+				if !restoredOnce {
+					raw, mErr := st.MarshalSnapshot(cfg)
+					if mErr != nil {
+						t.Fatal(mErr)
+					}
+					st, mErr = worldevents.UnmarshalOrchestratedSnapshot(raw, cfg)
+					if mErr != nil {
+						t.Fatal(mErr)
+					}
+					restoredOnce = true
+				}
+				st, err = drainStep(st, 1, 1, 3)
+				if err != nil {
+					t.Fatal(err)
+				}
+				continue
+			}
+			if err != nil {
+				t.Fatalf("seed %d tick %d: %v", seed, st.Director.Tick+1, err)
+			}
+			st = next
+			if iter%18 == 0 {
+				st, err = drainStep(st, 1, 1, 2)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if st.Director.Tick%200 == 0 {
+				runtime.GC()
+				runtime.ReadMemStats(&m)
+				if m.HeapAlloc > peakHeap {
+					peakHeap = m.HeapAlloc
+				}
+			}
+		}
+		if st.Director.Tick != targetTicks {
+			t.Fatalf("seed %d failed to reach target tick %d (stuck at %d)", seed, targetTicks, st.Director.Tick)
+		}
+		// Final drain to prove all pending facts finish cleanly.
+		var errDrain error
+		st, errDrain = drainStep(st, 100, 100, 100)
+		if errDrain != nil {
+			t.Fatal(errDrain)
+		}
+		if err := st.Validate(cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	runtime.GC()
+	runtime.ReadMemStats(&m)
+	finalHeap := m.HeapAlloc
+	if totalOutcomes < 6 || totalPauses < 3 {
+		t.Fatalf("expected repeated outcomes and backpressure recovery across slow-consumer run: outcomes=%d pauses=%d", totalOutcomes, totalPauses)
+	}
+	t.Logf("Slow-consumer long run passed: 3 seeds x %d ticks, batches=%d outcomes=%d contribs=%d pauses=%d, baselineHeap=%dB peakHeap=%dB finalHeap=%dB",
+		targetTicks, totalBatches, totalOutcomes, totalContribs, totalPauses, baselineHeap, peakHeap, finalHeap)
+	if finalHeap > baselineHeap+32*1024*1024 {
+		t.Fatalf("retained heap grew unexpectedly: baseline=%d final=%d", baselineHeap, finalHeap)
 	}
 }

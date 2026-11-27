@@ -385,5 +385,54 @@ func runWorldEventScenarios(logger *slog.Logger, reader *memory.SettlementReader
 			slog.Duration("duration", time.Since(start)),
 		)
 	}
+
+	// 4. Run Recovery 04.2 Headless Consumer Harness Scenarios J-N
+	// (development in-memory consumer; does NOT represent durable production persistence).
+	consumerRunners := []func(context.Context, *memory.SettlementReader) (worldevents.ConsumerScenarioSummary, error){
+		func(c context.Context, r *memory.SettlementReader) (worldevents.ConsumerScenarioSummary, error) {
+			return worldevents.RunScenarioJImmediateConsumer(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.ConsumerScenarioSummary, error) {
+			return worldevents.RunScenarioKSlowConsumer(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.ConsumerScenarioSummary, error) {
+			return worldevents.RunScenarioLPartiallyUnavailableConsumer(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.ConsumerScenarioSummary, error) {
+			return worldevents.RunScenarioMRecoveredConsumer(c, r)
+		},
+		func(c context.Context, r *memory.SettlementReader) (worldevents.ConsumerScenarioSummary, error) {
+			return worldevents.RunScenarioNDuplicateDeliveryConsumer(c, r)
+		},
+	}
+	for _, fn := range consumerRunners {
+		start := time.Now()
+		sum, err := fn(ctx, reader)
+		if err != nil {
+			return err
+		}
+		logger.Info("world_event_consumer_scenario_completed",
+			slog.String("event", "world_event_consumer_scenario_completed"),
+			slog.String("scenario", sum.Name),
+			slog.String("simulation_id", sum.SimulationID),
+			slog.String("consumer_mode", sum.Mode),
+			slog.Uint64("tick", sum.FinalTick),
+			slog.Int("campaigns_completed", sum.CampaignsCompleted),
+			slog.Int("director_batches_acked", sum.DirectorBatchesAcked),
+			slog.Int("director_events_consumed", sum.DirectorEventsConsumed),
+			slog.Int("director_pages_read", sum.DirectorPagesRead),
+			slog.Int("outcomes_acked", sum.OutcomesAcked),
+			slog.Int("contributions_acked", sum.ContributionsAcked),
+			slog.Int("backpressure_pauses", sum.BackpressurePauses),
+			slog.Int("redeliveries_deduped", sum.RedeliveriesDeduped),
+			slog.Int64("free_population", sum.FreePopulationTotal),
+			slog.Int64("reserved_population", sum.ReservedPopTotal),
+			slog.Int64("materialized_population", sum.MaterializedPopTotal),
+			slog.Int("snapshot_bytes", sum.SnapshotBytes),
+			slog.Bool("snapshot_verified", sum.SnapshotVerified),
+			slog.String("checksum", sum.FinalChecksum),
+			slog.Duration("duration", time.Since(start)),
+		)
+	}
 	return nil
 }
