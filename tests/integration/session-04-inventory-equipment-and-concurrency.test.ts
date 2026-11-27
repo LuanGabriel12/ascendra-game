@@ -98,9 +98,10 @@ describe("CARBON Session 04 — Inventory, Equipment, Procedural Items, Ledger &
       await migrateDown(pgCtx.pool, MIGRATIONS_DIR, existing.length);
     }
 
-    // Apply all 0001..0007 then step down 2 migrations to stand at Session 03 (0001..0005)
+    // Apply all migrations then step back to Session 03 (0001..0005) dynamically
     await migrateUp(pgCtx.pool, MIGRATIONS_DIR);
-    await migrateDown(pgCtx.pool, MIGRATIONS_DIR, 2);
+    const totalAvailable = (await listAppliedMigrations(pgCtx.pool)).length;
+    await migrateDown(pgCtx.pool, MIGRATIONS_DIR, totalAvailable - 5);
     const s03Applied = await listAppliedMigrations(pgCtx.pool);
     assert.deepEqual(
       s03Applied.map((m) => m.version),
@@ -143,9 +144,9 @@ describe("CARBON Session 04 — Inventory, Equipment, Procedural Items, Ledger &
       presetCode: "berserker",
     });
 
-    // Now apply incremental migrations 0006 & 0007 over the populated Session 03 DB
+    // Now apply incremental migrations 0006+ over the populated Session 03 DB
     const incApplied = await migrateUp(pgCtx.pool, MIGRATIONS_DIR);
-    assert.deepEqual(incApplied, [
+    assert.deepEqual(incApplied.slice(0, 2), [
       "0006_item_catalog_rarities_and_affixes",
       "0007_inventories_instances_loadouts_and_ledger",
     ]);
@@ -216,9 +217,9 @@ describe("CARBON Session 04 — Inventory, Equipment, Procedural Items, Ledger &
     assert.equal(v1Reloaded.implicitAttributes.strength, 4);
 
     // Verify full down:all -> up cycle works cleanly
-    const allSeven = await listAppliedMigrations(pgCtx.pool);
-    assert.equal(allSeven.length, 7);
-    await migrateDown(pgCtx.pool, MIGRATIONS_DIR, allSeven.length);
+    const allAppliedNow = await listAppliedMigrations(pgCtx.pool);
+    assert.ok(allAppliedNow.length >= 7);
+    await migrateDown(pgCtx.pool, MIGRATIONS_DIR, allAppliedNow.length);
     assert.equal((await listAppliedMigrations(pgCtx.pool)).length, 0);
     await migrateUp(pgCtx.pool, MIGRATIONS_DIR);
 
