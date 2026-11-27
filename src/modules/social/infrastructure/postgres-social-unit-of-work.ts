@@ -786,6 +786,60 @@ export class PgSocialTransactionScope {
       }
     }
 
+    const weaponMasteryByFamily = new Map<string, number>();
+    const activeLearnedAbilitiesBySchool = new Map<string, number>();
+    const activeSpecNodesBySchool = new Map<string, number>();
+    let activeLearnedAbilitiesCount = 0;
+
+    const hasMasteryTablesRes = await this.client.query<{ present: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM information_schema.tables
+         WHERE table_schema = current_schema() AND table_name = 'character_weapon_masteries'
+       ) AS present`,
+    );
+
+    if (hasMasteryTablesRes.rows[0]?.present === true) {
+      const mastRes = await this.client.query<{
+        weapon_family_code: string;
+        mastery_level: number;
+      }>(
+        `SELECT weapon_family_code, mastery_level
+         FROM character_weapon_masteries
+         WHERE character_id = $1::uuid`,
+        [characterId],
+      );
+      for (const m of mastRes.rows) {
+        weaponMasteryByFamily.set(m.weapon_family_code, Number(m.mastery_level));
+      }
+
+      const abRes = await this.client.query<{ school_code: string; cnt: string }>(
+        `SELECT ad.school_code, COUNT(*)::text AS cnt
+         FROM character_learned_abilities cla
+         INNER JOIN ability_definitions ad
+           ON ad.ability_code = cla.ability_code AND ad.ability_version = cla.ability_version
+         WHERE cla.character_id = $1::uuid AND cla.is_active = TRUE
+         GROUP BY ad.school_code`,
+        [characterId],
+      );
+      for (const ar of abRes.rows) {
+        const c = Number(ar.cnt);
+        activeLearnedAbilitiesBySchool.set(ar.school_code, c);
+        activeLearnedAbilitiesCount += c;
+      }
+
+      const specRes = await this.client.query<{ school_code: string; cnt: string }>(
+        `SELECT sn.school_code, COUNT(*)::text AS cnt
+         FROM character_specialization_unlocks csu
+         INNER JOIN specialization_nodes sn ON sn.node_code = csu.node_code
+         WHERE csu.character_id = $1::uuid AND csu.is_active = TRUE
+         GROUP BY sn.school_code`,
+        [characterId],
+      );
+      for (const sr of specRes.rows) {
+        activeSpecNodesBySchool.set(sr.school_code, Number(sr.cnt));
+      }
+    }
+
     return {
       moralBounty: social.moralBounty,
       globalFame: social.globalFame,
@@ -797,6 +851,10 @@ export class PgSocialTransactionScope {
       defensesBySettlementExternalId: defensesBySettlement,
       liberationsBySettlementExternalId: liberationsBySettlement,
       historicalAchievementKeys: histKeys,
+      weaponMasteryByFamily,
+      activeLearnedAbilitiesCount,
+      activeLearnedAbilitiesBySchool,
+      activeSpecNodesBySchool,
     };
   }
 

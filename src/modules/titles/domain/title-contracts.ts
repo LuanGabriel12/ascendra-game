@@ -118,6 +118,26 @@ export type TitleConditionNode =
       readonly eventType: string;
       readonly settlementExternalId?: string | undefined;
     }
+  | {
+      readonly op: "WeaponMasteryAtLeast";
+      readonly weaponFamilyCode: string;
+      readonly minLevel: number;
+    }
+  | {
+      readonly op: "MasteredWeaponFamilyCount";
+      readonly minFamilies: number;
+      readonly minMasteryLevel: number;
+    }
+  | {
+      readonly op: "LearnedAbilityCount";
+      readonly minCount: number;
+      readonly schoolCode?: string | undefined;
+    }
+  | {
+      readonly op: "SchoolSpecializationCompleted";
+      readonly schoolCode: string;
+      readonly minUnlockedNodes: number;
+    }
   | { readonly op: "PlannedSystemUnavailable"; readonly systemCode: string };
 
 export interface VersionedTitleDefinition {
@@ -163,6 +183,14 @@ export interface TitleEvaluationSnapshot {
   readonly liberationsBySettlementExternalId: ReadonlyMap<string, number>;
   /** Set of `${eventType}` and `${eventType}@${settlementExternalId}` */
   readonly historicalAchievementKeys: ReadonlySet<string>;
+  /** Session 06+: Map of `weaponFamilyCode -> masteryLevel` */
+  readonly weaponMasteryByFamily?: ReadonlyMap<string, number> | undefined;
+  /** Session 06+: Count of active learned abilities */
+  readonly activeLearnedAbilitiesCount?: number | undefined;
+  /** Session 06+: Map of `schoolCode -> active learned ability count` */
+  readonly activeLearnedAbilitiesBySchool?: ReadonlyMap<string, number> | undefined;
+  /** Session 06+: Map of `schoolCode -> active unlocked specialization node count` */
+  readonly activeSpecNodesBySchool?: ReadonlyMap<string, number> | undefined;
 }
 
 export const MAX_TITLE_AST_DEPTH = 4;
@@ -265,6 +293,58 @@ export function validateTitleConditionAst(root: TitleConditionNode): void {
         }
         return;
 
+      case "WeaponMasteryAtLeast":
+        if (!node.weaponFamilyCode || !node.weaponFamilyCode.trim()) {
+          throw new TitleConditionInvalidError("WeaponMasteryAtLeast requires weaponFamilyCode.");
+        }
+        if (!Number.isInteger(node.minLevel) || node.minLevel < 1 || node.minLevel > 100) {
+          throw new TitleConditionInvalidError(
+            "WeaponMasteryAtLeast minLevel must be an integer within 1..100.",
+          );
+        }
+        return;
+
+      case "MasteredWeaponFamilyCount":
+        if (!Number.isInteger(node.minFamilies) || node.minFamilies < 1 || node.minFamilies > 23) {
+          throw new TitleConditionInvalidError(
+            "MasteredWeaponFamilyCount minFamilies must be an integer within 1..23.",
+          );
+        }
+        if (
+          !Number.isInteger(node.minMasteryLevel) ||
+          node.minMasteryLevel < 1 ||
+          node.minMasteryLevel > 100
+        ) {
+          throw new TitleConditionInvalidError(
+            "MasteredWeaponFamilyCount minMasteryLevel must be an integer within 1..100.",
+          );
+        }
+        return;
+
+      case "LearnedAbilityCount":
+        if (!Number.isInteger(node.minCount) || node.minCount < 1) {
+          throw new TitleConditionInvalidError("LearnedAbilityCount minCount must be >= 1.");
+        }
+        if (node.schoolCode !== undefined && !node.schoolCode.trim()) {
+          throw new TitleConditionInvalidError(
+            "LearnedAbilityCount schoolCode cannot be blank when specified.",
+          );
+        }
+        return;
+
+      case "SchoolSpecializationCompleted":
+        if (!node.schoolCode || !node.schoolCode.trim()) {
+          throw new TitleConditionInvalidError(
+            "SchoolSpecializationCompleted requires schoolCode.",
+          );
+        }
+        if (!Number.isInteger(node.minUnlockedNodes) || node.minUnlockedNodes < 1) {
+          throw new TitleConditionInvalidError(
+            "SchoolSpecializationCompleted minUnlockedNodes must be >= 1.",
+          );
+        }
+        return;
+
       case "PlannedSystemUnavailable":
         if (!node.systemCode || !node.systemCode.trim()) {
           throw new TitleConditionInvalidError("PlannedSystemUnavailable requires systemCode.");
@@ -337,6 +417,33 @@ export function evaluateTitleConditionAst(
           );
         }
         return ctx.historicalAchievementKeys.has(curr.eventType);
+      case "WeaponMasteryAtLeast": {
+        const lvl = ctx.weaponMasteryByFamily?.get(curr.weaponFamilyCode) ?? 1;
+        return lvl >= curr.minLevel;
+      }
+      case "MasteredWeaponFamilyCount": {
+        if (!ctx.weaponMasteryByFamily) {
+          return curr.minMasteryLevel <= 1 && curr.minFamilies <= 0;
+        }
+        let qualified = 0;
+        for (const lvl of ctx.weaponMasteryByFamily.values()) {
+          if (lvl >= curr.minMasteryLevel) {
+            qualified++;
+          }
+        }
+        return qualified >= curr.minFamilies;
+      }
+      case "LearnedAbilityCount": {
+        if (curr.schoolCode !== undefined) {
+          const schoolCnt = ctx.activeLearnedAbilitiesBySchool?.get(curr.schoolCode) ?? 0;
+          return schoolCnt >= curr.minCount;
+        }
+        return (ctx.activeLearnedAbilitiesCount ?? 0) >= curr.minCount;
+      }
+      case "SchoolSpecializationCompleted": {
+        const unlockedCnt = ctx.activeSpecNodesBySchool?.get(curr.schoolCode) ?? 0;
+        return unlockedCnt >= curr.minUnlockedNodes;
+      }
       case "PlannedSystemUnavailable":
         return false;
     }
