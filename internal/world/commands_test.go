@@ -190,3 +190,52 @@ func TestDurableMonotonicIDsAndOverflowProtection(t *testing.T) {
 		t.Fatalf("expected ErrNumericOverflow on InvasionSeq max, got %v", err)
 	}
 }
+
+func TestDirectorRejectsForeignCampaignAndMissingCaller(t *testing.T) {
+	st, cfg := mustNewDirectorWorldState(t, "owner-guards")
+	st, _, err := world.StepWithDirector(st, nil, []world.DirectorCommand{{Kind: world.CmdDirectorPrepareInvasion, Tick: 1, CampaignID: "owner", InvadingFactionID: "faction"}}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cmd := range []world.DirectorCommand{
+		{Kind: world.CmdDirectorAbortPreparedInvasion, Tick: 2},
+		{Kind: world.CmdDirectorAbortPreparedInvasion, Tick: 2, CampaignID: "other"},
+		{Kind: world.CmdDirectorStartInvasion, Tick: 2, CampaignID: "owner", InvadingFactionID: "other"},
+	} {
+		before, _ := st.Checksum()
+		if _, _, err := world.StepWithDirector(st, nil, []world.DirectorCommand{cmd}, cfg); err == nil {
+			t.Fatalf("accepted command %+v", cmd)
+		}
+		after, _ := st.Checksum()
+		if before != after {
+			t.Fatal("failed command mutated state")
+		}
+	}
+	st.Invasion.State = world.InvasionUnderAttack
+	before, _ := st.Checksum()
+	_, err = world.SpawnCampaignReinforcement(&st, "missing", world.DirectorCommand{Kind: world.CmdDirectorSpawnCampaignGroup, CampaignID: "other", InvadingFactionID: "faction", GroupID: "g", ReservationID: "r", SourcePopulationID: "p", SourceCampID: "c", PopulationWeight: 1, Archetype: "orc-vanguard", Count: 1}, cfg)
+	if err == nil {
+		t.Fatal("missing caller accepted")
+	}
+	after, _ := st.Checksum()
+	if before != after {
+		t.Fatal("failed reinforcement mutated state")
+	}
+}
+
+func TestDirectorCannotStartWithForeignCampaignGroup(t *testing.T) {
+	st, cfg := mustNewDirectorWorldState(t, "foreign-start")
+	spawn := world.DirectorCommand{Kind: world.CmdDirectorSpawnCampaignGroup, Tick: 1, CampaignID: "foreign", InvadingFactionID: "faction", GroupID: "foreign-group", Archetype: "goblin-raider-pack", Count: 1, ReservationID: "r", SourcePopulationID: "p", SourceCampID: "c", PopulationWeight: 6}
+	st, _, err := world.StepWithDirector(st, nil, []world.DirectorCommand{spawn}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, _, err = world.StepWithDirector(st, nil, []world.DirectorCommand{{Kind: world.CmdDirectorPrepareInvasion, Tick: 2, CampaignID: "owner", InvadingFactionID: "faction"}}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = world.StepWithDirector(st, nil, []world.DirectorCommand{{Kind: world.CmdDirectorStartInvasion, Tick: 3, CampaignID: "owner", InvadingFactionID: "faction"}}, cfg)
+	if err == nil {
+		t.Fatal("foreign group authorized invasion")
+	}
+}

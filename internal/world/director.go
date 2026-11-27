@@ -1094,10 +1094,17 @@ func applyDirectorStartInvasion(next *WorldState, cmd Command, cfg Config, event
 	if next.Invasion.State != InvasionThreatened {
 		return fmt.Errorf("%w: cannot start invasion from state %s (must be Threatened)", ErrInvalidInvasionTransition, next.Invasion.State)
 	}
-	if next.Invasion.CampaignID != "" && next.Invasion.CampaignID != cmd.CampaignID {
+	if next.Invasion.CampaignID != cmd.CampaignID || next.Invasion.InvadingFactionID != cmd.InvadingFactionID {
 		return fmt.Errorf("%w: invasion already owned by campaign %q", ErrInvalidCommand, next.Invasion.CampaignID)
 	}
-	if countActiveHostiles(next.Groups) == 0 {
+	hasCampaignGroup := false
+	for _, group := range next.Groups {
+		if group.CampaignID == cmd.CampaignID && group.FactionID == cmd.InvadingFactionID && group.HP > 0 && group.State != ai.StateDead && !group.Routed {
+			hasCampaignGroup = true
+			break
+		}
+	}
+	if !hasCampaignGroup {
 		return fmt.Errorf("%w: cannot start campaign-driven invasion without mobilized hostiles", ErrInvalidCommand)
 	}
 	next.Invasion.CampaignID = cmd.CampaignID
@@ -1170,7 +1177,7 @@ func applyDirectorAbortPreparedInvasion(next *WorldState, cmd Command, cfg Confi
 	if next.Invasion.State != InvasionThreatened {
 		return fmt.Errorf("%w: can only abort a Threatened invasion (current=%s)", ErrInvalidInvasionTransition, next.Invasion.State)
 	}
-	if cmd.CampaignID != "" && next.Invasion.CampaignID != "" && next.Invasion.CampaignID != cmd.CampaignID {
+	if strings.TrimSpace(cmd.CampaignID) == "" || next.Invasion.CampaignID != cmd.CampaignID {
 		return fmt.Errorf("%w: invasion belongs to campaign %q, not %q", ErrInvalidCommand, next.Invasion.CampaignID, cmd.CampaignID)
 	}
 	if err := transitionInvasion(next, InvasionPeace, cfg, events); err != nil {
@@ -1207,6 +1214,10 @@ func SpawnCampaignReinforcement(
 	}
 	if c.Kind != CmdDirectorSpawnCampaignGroup {
 		return nil, fmt.Errorf("%w: expected CmdDirectorSpawnCampaignGroup, got %q", ErrInvalidCommand, c.Kind)
+	}
+	callerIdx := findGroupIndex(state.Groups, callerGroupID)
+	if callerIdx < 0 || state.Groups[callerIdx].HP == 0 || state.Groups[callerIdx].Routed || state.Groups[callerIdx].State == ai.StateDead || state.Groups[callerIdx].CampaignID != state.Invasion.CampaignID || c.CampaignID != state.Invasion.CampaignID || c.InvadingFactionID != state.Invasion.InvadingFactionID || c.ReservationID != state.Groups[callerIdx].ReservationID {
+		return nil, fmt.Errorf("%w: invalid reinforcement caller or campaign", ErrInvalidCommand)
 	}
 	events := make([]DomainEvent, 0, 2)
 	if err := applyDirectorSpawnCampaignGroup(state, c, cfg, &events); err != nil {
