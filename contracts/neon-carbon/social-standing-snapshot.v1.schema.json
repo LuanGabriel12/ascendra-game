@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ascendra.game/contracts/neon-carbon/social-standing-snapshot.v1.schema.json",
+  "title": "SocialStandingSnapshotWireV1",
+  "description": "PROPOSED JOINT CONTRACT (v1) — Read-only projection of Moral Bounty, Fame, Contextual Reputations, Jurisdictional Criminal Status, Active Warrants, and Equipped Title from CARBON to NEON without mutating CharacterSnapshotWireV1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "projection_scope",
+    "character_id",
+    "display_name",
+    "social_version",
+    "moral_band",
+    "global_fame",
+    "regional_fame",
+    "faction_reputations",
+    "settlement_reputations",
+    "criminal_status_summary",
+    "active_warrant_summary",
+    "equipped_title",
+    "recognition_flags"
+  ],
+  "properties": {
+    "contract_version": { "type": "integer", "const": 1 },
+    "projection_scope": {
+      "type": "string",
+      "enum": [
+        "public_limited",
+        "self_character",
+        "internal_authorized",
+        "judicial_authority"
+      ]
+    },
+    "character_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "display_name": { "type": "string", "minLength": 3, "maxLength": 24 },
+    "social_version": { "type": "integer", "minimum": 1 },
+    "moral_band": {
+      "type": "string",
+      "enum": [
+        "legendary_enemy",
+        "public_menace",
+        "criminal",
+        "dishonored",
+        "suspected",
+        "neutral",
+        "well_regarded",
+        "respected",
+        "protector",
+        "revered_hero",
+        "heroic_legend"
+      ]
+    },
+    "moral_bounty": {
+      "type": "string",
+      "pattern": "^(0|-?[1-9][0-9]{0,18})$"
+    },
+    "global_fame": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,18})$"
+    },
+    "regional_fame": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/RegionalFameSummary" }
+    },
+    "faction_reputations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/FactionReputationSummary" }
+    },
+    "settlement_reputations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/SettlementReputationSummary" }
+    },
+    "criminal_status_summary": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/JurisdictionStatusSummary" }
+    },
+    "active_warrant_summary": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ActiveWarrantSummary" }
+    },
+    "equipped_title": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/EquippedTitleSummary" }
+      ]
+    },
+    "recognition_flags": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 64 }
+    }
+  },
+  "$defs": {
+    "RegionalFameSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["region_id", "fame", "regional_moral_bounty"],
+      "properties": {
+        "region_id": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "fame": { "type": "string", "pattern": "^(0|[1-9][0-9]{0,18})$" },
+        "regional_moral_bounty": { "type": "string", "pattern": "^(0|-?[1-9][0-9]{0,18})$" }
+      }
+    },
+    "FactionReputationSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["faction_id", "faction_code", "standing_value"],
+      "properties": {
+        "faction_id": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+        },
+        "faction_code": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "standing_value": { "type": "integer" }
+      }
+    },
+    "SettlementReputationSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["settlement_id", "settlement_external_id", "standing_value"],
+      "properties": {
+        "settlement_id": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+        },
+        "settlement_external_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "standing_value": { "type": "integer" }
+      }
+    },
+    "JurisdictionStatusSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "jurisdiction_id",
+        "criminal_state",
+        "safe_zone_access",
+        "active_warrants_count"
+      ],
+      "properties": {
+        "jurisdiction_id": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "criminal_state": {
+          "type": "string",
+          "enum": [
+            "Clear",
+            "Suspected",
+            "Wanted",
+            "Fugitive",
+            "Captured",
+            "ServingSentence",
+            "Pardoned"
+          ]
+        },
+        "safe_zone_access": {
+          "type": "string",
+          "enum": ["permitted", "monitored", "restricted_arrest_on_sight"]
+        },
+        "active_warrants_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "ActiveWarrantSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["warrant_id", "jurisdiction_id", "issuing_authority_id"],
+      "properties": {
+        "warrant_id": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+        },
+        "jurisdiction_id": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "issuing_authority_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "EquippedTitleSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title_code", "display_name", "category", "rarity"],
+      "properties": {
+        "title_code": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "display_name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "category": {
+          "type": "string",
+          "enum": [
+            "achievement",
+            "reputation",
+            "historical",
+            "exclusive",
+            "criminal",
+            "heroic",
+            "professional",
+            "competitive",
+            "exploration",
+            "political"
+          ]
+        },
+        "rarity": {
+          "type": "string",
+          "enum": ["common", "uncommon", "rare", "epic", "legendary", "mythic"]
+        }
+      }
+    }
+  }
+}
