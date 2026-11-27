@@ -50,8 +50,13 @@ Eventos devidos são ordenados por:
 | `MaxPendingEvents` | `32` | Fila limitada contra backpressure/explosão de RAM |
 | `MaxCandidatesPerUpdate` | `16` | Limite por ciclo de avaliação |
 | `MaxChainDepth` | `2` | Impede cadeias infinitas de eventos |
-| `MaxEventsPerUpdate` | `64` | Limite de emissão por tick |
-| `MaxCompletedHistory` / `MaxOutcomesHistory` | `64` / `64` | Retenção histórica em anel FIFO limitado |
+| `MaxEventsPerUpdate` | `64` | Limite de eventos por página da consulta do lote de um tick (`PendingDirectorEventPage`); um tick pode conter várias páginas |
+| `MaxEventsPerBatch` | `128` | Teto rígido de eventos emitidos por um único lote de tick |
+| `MaxPendingDirectorEvents` | `1024` | Teto rígido de eventos armazenados somados entre todos os lotes pendentes (`>= MaxEventsPerBatch`) |
+| `MaxPendingDirectorBatches` | `256` | Teto de lotes pendentes aguardando confirmação |
+| `MaxPendingOutcomes` | `64` | Teto de resultados terminais aguardando confirmação |
+| `MaxPendingContributions` | `256` | Teto de contribuições aguardando confirmação (`2 × World.MaxContributions`) |
+| `MaxCompletedHistory` / `MaxOutcomesHistory` | `64` / `64` | Retenção histórica consultiva em anel FIFO limitado (não é fila de entrega) |
 | `MaxCooldownEntries` | `64` | Cooldowns expirados podados a cada tick |
 
 ## 6. Validação de Deadlines e Expiração

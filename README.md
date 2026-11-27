@@ -12,7 +12,7 @@ Este repositório contém a fundação técnica, o motor de IA de criaturas, o m
 - **Núcleo de simulação determinístico (`internal/simulation`)**:
   - PRNG determinístico com estado serializável (`SplitMix64` — sem `math/rand` global).
   - Serialização canônica e checksum SHA-256 independente de ordem de `map`, ponteiros, timestamps ou logs.
-  - Snapshot/restore versionado (`SchemaVersion = 4`) com limite pré-decodificação de bytes (`MaxBytes`) e validação explícita de schema e invariantes (versões `v1`/`v2`/`v3` rejeitadas com `ErrUnsupportedSnapshotVersion`).
+  - Snapshot/restore versionado (`SchemaVersion = 5`) com limite pré-decodificação de bytes (`MaxBytes`) e validação explícita de schema e invariantes (versões `v1`/`v2`/`v3`/`v4` rejeitadas com `ErrUnsupportedSnapshotVersion`).
 - **World / Event Director & Motor de Invasões (`internal/world`)**:
   - Máquina de estados explícita de invasão (`Peace -> Threatened -> UnderAttack -> Resolved`), rejeitando transições inválidas.
   - Simulação por ticks lógicos (`uint64`) sem dependência de relógio de parede (`time.Now()`) nem aritmética de ponto flutuante (`float32`/`float64`).
@@ -38,10 +38,11 @@ Este repositório contém a fundação técnica, o motor de IA de criaturas, o m
 ### Ciclo 04 — World Event Director & Dynamic Campaign Engine (`neon/world-event-director`)
 - **World Event Director & Campaign Engine (`internal/worldevents`)**: transforma alterações ecológicas em campanhas dinâmicas determinísticas com FSM explícita de 14 estados (`Candidate -> Scheduled -> Reconnaissance -> Preparing -> Warning -> Mobilizing -> Active -> Resolving -> Defended/Captured/Cancelled/Expired -> Recovering -> Completed`), políticas data-driven para Goblins e Orcs, regras de proteção de assentamento e eventos encadeados com teto `MaxChainDepth`.
 - **Escalonador determinístico baseado em ticks**: prioridade inteira separada da ameaça ecológica, envelhecimento anti-starvation (`PriorityAgingPerTick`), desempate canônico total, cooldowns e limites de concorrência (3 globais, 1 por região, 1 por assentamento, máx. 1 combate tático ativo).
-- **Reservas idempotentes de população em 3 compartimentos (`internal/ecosystem/reservations.go`)**: `Free + Reserved + Materialized` com `ReservationID` monotônico, `IdempotencyKey`, deduplicação por `AppliedOps`, poda segura com `RetiredReservationKeys` e zero ressurreição.
-- **Autoridade única de invasões e separação de comandos (`internal/world/commands.go`)**: `OrchestrationCampaignDirector` desabilita transições automáticas de ameaça em `world.Step`; `GameplayCommand` / `DirectorCommand` / `AdminCommand` isolados por escopo (`ErrUnauthorizedCommand`).
+- **Reservas sequenciais idempotentes de população em 3 compartimentos (`internal/ecosystem/reservations.go`)**: `Free + Reserved + Materialized` com sequência contígua (`CreateSequencedReservation`), `PruneClosedReservationsExcept`, poda `O(1)` imune a replay antigo e zero ressurreição.
+- **Filas confirmáveis e backpressure recuperável (`internal/worldevents/outcomes.go`)**: lotes de eventos do diretor paginados (`PendingDirectorEventPage`, `MaxEventsPerBatch`, `MaxPendingDirectorEvents`), fila de resultados terminais (`PendingOutcomes`) e fila de contribuições (`PendingContributions`) com `Acknowledge*` e `Acknowledge*Verified` fora de `Step`.
+- **Autoridade única de invasões e separação de comandos (`internal/world/commands.go`)**: `OrchestrationCampaignDirector` desabilita transições automáticas de ameaça em `world.Step`; `GameplayCommand` / `DirectorCommand` / `AdminCommand` isolados por escopo (`ErrUnauthorizedCommand`) com validação estrita de dono/facção/chamador.
 - **Reforços ecológicos com débito real e Fato Global com Zero Jogadores**: `EventReinforcementRequested` debitado exclusivamente da reserva da campanha; `TerminalSettlementOutcome` emitido estritamente uma vez mesmo quando `EligibleContributors == 0`.
-- **Snapshot v4 (`OrchestratedState`) e 19 cenários headless em `cmd/sim`**: 4 táticos + 6 ecossistema + 9 World Event Director (A–I).
+- **Snapshot v5 (`OrchestratedState`) e 24 cenários headless em `cmd/sim`**: 4 táticos + 6 ecossistema + 9 World Event Director (A–I) + 5 cenários de consumidor headless (J–N).
 
 ## Pré-requisitos
 
@@ -100,6 +101,7 @@ docs/handoff/                   Notas de handoff por ciclo
 - [Auditoria CODEX — Ciclo 1](docs/audits/NEON_CYCLE_01_AUDIT.md)
 - [Auditoria CODEX — Ciclo 2](docs/audits/NEON_CYCLE_02_AUDIT.md)
 - [Auditoria CODEX — Ciclo 3](docs/audits/NEON_CYCLE_03_AUDIT.md)
+- [Auditoria & Recuperação 04.2 — Ciclo 4](docs/audits/NEON_CYCLE_04_AUDIT.md)
 - [Proposta de Contratos de Ecossistema (NEON → CARBON)](docs/contracts/NEON_ECOSYSTEM_CONTRACT_PROPOSAL.md)
 - [Proposta de Contratos de World Events (NEON → CARBON)](docs/contracts/NEON_WORLD_EVENT_CONTRACT_PROPOSAL.md)
 - Documentação do Ecossistema (Ciclo 3):
@@ -113,6 +115,7 @@ docs/handoff/                   Notas de handoff por ciclo
   - [Campaign Engine](docs/worldevents/CAMPAIGN_ENGINE.md)
   - [Event Scheduler](docs/worldevents/EVENT_SCHEDULER.md)
   - [Population Reservations](docs/worldevents/POPULATION_RESERVATIONS.md)
+  - [Backpressure & Recovery](docs/worldevents/BACKPRESSURE_AND_RECOVERY.md)
   - [Performance Baseline (Ciclo 4)](docs/worldevents/PERFORMANCE_BASELINE.md)
 - ADRs:
   - [ADR-0001: Gameplay Backend Runtime (Go 1.27.x — Proposed)](docs/adr/0001-gameplay-backend-runtime.md)

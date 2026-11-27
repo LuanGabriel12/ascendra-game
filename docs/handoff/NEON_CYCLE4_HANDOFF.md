@@ -1,55 +1,45 @@
-# NEON — Cycle 04 Engineering Handoff (`neon/world-event-director`)
+# NEON — Cycle 04 & Recovery 04.2 Engineering Handoff (`neon/world-event-director`)
 
 - **Base auditada:** `b133a62724072d1815c71bcd08c49c3f23a51e00` (`neon/dynamic-ecosystem-engine`, PR #3)
 - **Branch atual:** `neon/world-event-director`
-- **Pull Request base sugerido:** `neon/dynamic-ecosystem-engine` (enquanto PR #3 ainda não estiver integrado à `main`; não realizar merge automático nem alterar PRs #1, #2 ou #3)
-- **Referência CARBON inspecionada (somente leitura):** `origin/feature/carbon-initial-persistence` @ `36ef459423be343b037f1145bb6dd608d0030f52`
+- **Pull Request base sugerido:** `neon/dynamic-ecosystem-engine` (enquanto PR #3 ainda não estiver integrado à `main`)
+- **Referência CARBON inspecionada (somente leitura):** `origin/feature/carbon-initial-persistence` (`36ef459`) e `origin/carbon/contribution-integration-engine` (`92f2732`, observada na auditoria)
 
 ---
 
-## 1. Entregas do Ciclo 04
+## 1. Entregas do Ciclo 04 + Recuperação 04.1 (CODEX) + Recuperação 04.2 (NEON)
 
 1. **World Event Director & Dynamic Campaign Engine (`internal/worldevents`)**:
-   - FSM explícita de 14 estados (`Candidate -> Scheduled -> Reconnaissance -> Preparing -> Warning -> Mobilizing -> Active -> Resolving -> Defended/Captured/Cancelled/Expired -> Recovering -> Completed`) com `ValidateCampaignTransition`, rejeitando transições ilegais, cancelamento após `Active` e reexecução de campanhas terminais.
-   - Políticas data-driven divergentes para Goblins (`goblin-raid-campaign`) e Orcs (`orc-warband-campaign`); facções neutras/aliadas (`HostileToSettlement == false`) **nunca** iniciam invasões.
-   - Escalonador determinístico baseado em ticks com prioridade inteira separada de `ThreatScore`, anti-starvation aging (`PriorityAgingPerTick`), desempate canônico total, limites de concorrência (`3` globais, `1` por região, `1` por assentamento, máx. `1` combate tático ativo), cooldowns, expiração por deadline, regras de proteção de assentamento e eventos encadeados com teto `MaxChainDepth = 2`.
-   - Fato global autoritativo `TerminalSettlementOutcome` emitido estritamente uma vez por invasão resolvida — **inclusive quando `EligibleContributors == 0`**.
-2. **Reservas Idempotentes de População em 3 Compartimentos (`internal/ecosystem/reservations.go`)** *(resolve achado P2 da auditoria do Ciclo 03)*:
-   - `FreePopulation + ReservedPopulation + MaterializedPopulation` conservados exatamente em `EcosystemState.Validate` e `OrchestratedState.Validate`.
-   - `CreateReservation`, `MaterializeFromReservation`, `ReconcileReservationContingent`, `CancelReservation`, `CompleteReservation` e `PruneClosedReservations` com `ReservationID` monotônico, `IdempotencyKey`, `AppliedOps` e `RetiredReservationKeys` limitados.
-3. **Autoridade Única de Invasões & Separação de Comandos (`internal/world/commands.go`, `director.go`, `types.go`)**:
-   - `world.OrchestrationCampaignDirector` desabilita transições automáticas de invasão por limiar/decaimento em `world.Step` (preservando `OrchestrationLegacyThreat` para regressão dos Ciclos 01–03).
-   - `GameplayCommand` / `DirectorCommand` / `AdminCommand` isolados por escopo (`world.ErrUnauthorizedCommand`).
-   - IDs monotônicos duráveis (`GroupSeq`, `InvasionSeq`, `CampaignSeq`, `ScheduledEventSeq`, `OutcomeSeq`, `ReservationSeq`) persistidos em snapshots e checksums com proteção contra overflow.
-   - Reforços ecológicos via `EventReinforcementRequested` debitados estritamente do buffer reservado da campanha (`SpawnCampaignReinforcement`), mantendo intacto o bloqueio contra criação fantasma de população.
-4. **Snapshot v4 (`internal/simulation/snapshot.go`)**:
-   - `SnapshotVersion = 4` (rejeitando explicitamente `v1`, `v2`, `v3`), enforcement pré-decodificação de `MaxSnapshotBytes` e validação cross-layer completa.
+   - FSM explícita de 14 estados com `ValidateCampaignTransition`, políticas data-driven para Goblins e Orcs, regras de proteção de assentamento e follow-ups obrigatórios com vaga reservada (`reservedFollowupSlots`).
+   - Escalonador determinístico baseado em ticks com anti-starvation aging, desempate canônico total, limites de concorrência, `ReleaseCancelledEvents` fora de `Step` e admissão calibrada sob consumidor lento (`campaignAdmissionError` com `MaxPendingContributions = 256 = 2 × World.MaxContributions`).
+   - Três filas confirmáveis duráveis em estado (`PendingDirectorBatches` paginado via `PendingDirectorEventPage`, `PendingOutcomes`, `PendingContributions`) com `Acknowledge*` e `Acknowledge*Verified` (rejeição de conflito e lote parcial), `MaxEventsPerBatch = 128`, `MaxPendingDirectorEvents = 1024` e orçamento de bytes de snapshot verificado antes de commitar.
+   - Fato global autoritativo `TerminalSettlementOutcome` emitido estritamente uma vez — **inclusive quando `EligibleContributors == 0`**.
+2. **Reservas Sequenciais Idempotentes em 3 Compartimentos (`internal/ecosystem/reservations.go`)**:
+   - `CreateSequencedReservation` com sequência contígua vinculada a `ReservationSeq`, namespace `ordered-reservation:<seq>`, `PruneClosedReservationsExcept` protegendo reservas referenciadas e rejeição de replay antigo com memória `O(1)`.
+3. **Autoridade Única de Invasões, Guardas de Dono & Separação de Comandos (`internal/world`)**:
+   - `OrchestrationCampaignDirector`, `GameplayCommand`/`DirectorCommand`/`AdminCommand`, e guardas de dono/facção/chamador em `applyDirectorStartInvasion`, `applyDirectorAbortPreparedInvasion` e `SpawnCampaignReinforcement`.
+4. **Snapshot v5 (`internal/simulation/snapshot.go`)**:
+   - `SnapshotVersion = 5` (rejeitando `v1`–`v4` e reservas legadas arbitrárias em estado orquestrado), pré-checagem de `MaxSnapshotBytes` e validação semântica cross-layer completa.
 5. **Harness Headless CLI (`cmd/sim`)**:
-   - Todos os 10 cenários anteriores (4 táticos + 6 ecossistema) preservados intactos + **9 cenários novos do Ciclo 04 (A–I)** com logs estruturados `log/slog` e verificação de equivalência mid-campaign em Snapshot v4 (`Scenario G`).
+   - 19 cenários anteriores preservados intactos (4 táticos + 6 ecossistema + 9 World Event Director A–I) + **5 cenários de consumidor headless (J–N)** cobrindo consumidor imediato, lento, parcialmente indisponível, recuperado e com reentrega/deduplicação (harness de dev em memória, não persistência de produção).
 
 ---
 
-## 2. Evidências Reais de Verificação
+## 2. Evidências Reais de Verificação (Recuperação 04.2 — Pós-Correções Finais)
 
-- **Determinismo estático:** `0` imports de `time`, `math/rand`, `net/` ou `database/sql` em `internal/`; `0` usos de `float32`/`float64` em arquivos não-teste de `internal/`.
-- **Build, Vet, Race e Shuffle:** `go vet ./...`, `go build ./...`, `go test -race -count=1 ./...`, `go test -shuffle=on -count=10 ./...`, `go run ./cmd/sim` e `git diff --check` **100% verdes**.
+- **Determinismo estático:** `0` imports proibidos (`time`, `math/rand`, `net/`, `database/sql`) e `0` `float32`/`float64` em `internal/` (não-teste).
+- **Regressão completa:** `go vet`, `go build`, `go test -race -count=1`, `go test -shuffle=on -count=10`, `go run ./cmd/sim` (24/24 cenários) e `git diff --check` **100% verdes**.
 - **Cobertura (`go test -count=1 -cover ./...`)**:
-  - `internal/simulation`: **100,0%**
-  - `internal/adapters/memory`: **97,1%**
-  - `internal/ports`: **96,8%**
-  - `internal/ai`: **86,5%**
-  - `internal/ecosystem`: **85,3%** *(alvo ≥ 85% atingido)*
-  - `internal/worldevents`: **85,1%** *(alvo ≥ 85% atingido)*
-  - `internal/world`: **72,8%**
-  - `cmd/sim`: **76,8%**
-- **Longa duração multi-seed:** `3` seeds × `1.000` epochs (`12.000` ticks, `78` campanhas resolvidas) com heap retido estável (`438.936 B -> 423.992 B`, pico `461.776 B`).
-- **Fuzzing (30s por alvo, 0 falhas):** `2.496.055` execuções totais (`368.013` em `FuzzCampaignSchedulerAndCommands`, `288.422` em `FuzzOrchestratedSnapshotDecode`, `1.839.620` em `FuzzEcosystemCommandsAndInvariants`).
-- **Benchmarks (`-count=5`, Ryzen 7 5800X3D):** `EvaluateCandidates` **9,75 µs**, `ReservationLifecycle` **10,82 µs**, `CampaignProgressionStep` **93,68 µs**, `OrchestratedStepIntegrated` **121,84 µs**, `OrchestratedSnapshotRoundTrip` **490,65 µs** (~12,9 KB).
+  - `internal/simulation`: **100,0%** | `internal/adapters/memory`: **97,1%** | `internal/ports`: **96,8%** | `internal/ai`: **86,5%** | `internal/ecosystem`: **85,2%** | `internal/worldevents`: **85,1%** | `cmd/sim`: **77,8%** | `internal/world`: **75,6%**.
+- **Simulações prolongadas:** 2.000 ciclos sequenciais (`MaxReservations=2`), 12.000 ticks multi-seed (78 campanhas, heap final `586.176 B`) e 2.400 ticks sob consumidor lento e capacidades pequenas (36 pausas recuperadas, heap final `583.984 B`).
+- **Fuzzing (60s por alvo, 16 workers, 0 falhas — 8.947.667 execuções totais):**
+  - `FuzzCampaignSchedulerAndCommands`: `2.654.904` | `FuzzOutcomeAcknowledgements`: `137.081` | `FuzzOrchestratedSnapshotDecode`: `388.971` | `FuzzEcosystemCommandsAndInvariants`: `5.766.711`.
+- **Benchmarks (`-count=5`, Ryzen 7 5800X3D):** detalhes completos em [PERFORMANCE_BASELINE.md](../worldevents/PERFORMANCE_BASELINE.md).
 
 ---
 
 ## 3. Fronteira com CARBON e Próximos Passos
 
-- Nenhum arquivo TypeScript/PostgreSQL do CARBON foi modificado; `internal/ports/carbon.go` não sofreu breaking changes.
-- Proposta de contratos alinhada ao `AscendraSharedEventEnvelopeV1` e `SettlementCaptured` já publicados pelo CARBON (`36ef459`) documentada em [NEON_WORLD_EVENT_CONTRACT_PROPOSAL.md](../contracts/NEON_WORLD_EVENT_CONTRACT_PROPOSAL.md).
-- Próximo passo natural após auditoria CODEX: **Ciclo 05** (sistema completo de combate técnico, bosses e cerco / evolução espacial 2D) + alinhamento conjunto com CARBON sobre o adapter de borda de eventos (UUIDv5 + strings decimais).
+- Nenhum arquivo TypeScript/PostgreSQL do CARBON foi modificado; `internal/ports/carbon.go` preservado intacto.
+- Documentação de filas confirmáveis e acoplamento futuro a Transactional Inbox/Outbox em [BACKPRESSURE_AND_RECOVERY.md](../worldevents/BACKPRESSURE_AND_RECOVERY.md) e [NEON_WORLD_EVENT_CONTRACT_PROPOSAL.md](../contracts/NEON_WORLD_EVENT_CONTRACT_PROPOSAL.md).
+- Branch preparada para o próximo ciclo: `neon/invasion-siege-engine` (Cycle 05 — Invasion & Siege Engine).

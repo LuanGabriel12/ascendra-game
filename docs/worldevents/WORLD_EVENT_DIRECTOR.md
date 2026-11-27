@@ -10,13 +10,13 @@ Ele NÃO substitui o motor de ecossistema, NÃO substitui o motor tático de com
 
 ```mermaid
 flowchart TD
-    SIM["internal/simulation (RNG, Canonical Hasher, Snapshot v4)"]
+    SIM["internal/simulation (RNG, Canonical Hasher, Snapshot v5)"]
     PORTS["internal/ports (SettlementReader, ContributionSink)"]
     AI["internal/ai (Perfis, Percepcao, Coordenacao O(G log G))"]
-    ECO["internal/ecosystem (Escala B: Populacoes, Recursos, Acampamentos, Reservas Idempotentes)"]
+    ECO["internal/ecosystem (Escala B: Populacoes, Recursos, Acampamentos, Reservas Sequenciais)"]
     WLD["internal/world (Escala A: Arena Tatica, Combate, Contribuicoes, Command Scopes)"]
-    WEV["internal/worldevents (World Event Director, Campaign FSM, Tick Scheduler)"]
-    CLI["cmd/sim (Harness CLI Headless: 19 cenarios)"]
+    WEV["internal/worldevents (World Event Director, Campaign FSM, Filas Confirmaveis)"]
+    CLI["cmd/sim (Harness CLI Headless: 24 cenarios)"]
 
     SIM --> AI
     SIM --> ECO
@@ -71,12 +71,14 @@ A função `worldevents.Step(state, input, cfg)` é **pura, sem I/O, sem `time.N
 
 Quando nenhum jogador participa (`0` defensores e `0` comandos de gameplay), o fato global continua sendo emitido estritamente uma vez com `EligibleContributors == 0`, evitando perda silenciosa de captura/defesa de cidades pelo mundo aberto.
 
-## 6. Snapshots v4 e Validação Cross-Layer
+## 6. Snapshots v5 e Validação Cross-Layer
 
-`simulation.SnapshotVersion = 4` introduz persistência conjunta das três camadas (`Director`, `World`, `Ecosystem`) sob um único checksum canônico SHA-256 e enforcement pré-decodificação de `MaxSnapshotBytes` (rejeitando `v1`, `v2` e `v3` com `ErrUnsupportedSnapshotVersion`).
+`simulation.SnapshotVersion = 5` persiste as três camadas e as três filas confirmáveis (`PendingDirectorBatches`, `PendingOutcomes`, `PendingContributions` + cursores de confirmação) sob um único checksum canônico SHA-256, com enforcement pré-decodificação de `MaxSnapshotBytes`. Versões anteriores (`v1`–`v4`) e reservas legadas arbitrárias são explicitamente rejeitadas; veja [BACKPRESSURE_AND_RECOVERY.md](BACKPRESSURE_AND_RECOVERY.md).
 
 Na restauração (`UnmarshalOrchestratedSnapshot`), `OrchestratedState.Validate` garante:
 - `Director.Tick == World.Tick`;
-- Toda campanha com `ReservationID` aponta para uma reserva existente, única e com proveniência idêntica;
+- Todas as filas confirmáveis têm sequências contíguas, `AckSeq <= Seq`, sem duplicatas nem ticks futuros;
+- Toda campanha `Active` corresponde exatamente ao `World.Invasion` ativo/resolvido com mesmo `CampaignID`;
+- Toda campanha com `ReservationID` aponta para uma reserva sequencial existente, única e com proveniência idêntica;
 - Todo grupo tático não contabilizado com `PopulationWeight > 0` bate exatamente com `pop.MaterializedPopulation` e `res.RemainingMaterialized()`;
 - `sum(res.RemainingReserved()) == pop.ReservedPopulation` para toda população.
