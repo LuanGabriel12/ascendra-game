@@ -6,7 +6,7 @@ O projeto prioriza **profundidade mecânica, consistência de sistemas e excelê
 
 ---
 
-## Visão Geral
+## Visão Geral 
 
 Em ASCENDRA, o estado do mundo evolui continuamente a partir das ações dos jogadores e da simulação ativa do servidor: cidades podem ser ameaçadas, sitiadas, ocupadas por facções ou hordas invasoras, libertadas e reconstruídas, registrando eventos marcantes na memória histórica permanente do servidor.
 
