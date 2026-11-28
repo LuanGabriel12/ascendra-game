@@ -380,6 +380,18 @@ export function assertConsistentCombatSnapshots(params: {
       params.abilitySnapshot.snapshotVersion,
     );
   }
+  if (params.abilitySnapshot.normalizationProfile !== params.characterSnapshot.normalizationProfile) {
+    throw new BoundaryValidationError("Cross-snapshot normalization profile mismatch.", [
+      "characterSnapshot.normalizationProfile != abilitySnapshot.normalizationProfile",
+    ]);
+  }
+  if (params.equipmentSnapshot &&
+      (params.equipmentSnapshot.normalizationProfile !== params.characterSnapshot.normalizationProfile ||
+       params.equipmentSnapshot.activeLoadoutId !== params.abilitySnapshot.activeLoadoutId)) {
+    throw new BoundaryValidationError("Cross-snapshot equipment configuration mismatch.", [
+      "equipmentSnapshot normalization profile or active loadout differs",
+    ]);
+  }
   if (params.equipmentSnapshot) {
     if (
       params.equipmentSnapshot.characterId !== cid ||
