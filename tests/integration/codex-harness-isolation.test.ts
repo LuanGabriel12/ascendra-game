@@ -23,13 +23,15 @@ test("external contexts isolate migrations, data, reconnect and cleanup", async 
     const bName = new URL(b.connectionString).pathname.slice(1);
     assert.notEqual(aName, bName);
     assert.notEqual(aName, new URL(controlUrl).pathname.slice(1));
-    await Promise.all([migrateUp(a.pool, migrations), migrateUp(b.pool, migrations)]);
+    const [appliedA] = await Promise.all([migrateUp(a.pool, migrations), migrateUp(b.pool, migrations)]);
+    const expectedMigrationCount = appliedA.length;
+    assert.ok(expectedMigrationCount >= 15);
     await a.pool.query("CREATE TABLE harness_marker (value integer)");
     await a.pool.query("INSERT INTO harness_marker VALUES (42)");
     const missing = await b.pool.query("SELECT to_regclass('public.harness_marker') AS name");
     assert.equal(missing.rows[0].name, null);
-    await migrateDown(a.pool, migrations, 12);
-    assert.equal((await b.pool.query("SELECT count(*)::int AS n FROM schema_migrations")).rows[0].n, 12);
+    await migrateDown(a.pool, migrations, expectedMigrationCount);
+    assert.equal((await b.pool.query("SELECT count(*)::int AS n FROM schema_migrations")).rows[0].n, expectedMigrationCount);
     await a.restartAndReconnect();
     assert.equal((await a.pool.query("SELECT value FROM harness_marker")).rows[0].value, 42);
     await a.pool.query("DROP TABLE harness_marker");

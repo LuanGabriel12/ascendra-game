@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -71,6 +71,9 @@ describe("CARBON Full Audit — Migrations, Fault Injection, Pool/Timeout Recove
       await migrateDown(pgCtx.pool, MIGRATIONS_DIR, pre.length);
     }
 
+    const expectedMigrationCount = (await readdir(MIGRATIONS_DIR)).filter((f) => f.endsWith(".up.sql")).length;
+    assert.ok(expectedMigrationCount >= 15);
+
     // 1. Run 3 concurrent migrateUp calls against an empty schema -> advisory lock serializes cleanly!
     const [r1, r2, r3] = await Promise.all([
       migrateUp(pgCtx.pool, MIGRATIONS_DIR),
@@ -78,7 +81,7 @@ describe("CARBON Full Audit — Migrations, Fault Injection, Pool/Timeout Recove
       migrateUp(pgCtx.pool, MIGRATIONS_DIR),
     ]);
     const totalApplied = r1.length + r2.length + r3.length;
-    assert.equal(totalApplied, 12);
+    assert.equal(totalApplied, expectedMigrationCount);
 
     // 2. Copy migrations to a disposable directory to test checksum mismatch & induced SQL failure safely
     const tmpMigDir = await mkdtemp(path.join(os.tmpdir(), "ascendra-mig-audit-"));
@@ -97,7 +100,7 @@ describe("CARBON Full Audit — Migrations, Fault Injection, Pool/Timeout Recove
         "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'should_rollback_completely'",
       );
       assert.equal(partialTableCheck.rowCount, 0);
-      assert.equal((await listAppliedMigrations(pgCtx.pool)).length, 12);
+      assert.equal((await listAppliedMigrations(pgCtx.pool)).length, expectedMigrationCount);
 
       // Remove broken 0099, tamper with already-applied 0001_carbon_settlement_slice.up.sql -> MUST throw MigrationChecksumMismatchError!
       await rm(path.join(tmpMigDir, "0099_induced_failure.up.sql"));

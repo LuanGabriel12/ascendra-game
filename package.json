@@ -19,7 +19,8 @@
     "demo:session03": "node --import tsx src/scripts/demo-session-03.ts",
     "demo:session04": "node --import tsx src/scripts/demo-session-04.ts",
     "demo:session05": "node --import tsx src/scripts/demo-session-05.ts",
-    "demo:session06": "node --import tsx src/scripts/demo-session-06.ts"
+    "demo:session06": "node --import tsx src/scripts/demo-session-06.ts",
+    "demo:session07": "node --import tsx src/scripts/demo-session-07.ts"
   },
   "dependencies": {
     "pg": "^8.23.1",
