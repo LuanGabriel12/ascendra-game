@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -82,33 +83,53 @@ export async function startPostgresTestContext(): Promise<RunningPostgresTestCon
   const externalUrl = process.env["DATABASE_URL"];
   if (externalUrl && externalUrl.trim().length > 0) {
     assertSafeTestDatabaseUrl(externalUrl);
-    let currentPool = createPgPool({
-      connectionString: externalUrl,
-      max: 12,
-      idleTimeoutMillis: 10000,
-      connectionTimeoutMillis: 5000,
+    // The supplied database is only a control connection. Every context owns a
+    // freshly created database, so concurrent suites can run destructive migrations.
+    const controlPool = createPgPool({ connectionString: externalUrl, max: 1 });
+    const databaseName = `ascendra_harness_${process.pid}_${randomUUID().replaceAll("-", "")}`;
+    const databaseUrl = new URL(externalUrl);
+    databaseUrl.pathname = `/${databaseName}`;
+    const connectionString = databaseUrl.toString();
+    const makePool = (): PgPool => createPgPool({
+      connectionString, max: 12, idleTimeoutMillis: 10000, connectionTimeoutMillis: 5000,
     });
+    let created = false;
+    let currentPool: PgPool | undefined;
+    try {
+      await controlPool.query(`CREATE DATABASE "${databaseName}"`);
+      created = true;
+      currentPool = makePool();
+      await currentPool.query("SELECT 1");
+    } catch (error) {
+      if (currentPool) await currentPool.end();
+      try {
+        if (created) await controlPool.query(`DROP DATABASE "${databaseName}"`);
+      } finally {
+        await controlPool.end();
+      }
+      throw error;
+    }
 
-    await currentPool.query("SELECT 1");
+    let pool = currentPool;
+    let stopped = false;
     return {
-      connectionString: externalUrl,
-      get pool(): PgPool {
-        return currentPool;
-      },
+      connectionString,
+      get pool(): PgPool { return pool; },
       isEmbedded: false,
       async restartAndReconnect(): Promise<PgPool> {
-        await currentPool.end();
-        currentPool = createPgPool({
-          connectionString: externalUrl,
-          max: 12,
-          idleTimeoutMillis: 10000,
-          connectionTimeoutMillis: 5000,
-        });
-        await currentPool.query("SELECT 1");
-        return currentPool;
+        if (stopped) throw new Error("Test context is stopped.");
+        await pool.end();
+        pool = makePool();
+        await pool.query("SELECT 1");
+        return pool;
       },
       async stop(): Promise<void> {
-        await currentPool.end();
+        if (stopped) return;
+        await pool.end();
+        // Only the generated identifier created above is ever dropped.
+        await controlPool.query(`DROP DATABASE "${databaseName}"`);
+        stopped = true;
+        await controlPool.end();
       },
     };
   }
