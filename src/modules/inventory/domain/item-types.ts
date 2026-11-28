@@ -127,7 +127,7 @@ export const ITEM_ORIGIN_TYPES = [
 export type ItemOriginType = (typeof ITEM_ORIGIN_TYPES)[number];
 
 export type ContainerType = "character_inventory" | "personal_storage";
-export type ItemLocationState = "in_container" | "equipped_active" | "destroyed";
+export type ItemLocationState = "in_container" | "equipped_active" | "in_escrow" | "destroyed";
 export type AffixKind = "prefix" | "suffix" | "special_effect";
 
 export interface RarityDefinition {
@@ -253,6 +253,8 @@ export interface ItemInstance {
   readonly generationSeedHash: string;
   readonly originType: ItemOriginType;
   readonly originReference: string;
+  readonly craftedByCharacterId?: string | null | undefined;
+  readonly craftingRecipeCode?: string | null | undefined;
   readonly instanceVersion: number;
   readonly createdAt: Date;
   readonly updatedAt: Date;

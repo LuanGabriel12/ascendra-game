@@ -840,6 +840,70 @@ export class PgSocialTransactionScope {
       }
     }
 
+    const professionsByCode = new Map<
+      string,
+      { readonly level: number; readonly craftsCompleted: number }
+    >();
+    const hasProfessionsRes = await this.client.query<{ present: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM information_schema.tables
+         WHERE table_schema = current_schema() AND table_name = 'character_professions'
+       ) AS present`,
+    );
+    if (hasProfessionsRes.rows[0]?.present === true) {
+      const profRes = await this.client.query<{
+        profession_code: string;
+        profession_level: number;
+        crafts_completed_count: number;
+      }>(
+        `SELECT profession_code, profession_level, crafts_completed_count
+         FROM character_professions
+         WHERE character_id = $1::uuid`,
+        [characterId],
+      );
+      for (const pr of profRes.rows) {
+        professionsByCode.set(pr.profession_code, {
+          level: Number(pr.profession_level),
+          craftsCompleted: Number(pr.crafts_completed_count),
+        });
+      }
+    }
+
+    const verifiedMarketSalesByCurrency = new Map<
+      string,
+      { readonly distinctAccountSalesCount: number; readonly distinctAccountGrossVolume: bigint }
+    >();
+    const hasMarketSalesRes = await this.client.query<{ present: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM information_schema.tables
+         WHERE table_schema = current_schema() AND table_name = 'market_sales'
+       ) AS present`,
+    );
+    if (hasMarketSalesRes.rows[0]?.present === true) {
+      // Strictly exclude same-account self-dealing (`is_same_account = FALSE`) per Section 28!
+      const salesRes = await this.client.query<{
+        currency_code: string;
+        cnt: string;
+        vol: string;
+      }>(
+        `SELECT
+           currency_code,
+           COUNT(*)::text AS cnt,
+           COALESCE(SUM(gross_amount), 0)::text AS vol
+         FROM market_sales
+         WHERE seller_character_id = $1::uuid
+           AND is_same_account = FALSE
+         GROUP BY currency_code`,
+        [characterId],
+      );
+      for (const s of salesRes.rows) {
+        verifiedMarketSalesByCurrency.set(s.currency_code, {
+          distinctAccountSalesCount: Number(s.cnt),
+          distinctAccountGrossVolume: BigInt(s.vol),
+        });
+      }
+    }
+
     return {
       moralBounty: social.moralBounty,
       globalFame: social.globalFame,
@@ -855,6 +919,8 @@ export class PgSocialTransactionScope {
       activeLearnedAbilitiesCount,
       activeLearnedAbilitiesBySchool,
       activeSpecNodesBySchool,
+      professionsByCode,
+      verifiedMarketSalesByCurrency,
     };
   }
 

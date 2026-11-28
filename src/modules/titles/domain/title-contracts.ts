@@ -138,6 +138,18 @@ export type TitleConditionNode =
       readonly schoolCode: string;
       readonly minUnlockedNodes: number;
     }
+  | {
+      readonly op: "ProfessionMasteryAtLeast";
+      readonly professionCode: string;
+      readonly minLevel: number;
+      readonly minCraftsCompleted: number;
+    }
+  | {
+      readonly op: "VerifiedMarketSalesAtLeast";
+      readonly minDistinctAccountSalesCount: number;
+      readonly minGrossVolume: string;
+      readonly currencyCode: string;
+    }
   | { readonly op: "PlannedSystemUnavailable"; readonly systemCode: string };
 
 export interface VersionedTitleDefinition {
@@ -191,6 +203,17 @@ export interface TitleEvaluationSnapshot {
   readonly activeLearnedAbilitiesBySchool?: ReadonlyMap<string, number> | undefined;
   /** Session 06+: Map of `schoolCode -> active unlocked specialization node count` */
   readonly activeSpecNodesBySchool?: ReadonlyMap<string, number> | undefined;
+  /** Session 07+: Map of `professionCode -> { level, craftsCompleted }` */
+  readonly professionsByCode?:
+    | ReadonlyMap<string, { readonly level: number; readonly craftsCompleted: number }>
+    | undefined;
+  /** Session 07+: Map of `currencyCode -> { distinctAccountSalesCount, distinctAccountGrossVolume }` */
+  readonly verifiedMarketSalesByCurrency?:
+    | ReadonlyMap<
+        string,
+        { readonly distinctAccountSalesCount: number; readonly distinctAccountGrossVolume: bigint }
+      >
+    | undefined;
 }
 
 export const MAX_TITLE_AST_DEPTH = 4;
@@ -345,6 +368,45 @@ export function validateTitleConditionAst(root: TitleConditionNode): void {
         }
         return;
 
+      case "ProfessionMasteryAtLeast":
+        if (!node.professionCode || !node.professionCode.trim()) {
+          throw new TitleConditionInvalidError("ProfessionMasteryAtLeast requires professionCode.");
+        }
+        if (!Number.isInteger(node.minLevel) || node.minLevel < 1 || node.minLevel > 100) {
+          throw new TitleConditionInvalidError(
+            "ProfessionMasteryAtLeast minLevel must be an integer within 1..100.",
+          );
+        }
+        if (!Number.isInteger(node.minCraftsCompleted) || node.minCraftsCompleted < 0) {
+          throw new TitleConditionInvalidError(
+            "ProfessionMasteryAtLeast minCraftsCompleted must be >= 0.",
+          );
+        }
+        return;
+
+      case "VerifiedMarketSalesAtLeast": {
+        if (
+          !Number.isInteger(node.minDistinctAccountSalesCount) ||
+          node.minDistinctAccountSalesCount < 1
+        ) {
+          throw new TitleConditionInvalidError(
+            "VerifiedMarketSalesAtLeast minDistinctAccountSalesCount must be >= 1.",
+          );
+        }
+        const vol = parseSignedInt64Threshold(node.minGrossVolume, node.op);
+        if (vol <= 0n) {
+          throw new TitleConditionInvalidError(
+            "VerifiedMarketSalesAtLeast minGrossVolume must be > 0.",
+          );
+        }
+        if (!node.currencyCode || !node.currencyCode.trim()) {
+          throw new TitleConditionInvalidError(
+            "VerifiedMarketSalesAtLeast requires currencyCode.",
+          );
+        }
+        return;
+      }
+
       case "PlannedSystemUnavailable":
         if (!node.systemCode || !node.systemCode.trim()) {
           throw new TitleConditionInvalidError("PlannedSystemUnavailable requires systemCode.");
@@ -443,6 +505,23 @@ export function evaluateTitleConditionAst(
       case "SchoolSpecializationCompleted": {
         const unlockedCnt = ctx.activeSpecNodesBySchool?.get(curr.schoolCode) ?? 0;
         return unlockedCnt >= curr.minUnlockedNodes;
+      }
+      case "ProfessionMasteryAtLeast": {
+        const prof = ctx.professionsByCode?.get(curr.professionCode);
+        if (!prof) {
+          return false;
+        }
+        return prof.level >= curr.minLevel && prof.craftsCompleted >= curr.minCraftsCompleted;
+      }
+      case "VerifiedMarketSalesAtLeast": {
+        const stats = ctx.verifiedMarketSalesByCurrency?.get(curr.currencyCode);
+        if (!stats) {
+          return false;
+        }
+        return (
+          stats.distinctAccountSalesCount >= curr.minDistinctAccountSalesCount &&
+          stats.distinctAccountGrossVolume >= BigInt(curr.minGrossVolume)
+        );
       }
       case "PlannedSystemUnavailable":
         return false;

@@ -381,6 +381,11 @@ export function assertInstanceTransferPermitted(params: {
       `Equipped item '${params.instance.id}' must be unequipped before transfer.`,
     );
   }
+  if (params.instance.locationState !== "in_container") {
+    throw new ItemBindingViolationError(
+      `Item '${params.instance.id}' in location '${params.instance.locationState}' is not available in inventory for transfer.`,
+    );
+  }
   if (params.instance.bindingState === "character_bound") {
     throw new ItemBindingViolationError(
       `Item '${params.instance.id}' is character_bound to '${params.instance.boundCharacterId}' and cannot be transferred.`,

@@ -75,7 +75,12 @@ export type LedgerOperationType =
   | "destroy"
   | "durability_loss"
   | "repair"
-  | "loadout_activate";
+  | "loadout_activate"
+  | "escrow_lock"
+  | "escrow_release"
+  | "escrow_settle"
+  | "consume"
+  | "craft";
 
 export interface ItemLedgerEntryInput {
   readonly operationId: string;
@@ -125,6 +130,8 @@ interface ItemInstanceRow {
   generation_seed_hash: string;
   origin_type: ItemOriginType;
   origin_reference: string;
+  crafted_by_character_id?: string | null | undefined;
+  crafting_recipe_code?: string | null | undefined;
   instance_version: number;
   created_at: Date;
   updated_at: Date;
@@ -222,6 +229,8 @@ function mapInstanceRow(
     generationSeedHash: row.generation_seed_hash,
     originType: row.origin_type,
     originReference: row.origin_reference,
+    craftedByCharacterId: row.crafted_by_character_id ?? null,
+    craftingRecipeCode: row.crafting_recipe_code ?? null,
     instanceVersion: row.instance_version,
     createdAt: row.created_at,
     updatedAt: row.updated_at,

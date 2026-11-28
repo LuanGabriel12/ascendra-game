@@ -1215,6 +1215,11 @@ export class InventoryEngineService {
       if (item.locationState === "destroyed") {
         throw new ItemInstanceNotFoundError(item.id);
       }
+      if (item.locationState === "in_escrow") {
+        throw new LoadoutInvalidError(
+          `Item '${item.id}' is currently held in economic escrow and cannot be equipped.`,
+        );
+      }
 
       const def = await scope.findItemDefinition(item.definitionCode, item.definitionVersion);
       if (!def) {
@@ -1672,9 +1677,9 @@ export class InventoryEngineService {
         seenInstances.add(a.itemInstanceId.toLowerCase());
 
         const inst = await scope.findItemInstanceById(a.itemInstanceId);
-        if (!inst || inst.locationState === "destroyed") {
+        if (!inst || inst.locationState === "destroyed" || inst.locationState === "in_escrow") {
           throw new LoadoutInvalidError(
-            `Referenced item '${a.itemInstanceId}' does not exist or is destroyed.`,
+            `Referenced item '${a.itemInstanceId}' does not exist, is destroyed, or is held in escrow.`,
           );
         }
         if (inst.ownerCharacterId !== character.id) {
@@ -1818,9 +1823,14 @@ export class InventoryEngineService {
       // Validate every target item is still owned, non-destroyed, non-broken, and meets requirements
       for (const s of targetSlots) {
         const inst = lockedInstances.get(s.itemInstanceId);
-        if (!inst || inst.locationState === "destroyed" || inst.ownerCharacterId !== character.id) {
+        if (
+          !inst ||
+          inst.locationState === "destroyed" ||
+          inst.locationState === "in_escrow" ||
+          inst.ownerCharacterId !== character.id
+        ) {
           throw new LoadoutInvalidError(
-            `Loadout '${targetRow.name}' contains invalid or unowned item reference '${s.itemInstanceId}'.`,
+            `Loadout '${targetRow.name}' contains invalid, escrowed, or unowned item reference '${s.itemInstanceId}'.`,
           );
         }
         const def = await scope.findItemDefinition(inst.definitionCode, inst.definitionVersion);
@@ -2416,6 +2426,11 @@ export class InventoryEngineService {
       }
       if (inst.locationState === "equipped_active") {
         throw new LoadoutInvalidError("Equipped item must be unequipped before destruction.");
+      }
+      if (inst.locationState !== "in_container") {
+        throw new LoadoutInvalidError(
+          `Item '${inst.id}' in state '${inst.locationState}' cannot be destroyed directly.`,
+        );
       }
 
       await scope.purgeInactiveLoadoutReferencesForItem(character.id, inst.id);
