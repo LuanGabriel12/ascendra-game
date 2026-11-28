@@ -44,3 +44,30 @@ The previous reports propose conflicting lock hierarchies (characters before acc
 ## Integration
 
 Review the accumulated CARBON changes as a final secure head, with stacked PRs for review if useful, but do not merge intermediate heads containing known prior defects into main. Reconcile NEON contracts separately and avoid automatic merges. Session 07 is not approved.
+## Follow-up: provisional bounty guard
+
+The application now rejects new Active or escrow_committed bounties even from internal authority; Draft planned_unfunded proposals remain available. Claim commands fail closed before opening a transaction, including retries and existing legacy records. The active listing returns no rows while no funding verifier exists. Legacy rows, original reference, claims and historical outbox entries are preserved, not evidence of reserve or payment. Existing historical events or direct database readers require reconciliation and must never interpret the old funding label as verified. There is no monetary settlement implementation. These controls cover application paths, not arbitrary privileged SQL writes.
+
+The social integration regression exercises arbitrary and blank references, an internal authority, a draft, identical and conflicting retries, a simulated legacy row, rejected concurrent claims, preservation and absence of new claim rows. The Session 05 demo uses a draft and checks rejection. Additional outbox, legacy history and full rollback adversarial validation remain open; prior positive claim tests cannot exercise the disabled claim flow until a verified provider is implemented.
+
+### Lock evidence gathered (partial, not a global ordering)
+
+| Operation | Observed order in application | Remaining uncertainty |
+|---|---|---|
+| Create character | account, inbox, insert character | Interactions with other account writers not tested with barriers |
+| Player character changes | character, account, inbox | Other domain locks require full mapping |
+| Inventory player operations | character, account guard, inbox, item/loadout/container | Ordering differs across operations; full graph unverified |
+| Item transfer | sorted characters, sorted accounts, inbox, item | Opposite transfer and suspension barriers unverified |
+| Internal item grants | inbox before recipient character | Potential inverse edge with player paths needs a concrete cycle test |
+| Skill grants | inbox before sorted characters | Cross-service cycle unverified |
+| Player skills | character before inbox | Other locks and account guard need full mapping |
+| Social crime/title system commands | inbox before character | Interactions with player title equip unverified |
+| Player title equip | character, account, inbox | Concrete cycle not yet reproduced |
+| Bounty claim | currently rejected before transaction | Historical implementation had inbox then bounty then sorted characters |
+
+No universal lock order is established by this partial table. Existing methods own their transactions; economy must use one shared transaction for inventory, wallet, escrow, ledger and idempotency. No deadlock has been reproduced or fixed in this follow-up.
+
+PostgreSQL 16 CI for 8da45e7 was green, including Go and race detection. That result predates the bounty guard and does not validate it. Prior findings 001–010 remain BLOCKED for full independent classification, and 011 remains a joint decision. Gate remains BLOCKED pending the remaining audit and CI of the new head.
+### Local follow-up validation
+
+On the bounty-guard changes: npm ci with TLS enabled, typecheck and build passed. Three complete local test runs each reported 67 passed, 0 failed and 0 skipped. Demonstrations 02–06 each exited 0. Both npm audit variants reported 0 vulnerabilities with TLS enabled. No migration was added. Coverage was not independently measured. These results do not close the untested adversarial and global lock questions above.

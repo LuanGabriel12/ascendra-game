@@ -10,3 +10,8 @@ Do not begin Session 07 until the independent audit is completed, PostgreSQL 16 
 - Complete all 11 independent findings, full schema differential checks, snapshot version/mutation analysis and remote Go validation. No production readiness without authentication and transport.
 - Never modify published migrations 0001–0012; use incremental migrations. The historical checksum backfill is not proof of original bytes.
 - Preserve relic/Relíquia until a joint decision. Do not merge an intermediate version with known P0/P1 defects into main.
+## Follow-up status
+
+Application-level creation of funded/active bounties and all claims now fails closed. Unfunded Draft proposals remain; legacy bounties and claims are unchanged, and active listings omit unverified legacy rows. Existing outbox events and privileged SQL access are not converted into proof of reserves. Consumers must quarantine legacy settlement commitments and independently reconcile historical events before any payment.
+
+Before removing the guard, require a real, sufficient, unconsumed reservation linked to issuer, bounty and currency and recorded in a ledger, verified and consumed atomically with settlement and a retained idempotency key. Re-enable and independently test same-account, race and duplicate-claim behavior when a provider exists. Full lock graph, controlled barrier tests, snapshot version audit, full classification of 001–010, repeated full runs and CI at the latest head remain outstanding. Session 07 remains blocked.
