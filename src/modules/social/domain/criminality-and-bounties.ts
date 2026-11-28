@@ -358,6 +358,11 @@ export function validateCriminalBountyCreation(params: {
   readonly desiredStatus: "Draft" | "Active";
   readonly crimeLegalStatus: "suspected" | "confirmed" | "pardoned" | "sentence_served";
 }): void {
+  if (params.fundingStatus === "escrow_committed") {
+    throw new CriminalBountyInvalidError(
+      "Bounty funding cannot be verified until a monetary reservation provider exists.",
+    );
+  }
   if (params.rewardAmount <= 0n) {
     throw new CriminalBountyInvalidError("Criminal bounty rewardAmount must be > 0.");
   }
@@ -367,15 +372,9 @@ export function validateCriminalBountyCreation(params: {
     );
   }
   if (params.desiredStatus === "Active") {
-    if (
-      params.fundingStatus !== "escrow_committed" ||
-      !params.fundingReference ||
-      !params.fundingReference.trim()
-    ) {
-      throw new CriminalBountyInvalidError(
-        "Active criminal bounty requires fundingStatus='escrow_committed' and a non-blank fundingReference.",
-      );
-    }
+    throw new CriminalBountyInvalidError(
+      "Active criminal bounties require verified monetary reservations.",
+    );
   }
 }
 

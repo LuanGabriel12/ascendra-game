@@ -299,6 +299,12 @@ export interface SocialEngineDependencies {
     | undefined;
 }
 
+/** No historical text reference proves a funded monetary reservation. */
+function assertBountySettlementUnavailable(): void {
+  throw new CriminalBountyInvalidError(
+    "Bounty claims are disabled until a real monetary reservation can be verified.",
+  );
+}
 export class SocialEngineService {
   private readonly pool: PgPool;
   private readonly unitOfWork: PostgresSocialUnitOfWork;
@@ -1753,6 +1759,11 @@ export class SocialEngineService {
   ): Promise<IdempotentCommandOutcome<CriminalBounty>> {
     assertNotGenesisContext("createCriminalBounty", cmd.executionProfile);
     const actorId = assertSystemAuthority(cmd.principal, "createCriminalBounty");
+    if (cmd.fundingStatus === "escrow_committed" || cmd.desiredStatus === "Active") {
+      throw new CriminalBountyInvalidError(
+        "Funded or active bounties require a verified monetary reservation provider.",
+      );
+    }
     const rewardAmount = parsePositiveBigIntStrict(cmd.rewardAmount, "rewardAmount");
     const commandKey = cmd.commandId.trim();
     const rulesVersion = cmd.rulesVersion ?? 1;
@@ -1910,6 +1921,7 @@ export class SocialEngineService {
   ): Promise<IdempotentCommandOutcome<CriminalBountyClaim>> {
     assertNotGenesisContext("claimCriminalBounty", cmd.executionProfile);
     const actorId = assertSystemAuthority(cmd.principal, "claimCriminalBounty");
+    assertBountySettlementUnavailable();
     const commandKey = cmd.commandId.trim();
     const now = new Date();
     const eventUuid = deriveDeterministicEventUuid(commandKey);

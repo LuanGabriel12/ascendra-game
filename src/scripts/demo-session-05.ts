@@ -17,7 +17,7 @@ import {
   PostgresSocialSnapshotReader,
   serializeSocialStandingSnapshotWireV1,
 } from "../modules/social/application/social-snapshot-query.js";
-import { CriminalBountyInvalidError } from "../modules/social/domain/errors.js";
+import { CriminalBountyInvalidError, TitleConditionInvalidError } from "../modules/social/domain/errors.js";
 import { PostgresSocialRepository } from "../modules/social/infrastructure/postgres-social-unit-of-work.js";
 import { migrateUp } from "../shared/db/migrator.js";
 import { StructuredLogger } from "../shared/observability/logger.js";
@@ -263,7 +263,7 @@ async function runSession05Demo(): Promise<void> {
       regionId: "region-thornreach",
     });
 
-    // 17. Create funded CriminalBounty (`escrow_committed`) on Varkon
+    // 17. Record an explicitly unfunded bounty proposal on Varkon.
     const varkonBounty = (
       await socialEngine.createCriminalBounty({
         commandId: "demo05:bounty:create-varkon",
@@ -275,36 +275,24 @@ async function runSession05Demo(): Promise<void> {
         sourceCrimeId: crimeOutcome.data.crimeRecord!.id,
         rewardAmount: 3000n,
         currencyCode: "silver_mark",
-        fundingStatus: "escrow_committed",
-        fundingReference: "escrow:valewatch-treasury:77",
-        desiredStatus: "Active",
+        fundingStatus: "planned_unfunded",
+        fundingReference: null,
+        desiredStatus: "Draft",
       })
     ).data;
 
-    // 18–19. Bramir claims the CriminalBounty (`pending_economy_settlement`); duplicate claim attempt is rejected!
-    const validClaim = await socialEngine.claimCriminalBounty({
-      commandId: "demo05:bounty:claim-varkon-by-bramir",
-      principal: sysAuth,
-      bountyId: varkonBounty.id,
-      claimantCharacterId: dwarfHunter.id,
-      resolutionKind: "authorized_defeat",
-      authorityConfirmationRef: "combat-log:ashvale-bounty-77",
-    });
-    assert.equal(validClaim.data.payoutCommitmentStatus, "pending_economy_settlement");
-
+    // 18–19. A proposal cannot produce a funded claim before economic verification.
     await assert.rejects(
-      () =>
-        socialEngine.claimCriminalBounty({
-          commandId: "demo05:bounty:duplicate-claim-rejected",
-          principal: sysAuth,
-          bountyId: varkonBounty.id,
-          claimantCharacterId: dwarfHunter.id,
-          resolutionKind: "authorized_defeat",
-          authorityConfirmationRef: "combat-log:duplicate-attempt",
-        }),
+      () => socialEngine.claimCriminalBounty({
+        commandId: "demo05:bounty:claim-varkon-by-bramir",
+        principal: sysAuth,
+        bountyId: varkonBounty.id,
+        claimantCharacterId: dwarfHunter.id,
+        resolutionKind: "authorized_defeat",
+        authorityConfirmationRef: "combat-log:ashvale-bounty-77",
+      }),
       CriminalBountyInvalidError,
     );
-
     // 20. Unlock & equip criminal title ('Terror dos Reinos') on Varkon + bounty-hunter title on Bramir
     await socialEngine.evaluateAndUnlockTitle({
       commandId: "demo05:title:varkon-terror",
@@ -319,12 +307,15 @@ async function runSession05Demo(): Promise<void> {
       titleCode: "terror_of_the_realms",
       expectedSocialVersion: 5,
     });
-    await socialEngine.evaluateAndUnlockTitle({
-      commandId: "demo05:title:bramir-hunter",
-      principal: sysAuth,
-      characterId: dwarfHunter.id,
-      titleCode: "relentless_bounty_hunter",
-    });
+    await assert.rejects(
+      () => socialEngine.evaluateAndUnlockTitle({
+        commandId: "demo05:title:bramir-hunter",
+        principal: sysAuth,
+        characterId: dwarfHunter.id,
+        titleCode: "relentless_bounty_hunter",
+      }),
+      TitleConditionInvalidError,
+    );
 
     // 21–22. Compare contextual NPC recognition across two regions (Ashvale vs Thornreach) & prove species != morality!
     //        Orc Gorim is Admiring/Respectful in Ashvale; Human Varkon is Hostile to Ashvale guards yet Admiring to Thornveil Syndicate!
@@ -431,8 +422,8 @@ async function runSession05Demo(): Promise<void> {
     assert.equal(recoveredVarkon.moralBounty, -1050n); // -300 murder - 750 sabotage
     assert.equal(recoveredVarkon.globalFame, 1200n);
     assert.equal(recoveredVarkon.equippedTitle?.titleCode, "terror_of_the_realms");
-    assert.equal(recoveredClaims.length, 1);
-    assert.equal(recoveredClaims[0]?.payoutCommitmentStatus, "pending_economy_settlement");
+    assert.equal(recoveredClaims.length, 0);
+
 
     logger.info("Step 28: Persistent recovery of MoralBounty, Fame, Reputations, Crimes, Claims & Titles confirmed", {
       operation: "demo05:complete",

@@ -740,82 +740,68 @@ describe("CARBON Session 05 — Reputation, Bounty, Fame, Criminality, Titles & 
       CriminalBountyInvalidError,
     );
 
-    // #20 Funded Active CriminalBounty succeeds
-    const activeBounty = (
-      await socialEngine.createCriminalBounty({
-        commandId: "s05:bounty:funded-varkon",
-        principal: SYSTEM_AUTHORITY,
-        targetCharacterId: outlaw.id,
-        issuingAuthorityId: "valewatch_guard",
-        jurisdictionId: "jur-ashvale-civic",
-        warrantId: confirmedMurder.data.autoWarrant!.id,
-        sourceCrimeId: confirmedMurder.data.crimeRecord!.id,
-        rewardAmount: 2500n,
-        currencyCode: "silver_mark",
-        fundingStatus: "escrow_committed",
-        fundingReference: "treasury-escrow:valewatch:0042",
-        desiredStatus: "Active",
-      })
-    ).data;
-    assert.equal(activeBounty.status, "Active");
-    assert.equal((await socialRepo.listActiveCriminalBounties({ jurisdictionId: "jur-ashvale-civic" })).length, 1);
+    // Until a ledger exists, textual escrow references cannot prove funding.
+    const create = {
+      commandId: "s05:bounty:funded-varkon",
+      principal: SYSTEM_AUTHORITY,
+      targetCharacterId: outlaw.id,
+      issuingAuthorityId: "valewatch_guard",
+      jurisdictionId: "jur-ashvale-civic",
+      warrantId: confirmedMurder.data.autoWarrant!.id,
+      sourceCrimeId: confirmedMurder.data.crimeRecord!.id,
+      rewardAmount: 2500n,
+      currencyCode: "silver_mark",
+      fundingStatus: "escrow_committed" as const,
+      fundingReference: "treasury-escrow:valewatch:0042",
+      desiredStatus: "Active" as const,
+    };
+    await assert.rejects(() => socialEngine.createCriminalBounty(create), CriminalBountyInvalidError);
+    await assert.rejects(() => socialEngine.createCriminalBounty({ ...create, fundingReference: "" }), CriminalBountyInvalidError);
+    await assert.rejects(() => socialEngine.createCriminalBounty({ ...create, desiredStatus: "Draft" }), CriminalBountyInvalidError);
 
-    // #23 Self-claim by target rejected!
-    await assert.rejects(
-      () =>
-        socialEngine.claimCriminalBounty({
-          commandId: "s05:bounty:self-claim-forbidden",
-          principal: SYSTEM_AUTHORITY,
-          bountyId: activeBounty.id,
-          claimantCharacterId: outlaw.id,
-          resolutionKind: "confirmed_capture",
-          authorityConfirmationRef: "forged-self",
-        }),
-      CriminalBountyInvalidError,
+    const proposal = (await socialEngine.createCriminalBounty({
+      ...create, commandId: "s05:bounty:proposal", fundingStatus: "planned_unfunded",
+      fundingReference: null, desiredStatus: "Draft",
+    })).data;
+    assert.equal(proposal.status, "Draft");
+    assert.equal(proposal.fundingStatus, "planned_unfunded");
+    const retry = await socialEngine.createCriminalBounty({
+      ...create, commandId: "s05:bounty:proposal", fundingStatus: "planned_unfunded",
+      fundingReference: null, desiredStatus: "Draft",
+    });
+    assert.equal(retry.duplicate, true);
+    await assert.rejects(() => socialEngine.createCriminalBounty({
+      ...create, commandId: "s05:bounty:proposal", fundingStatus: "planned_unfunded",
+      fundingReference: null, desiredStatus: "Draft", rewardAmount: 2501n,
+    }));
+
+    // Simulate an existing legacy record without deleting or rewriting its financial history.
+    await pgCtx.pool.query(
+      "UPDATE criminal_bounties SET status = 'Active', funding_status = 'escrow_committed', funding_reference = $2 WHERE id = $1::uuid",
+      [proposal.id, "legacy-reference"],
     );
-
-    // #21, #22 & #24: Concurrent bounty claim race between hunter1 and hunter2!
-    const claimRace = await Promise.allSettled([
-      socialEngine.claimCriminalBounty({
-        commandId: `s05:claim-race:h1:${randomUUID()}`,
-        principal: SYSTEM_AUTHORITY,
-        bountyId: activeBounty.id,
-        claimantCharacterId: hunter1.id,
-        resolutionKind: "confirmed_capture",
-        authorityConfirmationRef: "capture-report:valewatch-88a",
-      }),
-      socialEngine.claimCriminalBounty({
-        commandId: `s05:claim-race:h2:${randomUUID()}`,
-        principal: SYSTEM_AUTHORITY,
-        bountyId: activeBounty.id,
-        claimantCharacterId: hunter2.id,
-        resolutionKind: "confirmed_capture",
-        authorityConfirmationRef: "capture-report:valewatch-88b",
-      }),
+    assert.equal((await socialRepo.listActiveCriminalBounties({ jurisdictionId: "jur-ashvale-civic" })).length, 0);
+    const claim = {
+      commandId: "s05:claim:legacy", principal: SYSTEM_AUTHORITY, bountyId: proposal.id,
+      claimantCharacterId: hunter1.id, resolutionKind: "confirmed_capture" as const,
+      authorityConfirmationRef: "capture-report",
+    };
+    await assert.rejects(() => socialEngine.claimCriminalBounty(claim), CriminalBountyInvalidError);
+    await assert.rejects(() => socialEngine.claimCriminalBounty(claim), CriminalBountyInvalidError);
+    await assert.rejects(() => socialEngine.claimCriminalBounty({ ...claim, claimantCharacterId: hunter2.id }), CriminalBountyInvalidError);
+    const race = await Promise.allSettled([
+      socialEngine.claimCriminalBounty(claim),
+      socialEngine.claimCriminalBounty({ ...claim, commandId: "s05:claim:other", claimantCharacterId: hunter2.id }),
     ]);
-
-    const won = claimRace.filter((r) => r.status === "fulfilled");
-    const lost = claimRace.filter((r) => r.status === "rejected");
-    assert.equal(won.length, 1);
-    assert.equal(lost.length, 1);
-    if (won[0]?.status === "fulfilled") {
-      assert.equal(won[0].value.data.payoutCommitmentStatus, "pending_economy_settlement");
-    }
-
-    // Subsequent duplicate claim by another commandId also fails because bounty is already 'Fulfilled'!
-    await assert.rejects(
-      () =>
-        socialEngine.claimCriminalBounty({
-          commandId: "s05:claim:after-fulfilled",
-          principal: SYSTEM_AUTHORITY,
-          bountyId: activeBounty.id,
-          claimantCharacterId: hunter1.id,
-          resolutionKind: "confirmed_capture",
-          authorityConfirmationRef: "capture-report:late",
-        }),
-      CriminalBountyInvalidError,
+    assert.equal(race.filter((r) => r.status === "rejected").length, 2);
+    const preserved = await pgCtx.pool.query(
+      "SELECT status, funding_status, funding_reference, reward_amount FROM criminal_bounties WHERE id = $1::uuid",
+      [proposal.id],
     );
-
+    assert.equal(preserved.rows[0].funding_reference, "legacy-reference");
+    assert.equal(preserved.rows[0].status, "Active");
+    assert.equal(preserved.rows[0].reward_amount, "2500");
+    assert.equal((await pgCtx.pool.query("SELECT count(*)::int AS n FROM criminal_bounty_claims WHERE bounty_id = $1::uuid", [proposal.id])).rows[0].n, 0);
     // #19 Pardon resolves state to 'Pardoned' without erasing historical criminal_records!
     await socialEngine.resolveCriminalStatus({
       commandId: "s05:pardon:varkon-royal-amnesty",

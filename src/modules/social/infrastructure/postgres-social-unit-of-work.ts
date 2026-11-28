@@ -1252,25 +1252,10 @@ export class PostgresSocialRepository {
     readonly limit?: number | undefined;
     readonly offset?: number | undefined;
   }): Promise<ReadonlyArray<CriminalBounty>> {
-    const limit = Math.max(1, Math.min(100, options?.limit ?? 25));
-    const offset = Math.max(0, options?.offset ?? 0);
-
-    const res = options?.jurisdictionId
-      ? await this.pool.query(
-          `SELECT * FROM criminal_bounties
-           WHERE status = 'Active' AND jurisdiction_id = $1
-           ORDER BY reward_amount DESC, id ASC
-           LIMIT $2 OFFSET $3`,
-          [options.jurisdictionId, limit, offset],
-        )
-      : await this.pool.query(
-          `SELECT * FROM criminal_bounties
-           WHERE status = 'Active'
-           ORDER BY reward_amount DESC, id ASC
-           LIMIT $1 OFFSET $2`,
-          [limit, offset],
-        );
-    return res.rows.map((r) => mapCriminalBountyRow(r as Record<string, unknown>));
+    // Legacy Active / escrow_committed rows have no verifiable reservation.
+    // Do not advertise them as funded opportunities; retain them in storage.
+    void options;
+    return [];
   }
 
   public async listCharacterTitles(characterId: string): Promise<ReadonlyArray<CharacterTitleState>> {
